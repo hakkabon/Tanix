@@ -1,1 +1,0 @@
-/Users/uffe/Documents/ai-coding/kiro/Tanix/target/aarch64-unknown-none/debug/tanix-zephyr-stub: /Users/uffe/Documents/ai-coding/kiro/Tanix/servers/zephyr-stub/build.rs /Users/uffe/Documents/ai-coding/kiro/Tanix/servers/zephyr-stub/link.ld /Users/uffe/Documents/ai-coding/kiro/Tanix/servers/zephyr-stub/src/main.rs

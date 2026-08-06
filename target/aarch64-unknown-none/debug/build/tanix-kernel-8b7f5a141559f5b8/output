@@ -1,4 +1,0 @@
-cargo:rerun-if-changed=link.ld
-cargo:rustc-link-arg=-Tlink.ld
-cargo:rustc-link-arg=--entry=_start
-cargo:rustc-link-arg=--no-dynamic-linker

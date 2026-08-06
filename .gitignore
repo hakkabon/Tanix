@@ -1,0 +1,9 @@
+/target/
+**/*.rs.bk
+*.pdb
+rustc-ice-*.txt
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
