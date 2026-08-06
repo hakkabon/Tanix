@@ -97,41 +97,60 @@ pub trait Hypervisor {
 
 // ── Global backend selection ──────────────────────────────────────────────────
 
-use backend::{BareMetalBackend, GunyahBackend};
+use backend::BareMetalBackend;
+#[cfg(feature = "gunyah")]
+use backend::GunyahBackend;
+
+/// One backend instance per implementation, initialised at build time.
+///
+/// IMPORTANT: these must be module-level statics (not per-function) — the
+/// backend keeps mutable state (VM records, handle counters), and both the
+/// boot path (`detect_backend`) and the exception path (`get_backend`) must
+/// observe the *same* instance.
+static mut BARE: BareMetalBackend = BareMetalBackend::new();
+
+#[cfg(feature = "gunyah")]
+static mut GUNYAH: GunyahBackend = GunyahBackend::new();
+
+/// Backend selection: 0 = undetected, 1 = bare-metal, 2 = Gunyah.
+static mut SELECTED: u8 = 0;
+
+/// Decide which backend is present.  Run once at boot.
+fn select_backend() -> u8 {
+    #[cfg(feature = "gunyah")]
+    if GunyahBackend::detect() {
+        return 2;
+    }
+    1
+}
 
 /// Detect and return the appropriate backend as a trait object.
 ///
 /// Detection order (most specific first):
-///   1. Gunyah — check for the Gunyah UID hypercall response.
-///   2. Bare-metal / KVM — always available as a fallback; our kernel acts
-///      as its own VMM using address-space isolation.
+///   1. Gunyah — enabled via the `gunyah` cargo feature.  Probing issues an
+///      SMCCC HVC; on bare-metal EL1 an HVC is UNDEFINED, so the probe must
+///      never run unless we are genuinely hosted by Gunyah.
+///   2. Bare-metal — always available as a fallback; the kernel acts as its
+///      own VMM using cooperative vCPU switching.
 pub fn detect_backend() -> &'static mut dyn Hypervisor {
-    if GunyahBackend::detect() {
-        log::info!("hypervisor: Gunyah detected");
-        static mut GUNYAH: GunyahBackend = GunyahBackend::new();
-        unsafe { &mut *core::ptr::addr_of_mut!(GUNYAH) }
-    } else {
-        log::info!("hypervisor: bare-metal / KVM backend selected");
-        static mut BARE: BareMetalBackend = BareMetalBackend::new();
-        unsafe { &mut *core::ptr::addr_of_mut!(BARE) }
+    unsafe {
+        if SELECTED == 0 {
+            SELECTED = select_backend();
+        }
+        #[cfg(feature = "gunyah")]
+        if SELECTED == 2 {
+            log::info!("hypervisor: Gunyah detected");
+            return &mut *core::ptr::addr_of_mut!(GUNYAH);
+        }
+        log::info!("hypervisor: bare-metal backend selected");
+        &mut *core::ptr::addr_of_mut!(BARE)
     }
 }
 
 /// Return the already-detected backend.
 ///
-/// Panics if `detect_backend()` has not yet been called (i.e. the static
-/// is still `None`).  Used by the exception dispatcher which cannot receive
-/// the backend as a parameter.
+/// Used by the exception dispatcher which cannot receive the backend as a
+/// parameter.  Same instance as `detect_backend` — never panics after boot.
 pub fn get_backend() -> &'static mut dyn Hypervisor {
-    // The backend statics are initialised by detect_backend() at boot.
-    // After that call one of the two statics is live; we just pick the
-    // same one by re-running detect() (which is cheap — it reads one
-    // system register).
-    if GunyahBackend::detect() {
-        static mut GUNYAH: GunyahBackend = GunyahBackend::new();
-        unsafe { &mut *core::ptr::addr_of_mut!(GUNYAH) }
-    } else {
-        static mut BARE: BareMetalBackend = BareMetalBackend::new();
-        unsafe { &mut *core::ptr::addr_of_mut!(BARE) }
-    }
+    detect_backend()
 }

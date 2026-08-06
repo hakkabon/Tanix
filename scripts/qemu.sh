@@ -27,7 +27,7 @@ echo "UART output follows (Ctrl-A X to quit QEMU):"
 echo "──────────────────────────────────────────────"
 
 exec qemu-system-aarch64 \
-    -machine virt,virtualization=on \
+    -machine virt,virtualization=on,gic-version=3 \
     -cpu cortex-a53 \
     -m 256M \
     -nographic \

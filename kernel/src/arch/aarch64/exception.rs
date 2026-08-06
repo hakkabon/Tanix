@@ -52,7 +52,6 @@ const EC_IABT_LOWER:     u64 = 0x20; // Instruction abort from lower EL
 #[no_mangle]
 pub extern "C" fn irq_handler() {
     use super::gic;
-    use crate::hypervisor::doorbell;
 
     let intid = gic::ack();
 
@@ -89,7 +88,6 @@ pub extern "C" fn irq_handler() {
     }
 
     gic::eoi(intid);
-    let _ = doorbell::register; // keep the import live; suppress dead-code
 }
 
 // ── Synchronous handler (lower EL) ───────────────────────────────────────────
@@ -97,57 +95,55 @@ pub extern "C" fn irq_handler() {
 /// Called from `vectors.s` slot 8 (lower EL AArch64 synchronous exception).
 ///
 /// Handles HVC calls and data/instruction aborts from guest code.
-/// All HVC replies are written back via x0 of the saved register frame.
 ///
-/// The assembly stub saves registers and passes:
+/// The assembly stub saves the guest's register file on the *guest's* stack
+/// and passes us the frame base:
 ///   esr  — ESR_EL1
 ///   elr  — ELR_EL1 (faulting / HVC instruction PC)
 ///   far  — FAR_EL1
-///   sp   — kernel stack pointer (unused here, available for future use)
+///   sp   — saved-frame base pointer
+///
+/// Frame layout (set up by `LOWER_SYNC_ENTRY` in vectors.s):
+///   [sp+0]    guest x0
+///   [sp+8]    guest x1
+///   ...
+///   [sp+160]  ELR_EL1   (restored by the stub before `eret`)
+///   [sp+168]  SPSR_EL1
+///
+/// To pass a value back to the guest we must write into the frame (the stub
+/// restores every register from it on return).
 #[no_mangle]
-pub extern "C" fn sync_handler(esr: u64, elr: u64, far: u64, _sp: u64) {
+pub extern "C" fn sync_handler(esr: u64, elr: u64, _far: u64, sp: u64) {
     let ec = esr_ec(esr);
 
     match ec {
         EC_HVC64 => {
-            // The HVC immediate encodes the call number in ESR[15:0].
-            // For our SMCCC-style calls the function ID is in x0 (already
-            // saved by the macro; we read it from the live register since
-            // the stub hasn't zeroed it yet).
-            //
-            // We retrieve x0 and x1 from live registers — at this point
-            // the stub has saved them on the stack but not clobbered them.
-            let func: u64;
-            let arg1: u64;
-            unsafe {
-                core::arch::asm!("mov {}, x0", out(reg) func, options(nomem, nostack));
-                core::arch::asm!("mov {}, x1", out(reg) arg1, options(nomem, nostack));
-            }
+            // The guest's x0 (function ID) and x1 (argument) are in the
+            // saved frame — the stub has already clobbered the live
+            // registers with ESR/ELR/etc.
+            let frame = sp as *const u64;
+            let func = unsafe { core::ptr::read_volatile(frame) };
+            let arg1 = unsafe { core::ptr::read_volatile(frame.add(1)) };
 
             // Dispatch through the doorbell handler.
-            // get_backend() is a thin wrapper around the global static.
+            // get_backend() returns the same singleton instance as
+            // detect_backend().
             let ret = {
                 let hv = crate::hypervisor::get_backend();
                 crate::hypervisor::doorbell::handle_hvc(func, arg1, hv)
             };
 
-            // Write the return value into x0 of the saved frame.
-            unsafe { core::arch::asm!("mov x0, {}", in(reg) ret, options(nomem, nostack)) };
+            // Write the return value into the guest's x0 slot.
+            unsafe { core::ptr::write_volatile(frame as *mut u64, ret) };
 
-            // Advance ELR past the HVC instruction (4 bytes).
-            unsafe {
-                core::arch::asm!(
-                    "msr ELR_EL1, {v}",
-                    v = in(reg) elr.wrapping_add(4),
-                    options(nomem, nostack)
-                );
-            }
+            // Advance the saved ELR past the HVC instruction (4 bytes).
+            unsafe { core::ptr::write_volatile(frame.add(20) as *mut u64, elr + 4) };
         }
 
         EC_DABT_LOWER | EC_IABT_LOWER => {
             panic!(
                 "guest abort EC={:#x} ESR={:#010x} ELR={:#018x} FAR={:#018x}",
-                ec, esr, elr, far
+                ec, esr, elr, _far
             );
         }
 

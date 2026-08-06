@@ -64,6 +64,28 @@ pub const FLAGS_DEVICE: u64 = DESC_VALID
     | DESC_PXN
     | ATTR_DEVICE;
 
+// ── Block descriptor flags (L2, 2 MiB) ───────────────────────────────────────
+//
+// Block descriptors must NOT set bit 1 (that marks a table descriptor).
+// We use them to pre-map large ranges (entire DDR, MMIO windows) before the
+// MMU is enabled, so every later frame-allocation is already mapped and no
+// page-table frames need to be allocated after the MMU is live.
+
+/// Normal (WB/WA cacheable) 2 MiB block, RW at EL1.
+pub const FLAGS_BLOCK_NORMAL: u64 = DESC_VALID
+    | DESC_AF
+    | DESC_SH_INNER
+    | DESC_AP_RW_EL1
+    | ATTR_NORMAL;
+
+/// Device-nGnRnE 2 MiB block for MMIO windows (non-executable).
+pub const FLAGS_BLOCK_DEVICE: u64 = DESC_VALID
+    | DESC_AF
+    | DESC_AP_RW_EL1
+    | DESC_UXN
+    | DESC_PXN
+    | ATTR_DEVICE;
+
 // ── Table type ────────────────────────────────────────────────────────────────
 
 /// A single page-table level — 512 × 8-byte entries.
@@ -146,6 +168,9 @@ unsafe fn ensure_table(table: *mut PageTable, idx: usize) -> *mut PageTable {
 
 /// Map a single 4 KiB page: VA `vaddr` → PA `paddr` with `flags`.
 ///
+/// If a covering L2 block descriptor already exists (the DDR pre-map), this
+/// is a no-op — the range is already mapped.
+///
 /// # Safety
 /// Frame allocator must be initialised.  `vaddr` and `paddr` must be
 /// 4 KiB-aligned.
@@ -156,6 +181,13 @@ pub unsafe fn map_page(vaddr: VirtAddr, paddr: PhysAddr, flags: u64) {
     let l0 = core::ptr::addr_of_mut!(KERNEL_L0);
     let l1 = ensure_table(l0, l0_idx(vaddr));
     let l2 = ensure_table(l1, l1_idx(vaddr));
+
+    let l2e = (*l2).entry(l2_idx(vaddr));
+    if l2e & DESC_VALID != 0 && l2e & DESC_TABLE == 0 {
+        // A block descriptor already covers this address — nothing to do.
+        return;
+    }
+
     let l3 = ensure_table(l2, l2_idx(vaddr));
 
     (*l3).set_entry(l3_idx(vaddr), (paddr as u64) | flags);
@@ -176,27 +208,57 @@ pub unsafe fn map_range(paddr: PhysAddr, size: usize, flags: u64) {
     }
 }
 
+/// Identity-map a region as a series of 2 MiB block descriptors.
+///
+/// `vaddr`/`paddr` must be 2 MiB-aligned and `size` a multiple of 2 MiB.
+/// Used at boot to pre-map large ranges before the MMU is enabled.
+///
+/// # Safety
+/// Frame allocator must be initialised.
+pub unsafe fn map_block(vaddr: VirtAddr, paddr: PhysAddr, size: usize, flags: u64) {
+    assert_eq!(vaddr & (2 * 1024 * 1024 - 1), 0, "map_block: vaddr unaligned");
+    assert_eq!(paddr & (2 * 1024 * 1024 - 1), 0, "map_block: paddr unaligned");
+
+    let l0 = core::ptr::addr_of_mut!(KERNEL_L0);
+    let l1 = ensure_table(l0, l0_idx(vaddr));
+    let l2 = ensure_table(l1, l1_idx(vaddr));
+
+    let mut offset = 0;
+    while offset < size {
+        (*l2).set_entry(l2_idx(vaddr + offset), (paddr as u64 + offset as u64) | flags);
+        offset += 2 * 1024 * 1024;
+    }
+}
+
 // ── MMU enable ────────────────────────────────────────────────────────────────
 
 /// Build the kernel identity map and enable the MMU.
 ///
 /// After this call all physical addresses equal their virtual addresses.
-/// MMIO regions are mapped as Device memory; DRAM as Normal WB.
+///
+/// Mapping strategy: every range is pre-mapped *before* the MMU is enabled,
+/// using 2 MiB block descriptors:
+///
+///   • 0x4000_0000 .. 0x5000_0000  — all 256 MiB of DDR (normal WB/WA, RWX)
+///   • 0x0800_0000 .. 0x0A00_0000  — GICv3 distributor + redistributors
+///   • 0x0900_0000 .. 0x0B00_0000  — PL011 UARTs
+///
+/// Mapping the *entire* DDR means any frame later handed out by the frame
+/// allocator (shared memory, guest RAM, page tables) is already mapped —
+/// no table allocation is required after the MMU is live, which avoids the
+/// classic "who maps the page-table pages?" chicken-and-egg problem.
 ///
 /// # Safety
 /// Must be called exactly once, after the frame allocator is initialised.
-pub unsafe fn enable(kernel_end: PhysAddr) {
-    // 1. Identity-map the kernel image (normal memory, RWX).
-    //    From RAM_START (0x4000_0000) to kernel_end, rounded to 2 MiB so we
-    //    don't partially map a large page.
-    let kern_size = (kernel_end - 0x4000_0000 + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    map_range(0x4000_0000, kern_size, FLAGS_KERNEL_RWX);
+pub unsafe fn enable() {
+    // 1. Entire 256 MiB DDR as 2 MiB blocks (identity, RWX for now).
+    map_block(0x4000_0000, 0x4000_0000, 256 * 1024 * 1024, FLAGS_BLOCK_NORMAL);
 
-    // 2. Map GICv3 distributor + redistributor (device).
-    map_range(0x0800_0000, 2 * 1024 * 1024, FLAGS_DEVICE); // 2 MiB covers GICD + GICR
+    // 2. GICv3 distributor + redistributor (device-nGnRnE).
+    map_block(0x0800_0000, 0x0800_0000, 2 * 1024 * 1024, FLAGS_BLOCK_DEVICE);
 
-    // 3. Map PL011 UART (device).
-    map_range(0x0900_0000, PAGE_SIZE, FLAGS_DEVICE);
+    // 3. PL011 UART (device-nGnRnE).
+    map_block(0x0900_0000, 0x0900_0000, 2 * 1024 * 1024, FLAGS_BLOCK_DEVICE);
 
     // 4. Install TTBR0_EL1 (user/low address space) — we use TTBR0 for
     //    the identity map since our kernel VAs are below 0x0001_0000_0000.
@@ -222,5 +284,5 @@ pub unsafe fn enable(kernel_end: PhysAddr) {
         options(nomem, nostack)
     );
 
-    log::info!("MMU enabled — identity map active");
+    log::info!("MMU enabled — identity map active (DDR + MMIO pre-mapped)");
 }

@@ -1,3 +1,4 @@
+use core::fmt::Write;
 use core::panic::PanicInfo;
 
 /// Minimal UART write for panic messages.
@@ -14,6 +15,16 @@ fn uart_write_bytes(bytes: &[u8]) {
 
 fn uart_print(s: &str) {
     uart_write_bytes(s.as_bytes());
+}
+
+/// `core::fmt::Write` backend so formatted panic messages render on the UART.
+struct UartWriter;
+
+impl Write for UartWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        uart_print(s);
+        Ok(())
+    }
 }
 
 /// Semihosting SYS_EXIT — tells QEMU to terminate the simulation.
@@ -62,10 +73,14 @@ fn panic(info: &PanicInfo) -> ! {
         uart_print(" — ");
     }
 
-    if let Some(msg) = info.message().as_str() {
-        uart_print(msg);
-    } else {
-        uart_print("(no message)");
+    // `message()` is a `&str` only for literal messages; formatted panics
+    // (format_args!) must be rendered through `fmt::Write`.
+    match info.message().as_str() {
+        Some(msg) if !msg.is_empty() => uart_print(msg),
+        Some(_) => uart_print("(no message)"),
+        None => {
+            let _ = core::fmt::write(&mut UartWriter, format_args!("{}", info.message()));
+        }
     }
 
     uart_print("\n");

@@ -14,22 +14,83 @@ mod vm;
 
 /// Phase 3 Zephyr-stub with VirtIO driver, embedded at compile time.
 /// Build with `just zephyr-stub` before `just kernel-embed`.
+///
+/// The path is emitted by `build.rs` and is profile-aware (debug/release).
 #[cfg(feature = "embed-zephyr-stub")]
-static ZEPHYR_STUB_BIN: &[u8] = include_bytes!(
-    "../../target/aarch64-unknown-none/debug/tanix-zephyr-stub"
-);
+static ZEPHYR_STUB_BIN: &[u8] = include_bytes!(env!("TANIX_STUB_BIN_PATH"));
 
-/// Fallback: tight WFI loop — boots but does not participate in VirtIO.
+/// Fallback: an infinite yield loop — boots, hands control back to the
+/// kernel immediately, but never answers VirtIO messages.
+///
+///   mov x0, x6   ; guest-context pointer (set by vm::Manager at launch)
+///   br  x5       ; jump to the kernel's vm_yield_entry
+///
+/// The kernel's demo loop then completes with "no Echo" warnings instead of
+/// hanging.  Encoding: 0xAA0003E0 (mov x0, x6), 0xD61F00A0 (br x5).
 #[cfg(not(feature = "embed-zephyr-stub"))]
 static ZEPHYR_STUB_BIN: &[u8] = &[
-    0x7f, 0x20, 0x03, 0xd5, // wfi
-    0xff, 0xff, 0xff, 0x17, // b #-4
+    0xe0, 0x03, 0x00, 0xaa, // mov x0, x6
+    0xa0, 0x00, 0x1f, 0xd6, // br  x5
 ];
 
 // ── Boot entry ────────────────────────────────────────────────────────────────
+//
+// `_start` is pure assembly: at reset the CPU may be in EL3 or EL2 (QEMU's
+// `virt` machine with `virtualization=on` hands `-kernel` the CPU at EL2),
+// while the whole kernel targets EL1.  We therefore drop EL3 -> EL2 -> EL1
+// and only then set SP (the reset value is 0, so any stack use before this
+// point faults) and jump into Rust.
 
+use core::arch::global_asm;
+
+global_asm!(
+    r#"
+    .section .text._start, "ax"
+    .global _start
+_start:
+    // Determine the current exception level.
+    mrs  x0, CurrentEL
+    and  x0, x0, #0xc
+    cmp  x0, #0xc
+    b.eq 3f
+    cmp  x0, #0x8
+    b.eq 2f
+    b    1f
+
+3:  // EL3 -> EL2: SCR_EL3 with NS=1, HCE=1, RW=1
+    mov  x1, #0x501
+    msr  SCR_EL3, x1
+    isb
+    adr  x1, 2f
+    msr  ELR_EL3, x1
+    mov  x1, #0x3c9      // SPSR: EL2h, DAIF masked
+    msr  SPSR_EL3, x1
+    eret
+
+2:  // EL2 -> EL1: HCR_EL2.RW=1 forces AArch64 at EL1.
+    mov  x1, #1
+    lsl  x1, x1, #31
+    msr  HCR_EL2, x1
+    msr  SCTLR_EL2, xzr
+    isb
+    adr  x1, 1f
+    msr  ELR_EL2, x1
+    mov  x1, #0x3c5      // SPSR: EL1h, DAIF masked
+    msr  SPSR_EL2, x1
+    eret
+
+1:  // EL1h: initialise the stack, then enter Rust.
+    adrp x0, __stack_top
+    add  x0, x0, :lo12:__stack_top
+    mov  sp, x0
+    b    kmain_entry
+    "#
+);
+
+/// Rust-side boot continuation, reached from the `_start` stub with a valid
+/// stack and SP pointing at `__stack_top`.  Zeroes BSS and enters `kmain`.
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn kmain_entry() -> ! {
     unsafe {
         extern "C" {
             static __bss_start: u8;
@@ -63,18 +124,19 @@ fn kmain() -> ! {
     log::info!("kernel image ends at {:#x}", kernel_end);
 
     unsafe { mem::frame::init(kernel_end); }
-    unsafe { mem::page_table::enable(kernel_end); }
+    unsafe { mem::page_table::enable(); }
 
     let hv = hypervisor::detect_backend();
 
     // ── Phase 3: VirtIO shared-memory transport ───────────────────────────────
     //
-    // Memory layout after kernel image:
+    // Memory layout after the kernel image (all in the 256 MiB DDR window,
+    // which the MMU pre-maps):
     //   [shmem]       4 pages (16 KiB)   — VirtQueue + data buffers
     //   [guest RAM]   256 pages (1 MiB)  — Zephyr stub text + data + stack
     //
-    // The shmem region is allocated first so its address is lower than the
-    // guest RAM; we pass the shmem base to the guest via a register on launch.
+    // The shmem base is passed to the guest in x4 at launch; the guest's
+    // VirtIO driver finds its VirtqueueConfig there.
 
     // 1. Allocate and share the VirtQueue region.
     let shmem_handle = unsafe {
@@ -89,6 +151,8 @@ fn kmain() -> ! {
     log::info!("phase 3: shmem at {:#x}", shmem_phys);
 
     // 2. Register the inter-VM doorbell (SGI 1, VM handle = 1).
+    //    Retained for the Gunyah path; the cooperative demo communicates
+    //    via the yield pair instead of interrupts.
     let doorbell = hypervisor::doorbell::register(1, 1)
         .expect("phase 3: failed to register doorbell");
 
@@ -99,28 +163,25 @@ fn kmain() -> ! {
     log::info!("phase 3: VirtIO transport ready");
 
     // 4. Create and launch the Zephyr guest VM.
-    //    Pass the shmem physical address in x1 at launch so the guest's
-    //    driver can find the VirtqueueConfig without a fixed address.
+    //    Boot args: x4 = shmem base, x5 = kernel yield function.  The guest
+    //    uses the yield function to hand control back between messages.
     const GUEST_RAM_PAGES: usize = 256; // 1 MiB
+    let boot_args: [u64; 2] = [
+        shmem_phys as u64,
+        vm::yield_fn_addr() as u64,
+    ];
     let guest_handle = unsafe {
-        vm::create_vm("zephyr-stub", ZEPHYR_STUB_BIN, GUEST_RAM_PAGES, hv)
+        vm::create_vm("zephyr-stub", ZEPHYR_STUB_BIN, GUEST_RAM_PAGES, hv, boot_args)
             .expect("phase 3: failed to create guest VM")
     };
 
-    // Pass shmem_phys to the guest.  The bare-metal backend's launch_guest
-    // uses `eret`; we load shmem_phys into x1 before calling it.
-    unsafe {
-        core::arch::asm!(
-            "mov x1, {shmem}",
-            shmem = in(reg) shmem_phys as u64,
-            options(nomem, nostack)
-        );
-    }
+    log::info!(
+        "phase 3: launching guest VM {:?} (shmem={:#x})",
+        guest_handle, shmem_phys
+    );
 
-    log::info!("phase 3: launching guest VM {:?} (shmem={:#x})", guest_handle, shmem_phys);
-
-    // vm_start eretes into the guest.  On first HVC the guest context is
-    // restored and sync_handler runs in our exception vector.
+    // 5. Enter the guest.  This switches the CPU into the guest; it returns
+    //    when the guest yields control back (right after its boot banner).
     unsafe {
         vm::start_vm(guest_handle, hv)
             .expect("phase 3: vm_start failed");
@@ -128,12 +189,10 @@ fn kmain() -> ! {
 
     // ── Phase 3: drive the VirtIO ping-pong ──────────────────────────────────
     //
-    // After vm_start returns (the guest halted), the transport is still live.
-    // In practice with `eret` the guest runs cooperatively — each time it
-    // issues an HVC for a doorbell the exception handler runs synchronously
-    // and returns, allowing the guest to continue.
-    //
-    // Here we run 3 rounds of Print → wait for Echo reply.
+    // Each round: post a Print message → resume the guest (it processes the
+    // message, writes an Echo into the used ring, yields) → collect the
+    // reply.  Fully synchronous and race-free: the guest cannot run while
+    // we are preparing the next message, and vice-versa.
 
     log::info!("phase 3: starting VirtIO message exchange");
 
@@ -148,11 +207,25 @@ fn kmain() -> ! {
         unsafe {
             transport.send_print(text, hv);
 
-            let got = transport.wait_reply(500, hv);
-            if got {
+            vm::resume_vm(guest_handle, hv)
+                .expect("phase 3: vm_resume failed");
+
+            let mut got_reply = false;
+            transport.poll_replies(|desc_idx, op, printed| {
+                log::info!(
+                    "virtio: reply desc={} op={:?} printed={}",
+                    desc_idx, op, printed
+                );
+                got_reply = true;
+            });
+
+            if got_reply {
                 log::info!("phase 3: round {} — Echo received", round);
             } else {
-                log::warn!("phase 3: round {} — timeout waiting for Echo", round);
+                log::warn!(
+                    "phase 3: round {} — no Echo (guest not answering)",
+                    round
+                );
             }
         }
     }

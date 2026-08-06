@@ -104,7 +104,11 @@ fn load_elf64(image: &[u8], ram_base: PhysAddr, _ram_size: usize) -> Result<Phys
     let phoff = { hdr.e_phoff } as usize;
     let phentsize = { hdr.e_phentsize } as usize;
     let phnum = { hdr.e_phnum } as usize;
-    let entry = { hdr.e_entry } as PhysAddr;
+
+    // The guest image links at address 0 (see servers/zephyr-stub/link.ld),
+    // so e_entry is an *offset* within the image.  The absolute guest entry
+    // is the image's load base plus that offset.
+    let entry = ram_base + { hdr.e_entry } as usize;
 
     log::info!(
         "loader: ELF64 entry={:#x} phdrs={} @ off={:#x}",

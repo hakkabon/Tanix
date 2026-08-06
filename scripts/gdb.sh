@@ -24,7 +24,7 @@ echo "Starting QEMU GDB server on :1234 ..."
 
 # ── Start QEMU in background, halted at reset vector ────────────────────────
 qemu-system-aarch64 \
-    -machine virt,virtualization=on \
+    -machine virt,virtualization=on,gic-version=3 \
     -cpu cortex-a53 \
     -m 256M \
     -nographic \

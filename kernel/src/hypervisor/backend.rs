@@ -3,24 +3,30 @@
 //!
 //! BareMetalBackend
 //! ─────────────────
-//! Implements VM isolation using the AArch64 MMU:
-//!   • Each "VM" gets its own TTBR0 address space (separate page tables).
-//!   • "vCPU run" is an `eret` into EL1 with the guest's TTBR0.
-//!   • "Doorbell" is a software interrupt delivered via GIC SGI (ID 1).
-//!   • "Shared memory" maps the same physical range into both page tables.
+//! A minimal VMM that runs guest VMs as *cooperative vCPU pairs* inside a
+//! single EL1 address space:
+//!   • Each "VM" gets a region of guest RAM carved from the frame allocator.
+//!   • "vCPU run" is a context switch into the guest; the guest returns
+//!     control by calling a kernel-provided yield function (vm::vm_yield).
+//!   • "Doorbell" is a software interrupt delivered via GIC SGI (ID 1) —
+//!     kept for the Gunyah path; the cooperative demo does not need it.
+//!   • "Shared memory" is a physical range handed to the guest via boot
+//!     registers; both sides are identity-mapped, so addresses are shared
+//!     directly.
 //!
-//! This gives us real address-space isolation without a Type-1 hypervisor.
-//! The security guarantees are weaker (no EL2 boundary) but the API contract
-//! is identical, so the Phase 2b Gunyah port is a drop-in.
+//! This gives us the same *API contract* as a Type-1 hypervisor without
+//! requiring EL2.  The security guarantees are weaker (no EL2 boundary),
+//! but the design maps 1:1 onto Gunyah: vCPU run = GH_VCPU_RUN, doorbell =
+//! GH_DOORBELL_SEND, shared memory = GH_MEMEXTENT_DONATE.
 //!
 //! GunyahBackend (stub)
 //! ─────────────────────
-//! Issues Gunyah hypercalls via SMCCC HVC.  Stubs only — real implementation
-//! requires the Gunyah QEMU fork or SA8295P hardware.
+//! Issues Gunyah hypercalls via SMCCC HVC.  Stubs only — real
+//! implementation requires the Gunyah QEMU fork or SA8295P hardware.
+//! Enable probing with the `gunyah` cargo feature; see hypervisor/mod.rs.
 
 use super::{Hypervisor, HvError, VmConfig, VmHandle, DoorbellHandle, ShmemHandle};
 use crate::mem::PhysAddr;
-use crate::mem::page_table::{map_range, FLAGS_KERNEL_RWX};
 
 // ── Bare-metal backend ────────────────────────────────────────────────────────
 
@@ -82,11 +88,11 @@ impl Hypervisor for BareMetalBackend {
         let slot = self.vms.iter_mut().find(|s| s.is_none())
             .ok_or(HvError::NoMemory)?;
 
-        // Map the guest's RAM into the kernel's address space so the loader
-        // can write the binary image into it.
-        unsafe {
-            map_range(config.ram_base, config.ram_size, FLAGS_KERNEL_RWX);
-        }
+        // NOTE: the guest RAM is not mapped here.  The whole DDR window is
+        // pre-mapped as 2 MiB blocks at MMU enable time (mem::page_table),
+        // so frames handed out by the allocator are always accessible.
+        // The vm::Manager zeroes and loads the image into RAM before this
+        // call, so no mapping work remains by the time we get here.
 
         log::info!(
             "vm_create: handle={:?} ram={:#x}+{:#x} entry={:#x}",
@@ -112,29 +118,15 @@ impl Hypervisor for BareMetalBackend {
         }
         vm.started = true;
 
-        let entry = vm.entry;
-        let ram_base = vm.ram_base;
-        let ram_size = vm.ram_size;
-
         log::info!(
             "vm_start: handle={:?} entry={:#x} (ram {:#x}+{:#x})",
-            handle, entry, ram_base, ram_size
+            handle, vm.entry, vm.ram_base, vm.ram_size
         );
 
-        // In bare-metal mode we launch the guest by jumping to its entry
-        // point using an `eret`-style transfer.  We set up a minimal EL1
-        // saved state and return into the guest.
-        //
-        // The guest runs in the *same* EL1 privilege as the kernel — the
-        // isolation is purely via address spaces (separate TTBR0).  A proper
-        // EL2-based isolation comes with the Gunyah backend.
-        //
-        // For Phase 2 the guest is a simple Zephyr RTOS stub that we bounce
-        // back from via an HVC — so "starting" it means calling its entry fn.
-        unsafe {
-            launch_guest(entry);
-        }
-
+        // The actual CPU transfer into the guest is performed by
+        // vm::Manager::start via a cooperative context switch (see
+        // vm/mod.rs).  This backend only tracks VM lifecycle state; on
+        // Gunyah this method would issue GH_VCPU_RUN instead.
         Ok(())
     }
 
@@ -186,29 +178,6 @@ impl Hypervisor for BareMetalBackend {
         log::info!("mem_share: phys={:#x} size={:#x} → handle={:?}", phys, size, handle);
         Ok(handle)
     }
-}
-
-/// Jump to the guest entry point.
-///
-/// We use `eret` semantics: SPSR_EL1 is set to EL1h with IRQs masked,
-/// and ELR_EL1 is set to the guest entry.  On `eret` the CPU switches to
-/// the saved SPSR state and jumps to ELR.
-///
-/// # Safety
-/// `entry` must be a valid executable address.
-#[inline(never)]
-unsafe fn launch_guest(entry: PhysAddr) {
-    core::arch::asm!(
-        // ELR_EL1 = entry point
-        "msr ELR_EL1, {entry}",
-        // SPSR_EL1: EL1h (SP_EL1), IRQ masked (I bit set), FIQ masked
-        "msr SPSR_EL1, {spsr}",
-        "isb",
-        "eret",
-        entry = in(reg) entry as u64,
-        spsr  = in(reg) 0b0000_0101u64, // EL1h, DAIF=0b0010 (IRQ masked)
-        options(noreturn)
-    );
 }
 
 // ── Gunyah backend (stub) ─────────────────────────────────────────────────────

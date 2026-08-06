@@ -9,6 +9,11 @@ description = "Tanix microkernel — Phase 3"
 # Requires: cargo build --package tanix-zephyr-stub first.
 embed-zephyr-stub = []
 
+# Probe for the Gunyah hypervisor via SMCCC HVC at boot.
+# Enable ONLY when actually booting under Gunyah — on bare-metal EL1 an HVC
+# is UNDEFINED and would take an unexpected exception.
+gunyah = []
+
 [dependencies]
 # log facade — no_std compatible; backend registered in arch::aarch64::uart.
 log = { version = "0.4", default-features = false }

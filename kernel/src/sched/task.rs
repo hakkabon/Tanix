@@ -202,5 +202,12 @@ pub unsafe fn schedule() {
 
 extern "C" {
     /// Defined in `switch.s`.
-    fn context_switch(from: *mut Context, to: *const Context);
+    ///
+    /// Saves the current task's callee-saved registers / SP / LR into `from`
+    /// and restores `to`, then returns into the restored context.
+    ///
+    /// Only touches x0, x1, x9, x19–x30 and SP — all other registers
+    /// (including x4–x8, x10–x18) survive the switch, which the VM manager
+    /// relies on to pass boot arguments to a guest.
+    pub(crate) fn context_switch(from: *mut Context, to: *const Context);
 }

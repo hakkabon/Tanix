@@ -2,9 +2,26 @@
 //! VM management subsystem.
 //!
 //! Provides the kernel-side lifecycle manager for guest VMs:
-//!   • `vm::Manager` — create, load, start, stop VMs.
-//!   • `vm::loader`  — parse and copy flat binaries / ELF images.
-//!   • `vm::shmem`   — shared memory region management.
+//!   • `vm::Manager`  — create, load, start, resume, stop VMs.
+//!   • `vm::loader`   — parse and copy flat binaries / ELF images.
+//!   • `vm::shmem`    — shared memory region management.
+//!
+//! Cooperative vCPU model (Phase 3)
+//! ────────────────────────────────
+//! The bare-metal backend has no EL2, so kernel and guest share EL1 and one
+//! address space.  A guest runs as a *cooperative vCPU pair*:
+//!
+//!   • `Manager::start` / `Manager::resume` switch into the guest with a
+//!     `context_switch` (the guest becomes the running "task").
+//!   • The guest calls the kernel-provided `vm_yield_entry` function to
+//!     hand control back; the kernel resumes right after its switch call.
+//!   • Boot arguments (shared-memory base, yield function address, guest
+//!     context pointer) are passed in x4/x5/x6 — registers the switch stub
+//!     does not touch.
+//!
+//! This is deliberately shaped like a tiny VMM: on Gunyah (Phase 2b) the
+//! same `start`/`resume` calls become GH_VCPU_RUN, and "the guest yielded"
+//! becomes "the guest exited" via a doorbell / hypercall exit reason.
 
 pub mod loader;
 pub mod shmem;
@@ -12,6 +29,8 @@ pub mod shmem;
 use crate::hypervisor::{Hypervisor, HvError, VmConfig, VmHandle};
 use crate::mem::{PhysAddr, PAGE_SIZE};
 use crate::mem::frame::alloc_frames;
+use crate::sched::task::context_switch;
+use crate::sched::task::Context;
 
 // ── VM descriptor ─────────────────────────────────────────────────────────────
 
@@ -26,8 +45,12 @@ pub struct Vm {
     /// Physical address of the VM's RAM region.
     pub ram_base: PhysAddr,
     pub ram_size: usize,
-    /// Guest entry point (physical address).
+    /// Guest entry point (physical address within the RAM region).
     pub entry: PhysAddr,
+    /// Boot arguments passed to the guest in registers at launch:
+    ///   boot[0] → x4 (shared-memory physical base)
+    ///   boot[1] → x5 (kernel yield-function address)
+    pub boot: [u64; 2],
     pub running: bool,
 }
 
@@ -38,24 +61,50 @@ impl Vm {
     }
 }
 
+// ── Cooperative vCPU state ────────────────────────────────────────────────────
+
+/// Contexts backing one kernel ↔ guest switch pair.
+pub struct VmRuntime {
+    /// Kernel context, saved whenever the kernel switches into the guest.
+    pub kernel_ctx: Context,
+    /// Guest context, saved whenever the guest yields back to the kernel.
+    pub guest_ctx: Context,
+}
+
+impl VmRuntime {
+    pub const fn new() -> Self {
+        Self {
+            kernel_ctx: Context::zeroed(),
+            guest_ctx: Context::zeroed(),
+        }
+    }
+}
+
 // ── Manager ───────────────────────────────────────────────────────────────────
 
 pub struct Manager {
     vms: [Option<Vm>; MAX_VMS],
+    runtime: VmRuntime,
 }
 
 impl Manager {
     pub const fn new() -> Self {
-        Self { vms: [None, None, None, None] }
+        Self {
+            vms: [None, None, None, None],
+            runtime: VmRuntime::new(),
+        }
     }
 
-    /// Allocate `ram_pages` physical frames, load the binary image into
-    /// them, create the VM through the backend, and return the handle.
+    /// Allocate `ram_pages` physical frames, zero them, load the binary
+    /// image, create the VM through the backend, and return the handle.
+    ///
+    /// `boot` is passed to the guest in registers at launch (x4, x5).
     pub fn create_and_load(
         &mut self,
         name: &str,
         image: &[u8],
         ram_pages: usize,
+        boot: [u64; 2],
         hv: &mut dyn Hypervisor,
     ) -> Result<VmHandle, HvError> {
         // 1. Allocate contiguous physical RAM for the guest.
@@ -63,14 +112,21 @@ impl Manager {
             .ok_or(HvError::NoMemory)?;
         let ram_size = ram_pages * PAGE_SIZE;
 
-        // 2. Load the binary image.
+        // 2. Zero the whole region first — the guest expects its BSS and
+        //    stack area to start zeroed (its link script is base-0, so the
+        //    ELF loader only zeroes per-segment BSS, not the tail).
+        unsafe {
+            core::ptr::write_bytes(ram_base as *mut u8, 0, ram_size);
+        }
+
+        // 3. Load the binary image.
         let entry = loader::load_flat(image, ram_base, ram_size)?;
 
-        // 3. Create VM through backend.
+        // 4. Create VM through backend.
         let config = VmConfig { ram_base, ram_size, entry };
         let handle = hv.vm_create(config)?;
 
-        // 4. Record locally.
+        // 5. Record locally.
         let slot = self.vms.iter_mut().find(|s| s.is_none())
             .ok_or(HvError::NoMemory)?;
 
@@ -84,6 +140,7 @@ impl Manager {
             ram_base,
             ram_size,
             entry,
+            boot,
             running: false,
         });
 
@@ -95,21 +152,81 @@ impl Manager {
         Ok(handle)
     }
 
-    /// Start a VM.
+    /// Enter the guest for the first time.
+    ///
+    /// Returns when the guest yields control back (its first `yield`).
     pub fn start(&mut self, handle: VmHandle, hv: &mut dyn Hypervisor) -> Result<(), HvError> {
         let vm = self.find_mut(handle).ok_or(HvError::InvalidHandle)?;
         if vm.running {
             return Err(HvError::BadState);
         }
         vm.running = true;
-        log::info!("vm::Manager: starting '{}'", vm.name_str());
-        hv.vm_start(handle)
+        let entry = vm.entry;
+        let stack_top = vm.ram_base + vm.ram_size;
+        let boot = vm.boot;
+
+        hv.vm_start(handle)?;
+
+        let Manager { runtime, .. } = self;
+        runtime.guest_ctx = Context::new(entry, stack_top);
+        let guest_ctx_ptr = core::ptr::addr_of_mut!(runtime.guest_ctx) as usize;
+
+        log::info!(
+            "vm::Manager: entering guest entry={:#x} sp={:#x}",
+            entry, stack_top
+        );
+
+        unsafe {
+            // Boot args for the guest: x4 = shmem base, x5 = yield fn,
+            // x6 = guest-context pointer.  `context_switch` only touches
+            // x0/x1/x9 and x19–x30, so these survive into the guest's
+            // entry point.  The `out()` clobbers stop the compiler from
+            // reusing x4–x6 afterwards.
+            core::arch::asm!(
+                "mov x4, {s}",
+                "mov x5, {y}",
+                "mov x6, {c}",
+                s = in(reg) boot[0],
+                y = in(reg) boot[1],
+                c = in(reg) guest_ctx_ptr as u64,
+                out("x4") _, out("x5") _, out("x6") _,
+                options(nomem, nostack)
+            );
+
+            context_switch(&mut runtime.kernel_ctx, &runtime.guest_ctx);
+        }
+
+        log::info!("vm::Manager: guest yielded control");
+        Ok(())
+    }
+
+    /// Re-enter a guest that previously yielded.
+    ///
+    /// Returns when the guest yields again.
+    pub fn resume(&mut self, handle: VmHandle, _hv: &mut dyn Hypervisor) -> Result<(), HvError> {
+        let running = self.find(handle).map(|v| v.running).unwrap_or(false);
+        if !running {
+            return Err(HvError::BadState);
+        }
+
+        let Manager { runtime, .. } = self;
+        unsafe {
+            context_switch(&mut runtime.kernel_ctx, &runtime.guest_ctx);
+        }
+        Ok(())
     }
 
     pub fn find_mut(&mut self, handle: VmHandle) -> Option<&mut Vm> {
         self.vms
             .iter_mut()
             .filter_map(|s| s.as_mut())
+            .find(|v| v.handle == handle)
+    }
+
+    pub fn find(&self, handle: VmHandle) -> Option<&Vm> {
+        self.vms
+            .iter()
+            .filter_map(|s| s.as_ref())
             .find(|v| v.handle == handle)
     }
 }
@@ -119,16 +236,53 @@ impl Manager {
 static mut VM_MANAGER: Manager = Manager::new();
 
 /// Create and load a VM.  Returns its handle.
+///
+/// `boot` is passed to the guest at launch:
+///   boot[0] = shared-memory physical base (guest's `x4`)
+///   boot[1] = kernel yield-function address (guest's `x5`)
 pub unsafe fn create_vm(
     name: &str,
     image: &[u8],
     ram_pages: usize,
     hv: &mut dyn Hypervisor,
+    boot: [u64; 2],
 ) -> Result<VmHandle, HvError> {
-    (*core::ptr::addr_of_mut!(VM_MANAGER)).create_and_load(name, image, ram_pages, hv)
+    (*core::ptr::addr_of_mut!(VM_MANAGER)).create_and_load(name, image, ram_pages, boot, hv)
 }
 
-/// Start a VM.
+/// Start a VM: enters the guest, returns after its first yield.
 pub unsafe fn start_vm(handle: VmHandle, hv: &mut dyn Hypervisor) -> Result<(), HvError> {
     (*core::ptr::addr_of_mut!(VM_MANAGER)).start(handle, hv)
+}
+
+/// Resume a VM that previously yielded.  Returns after its next yield.
+pub unsafe fn resume_vm(handle: VmHandle, hv: &mut dyn Hypervisor) -> Result<(), HvError> {
+    (*core::ptr::addr_of_mut!(VM_MANAGER)).resume(handle, hv)
+}
+
+/// Address of the guest-facing yield entry point.
+///
+/// The guest receives this in `x5` at launch and calls it as
+/// `fn(guest_ctx: usize)` to hand control back to the kernel.
+pub fn yield_fn_addr() -> usize {
+    vm_yield_entry as *const () as usize
+}
+
+/// Called *by the guest* to yield control back to the kernel.
+///
+/// Saves the guest's current context into `guest_ctx` (whose address was
+/// passed to the guest in `x6` at launch) and restores the kernel context,
+/// so the kernel continues right after its `context_switch` call.  When the
+/// kernel later resumes the guest, this function returns and the guest
+/// continues where it left off.
+///
+/// # Safety
+/// `guest_ctx` must point to the manager's `runtime.guest_ctx`.
+#[no_mangle]
+pub extern "C" fn vm_yield_entry(guest_ctx: *mut Context) {
+    unsafe {
+        let mgr = core::ptr::addr_of_mut!(VM_MANAGER);
+        let kernel_ctx = &mut *core::ptr::addr_of_mut!((*mgr).runtime.kernel_ctx);
+        context_switch(guest_ctx, kernel_ctx);
+    }
 }
