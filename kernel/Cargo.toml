@@ -1,0 +1,14 @@
+[package]
+name = "tanix-kernel"
+version.workspace = true
+edition.workspace = true
+description = "Tanix microkernel — Phase 3"
+
+[features]
+# Build the Zephyr-stub binary path into the kernel image.
+# Requires: cargo build --package tanix-zephyr-stub first.
+embed-zephyr-stub = []
+
+[dependencies]
+# log facade — no_std compatible; backend registered in arch::aarch64::uart.
+log = { version = "0.4", default-features = false }

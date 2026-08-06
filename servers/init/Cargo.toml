@@ -1,0 +1,9 @@
+[package]
+name = "tanix-init"
+version.workspace = true
+edition.workspace = true
+description = "Tanix init server — first userspace process (Phase 1)"
+
+# The init server is a bare-metal ELF loaded by the kernel.
+# It uses no_std + no_main just like the kernel.
+[dependencies]

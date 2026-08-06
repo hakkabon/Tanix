@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "servers/init",
+    "servers/zephyr-stub",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# ── Build profiles ────────────────────────────────────────────────────────────
+# Profile settings must live at the workspace root; they are ignored in
+# member crate manifests.
+
+[profile.dev]
+panic = "abort"
+opt-level = 1       # keep at ≥1 so volatile MMIO reads/writes aren't elided
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true
+codegen-units = 1
+strip = "debuginfo"

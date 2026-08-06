@@ -1,0 +1,7 @@
+[package]
+name = "tanix-zephyr-stub"
+version.workspace = true
+edition.workspace = true
+description = "Minimal Zephyr-like guest VM stub for Phase 2 ping-pong demo"
+
+[dependencies]
