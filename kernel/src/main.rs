@@ -270,6 +270,7 @@ fn kmain() -> ! {
     log::info!("phase 4: booting Minix-style server set");
 
     if server::available() {
+        server::reserve_regions();
         match server::spawn_by_name("init") {
             Ok(id) => {
                 log::info!("phase 4: init server spawned as {:?}", id);
@@ -287,6 +288,28 @@ fn kmain() -> ! {
             "phase 4: server binaries not embedded \
              (build with --features embed-servers)"
         );
+    }
+
+    // ── Phase 5: display stack ────────────────────────────────────────────────
+    //
+    // The kernel boots the display server (owns the QEMU virtio-gpu
+    // framebuffer + virtio-tablet pointer) and the `ui-demo` application
+    // server.  The Phase-4 demo needs `init` to exit, so it can no longer
+    // act as the root for the Phase-5 servers; kmain spawns them directly
+    // once the Phase-4 demo has run its course.  `ui-demo` parks on a
+    // receive (nothing has sent yet), so the scheduler never returns here.
+
+    if server::available() {
+        let display = server::spawn_by_name("display");
+        let ui_demo = server::spawn_by_name("ui-demo");
+        log::info!(
+            "phase 5: display stack spawned (display={:?}, ui-demo={:?})",
+            display, ui_demo
+        );
+        unsafe {
+            sched::enter();
+        }
+        log::info!("phase 5: display stack idle");
     }
 
     // ── Idle ─────────────────────────────────────────────────────────────────

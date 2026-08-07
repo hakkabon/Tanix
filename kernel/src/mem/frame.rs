@@ -83,6 +83,23 @@ impl FrameAllocator {
         }
     }
 
+    /// Reserve a range of physical memory so it is never handed out.
+    ///
+    /// Rounds `start` up and `start + size` down to page boundaries; the
+    /// range is clamped to the managed RAM window.
+    pub fn reserve_region(&mut self, start: PhysAddr, size: usize) {
+        let begin = (start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let end = (start + size) & !(PAGE_SIZE - 1);
+        if end <= begin {
+            return;
+        }
+        let begin_idx = Self::phys_to_idx(begin).unwrap_or(0);
+        let end_idx = Self::phys_to_idx(end).unwrap_or(TOTAL_FRAMES);
+        for i in begin_idx..end_idx {
+            self.set_used(i);
+        }
+    }
+
     fn phys_to_idx(addr: PhysAddr) -> Option<usize> {
         if !(RAM_START..RAM_END).contains(&addr) {
             return None;
@@ -196,6 +213,14 @@ pub unsafe fn alloc_frame() -> Option<PhysAddr> {
 /// `init` must have been called.
 pub unsafe fn alloc_frames(n: usize) -> Option<PhysAddr> {
     (*core::ptr::addr_of_mut!(FRAME_ALLOC)).alloc_contiguous(n)
+}
+
+/// Reserve a range of physical memory so it is never handed out.
+///
+/// # Safety
+/// `init` must have been called; the range must not already be in use.
+pub unsafe fn reserve_region(start: PhysAddr, size: usize) {
+    (*core::ptr::addr_of_mut!(FRAME_ALLOC)).reserve_region(start, size);
 }
 
 /// Free a physical frame.

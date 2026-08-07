@@ -64,5 +64,17 @@ pub const M_PM_EXIT: u32 = 0x0302;
 pub const M_PM_EXIT_REPLY: u32 = 0x0303;
 pub const M_PM_NOTIFY_EXIT: u32 = 0x0304;
 
+/// Display server (`display`) — owns the virtio-gpu framebuffer and the
+/// virtio-tablet pointer.  Clients draw with FILL_RECT, present with FLUSH,
+/// and sample the pointer with TICK (the display server drains the tablet
+/// event queue on every TICK and reports the latest position).
+pub const M_DISPLAY_GET_MODE: u32 = 0x0500;
+pub const M_DISPLAY_MODE_REPLY: u32 = 0x0501; // data[0]=width, data[1]=height
+pub const M_DISPLAY_FILL_RECT: u32 = 0x0502; // data[0..3]=x,y,w,h, data[4..6]=r,g,b
+pub const M_DISPLAY_DONE: u32 = 0x0503; // reply to FILL_RECT / FLUSH (data[0]=ok)
+pub const M_DISPLAY_FLUSH: u32 = 0x0504;
+pub const M_DISPLAY_TICK: u32 = 0x0505;
+pub const M_DISPLAY_TICK_REPLY: u32 = 0x0506; // data[0]=pointer x, data[1]=pointer y, data[2]=buttons
+
 /// Maximum string payload carried inside a message (28 chars + NUL).
 pub const MAX_INLINE_STR: usize = 28;

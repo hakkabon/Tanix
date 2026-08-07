@@ -11,6 +11,9 @@ pub mod entry;
 pub mod fmt;
 pub mod sys;
 
+#[cfg(feature = "alloc")]
+pub mod heap;
+
 mod panic;
 
 pub use abi::{BootInfo, Message, SyscallTable};

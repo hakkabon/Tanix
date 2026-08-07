@@ -43,6 +43,8 @@ static SERVER_BINS: &[(&str, &[u8])] = &[
     ("mem", include_bytes!(env!("TANIX_MEM_BIN_PATH"))),
     ("dev", include_bytes!(env!("TANIX_DEV_BIN_PATH"))),
     ("worker", include_bytes!(env!("TANIX_WORKER_BIN_PATH"))),
+    ("display", include_bytes!(env!("TANIX_DISPLAY_BIN_PATH"))),
+    ("ui-demo", include_bytes!(env!("TANIX_UI_DEMO_BIN_PATH"))),
 ];
 
 #[cfg(not(feature = "embed-servers"))]
@@ -55,11 +57,13 @@ static SERVER_BINS: &[(&str, &[u8])] = &[];
 /// 0x4052f000..0x4062f000, so the first free 128 KiB-aligned slot is
 /// 0x40700000 (256 MiB DDR window starts at 0x40000000).
 pub const SERVER_BASES: &[(&str, usize)] = &[
-    ("init",   0x4070_0000),
-    ("pm",     0x4072_0000),
-    ("mem",    0x4074_0000),
-    ("dev",    0x4076_0000),
-    ("worker", 0x4078_0000),
+    ("init",    0x4070_0000),
+    ("pm",      0x4072_0000),
+    ("mem",     0x4074_0000),
+    ("dev",     0x4076_0000),
+    ("worker",  0x4078_0000),
+    ("display", 0x407A_0000),
+    ("ui-demo", 0x407C_0000),
 ];
 
 // ── Spawn ─────────────────────────────────────────────────────────────────────
@@ -108,4 +112,22 @@ pub fn spawn_by_name(name: &str) -> Result<TaskId, i32> {
 /// Whether any server binaries are embedded (feature enabled + built).
 pub fn available() -> bool {
     !SERVER_BINS.is_empty()
+}
+
+/// Reserve every server's private RAM region in the physical frame
+/// allocator.
+///
+/// The frame allocator only reserves `[RAM_START .. kernel_end]` at boot;
+/// without this, kernel services (e.g. the display framebuffer, handed out
+/// as one large contiguous run) can be allocated frames that overlap a
+/// live server image, silently corrupting its code and data.  Must be
+/// called before any server task can run or make allocations.
+pub fn reserve_regions() {
+    for &(_, base) in SERVER_BASES {
+        let size = SERVER_RAM_PAGES * PAGE_SIZE;
+        unsafe {
+            crate::mem::frame::reserve_region(base, size);
+        }
+        log::info!("server: reserved region {:#x}+{} KiB", base, size / 1024);
+    }
 }
