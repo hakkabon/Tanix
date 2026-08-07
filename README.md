@@ -5,11 +5,15 @@ philosophy (a tiny kernel, most OS services in unprivileged processes) with
 an eye on automotive/embedded hypervisor use cases (Qualcomm Gunyah, Zephyr
 guest RTOS, display-oriented UI).
 
-Current state: **Phase 4 complete** — the kernel boots on QEMU's `virt`
+Current state: **Phase 5 complete** — the kernel boots on QEMU's `virt`
 machine, drops from EL2 to EL1, turns on the MMU, runs a full VirtIO
-message ping-pong with a guest "Zephyr-stub" VM, and then boots a set of
+message ping-pong with a guest "Zephyr-stub" VM, boots a set of
 Minix-style server processes (init, pm, mem, dev, worker) that talk to
-each other over synchronous kernel IPC.
+each other over synchronous kernel IPC, and drives a display stack
+end-to-end: a `display` server drives virtio-gpu (framebuffer) and
+virtio-tablet (pointer) over the QEMU virtio-mmio transport, and a
+`ui-demo` app draws a button + paint-canvas UI that reacts to real mouse
+input injected through QEMU's QMP monitor.
 
 ---
 
@@ -21,7 +25,8 @@ each other over synchronous kernel IPC.
 | 2 | Memory (frame allocator, MMU) + hypervisor backend abstraction | ✅ done |
 | 3 | VirtIO transport between kernel and guest VM (shmem + virtqueue) | ✅ done |
 | 4 | Minix-style server processes (init, pm, mem, dev, worker) | ✅ done |
-| 5 | Hypervisor assist (Gunyah-style) and display/UI | 🔭 planned |
+| 5 | Display/UI stack: virtio-gpu framebuffer + virtio-tablet pointer, driven by a Minix-style display server | ✅ done |
+| 6 | Hypervisor assist (Gunyah-style) | 🔭 planned |
 
 ---
 
@@ -39,7 +44,7 @@ kernel/                  the microkernel itself (no_std, freestanding binary)
     mmu.rs               TCR/MAIR configuration (MMU itself enabled later)
     boot.rs              CurrentEL / MPIDR helpers
   src/mem/
-    frame.rs             bitmap frame allocator over the 256 MiB DDR
+    frame.rs             bitmap frame allocator over the 256 MiB DDR (+ reserved zones)
     page_table.rs        4-level page tables; pre-map + MMU enable
   src/hypervisor/
     mod.rs               backend selection (BareMetal vs Gunyah)
@@ -55,16 +60,21 @@ kernel/                  the microkernel itself (no_std, freestanding binary)
   src/ipc/               synchronous send/receive channels + syscall table
   src/sched/             cooperative scheduler; register-frame context switch
     task.rs              Task / Context (switch.s asm), spawn_server
-  src/server.rs          Phase-4 server registry: embed + spawn by name
+  src/server.rs          server registry: embed + spawn by name, region reservation
   link.ld                kernel image layout (load at 0x4008_0000)
   build.rs               linker args; emits embedded-binary paths
 servers/zephyr-stub/     the Phase-3 guest: a tiny Zephyr-like RTOS PoC
   src/main.rs            cooperative device loop, VirtIO device side
+servers/libtanix-sys/    shared no_std crate: syscall table, Message/ABI (BootInfo)
 servers/init/            root server: spawns pm/mem/dev, drives the demo
 servers/pm/              process manager (spawn/exec via syscall)
 servers/mem/             memory service (grant/query)
 servers/dev/             device service (text I/O)
 servers/worker/          worker binary, exec'd by pm at runtime
+servers/display/         Phase-5 display server: virtio-mmio transport (virtio.rs),
+                         virtio-gpu driver (gpu.rs), virtio-tablet driver (input.rs)
+servers/libtanix-ui/     shared UI helpers for the demo apps
+servers/ui-demo/         Phase-5 demo app: button + paint canvas, pointer-reactive
 servers/link.ld          server link script (fixed LINK_BASE layout)
 scripts/qemu.sh          QEMU runner (debug/release, embed or fallback)
 scripts/gdb.sh           QEMU + GDB server attach
@@ -89,7 +99,7 @@ justfile                 build/run/lint recipes
    - branches to `kmain_entry` (zeroes BSS, calls `kmain`).
 2. `kmain` runs: UART + log → exception vectors → TCR/MAIR → GICv3 →
    timer → frame allocator → **MMU enable** → hypervisor backend →
-   Phase-3 VirtIO demo.
+   Phase-3 VirtIO demo → Phase-4 server demo → Phase-5 display stack.
 
 ## Memory map (QEMU virt)
 
@@ -97,9 +107,12 @@ justfile                 build/run/lint recipes
 |--------|---------|-------|
 | DDR | `0x4000_0000 .. 0x5000_0000` | 256 MiB; kernel loaded at `0x4008_0000` |
 | Stack | just below `0x4008_0000` | 64 KiB window below the kernel image |
+| Server regions | `0x4070_0000 .. 0x4080_0000` | 512 KiB reserved for embedded servers |
+| Framebuffer | `0x407e_2000` | virtio-gpu scanout surface (1280×800×4) |
 | GICv3 distributor | `0x0800_0000` | |
 | GICv3 redistributors | `0x080A_0000` | per-CPU frames |
 | PL011 UART | `0x0900_0000` | |
+| virtio-mmio | `0x0A00_0000 .. 0x0C00_0000` | 32 slots × 0x200; gpu at slot 31, tablet at slot 30 |
 
 When the MMU is enabled (`mem::page_table::enable`), the **entire DDR** plus
 the GIC and UART windows are pre-mapped as 2 MiB block descriptors *before*
@@ -212,6 +225,79 @@ server has blocked or finished.
 
 ---
 
+## Display stack (Phase 5)
+
+The display stack is another pair of embedded servers, spawned after the
+Phase-4 set:
+
+```
+ui-demo ── M_DISPLAY_FILL_RECT/FLUSH/TICK ──▶ display server ──▶ virtio-gpu
+                                                 │               (framebuffer)
+                                                 └──▶ virtio-tablet
+                                                      (pointer events)
+```
+
+### virtio-mmio transport
+
+`servers/display/src/virtio.rs` is a small virtio **legacy** transport
+driver for the QEMU virtio-mmio device type: it probes the 32 slots at
+`0x0A00_0000` (`REG_MAGIC`/`REG_DEVICE_ID`), resets, negotiates features,
+configures a queue, writes `DRIVER_OK`, and then moves buffers through the
+descriptor/avail/used rings — including a `submit` path that chains a
+read-only descriptor sequence and a write-only response, and a
+`drain_used` path for event buffers. In the current QEMU layout the
+virtio-gpu sits at slot 31 (`0x0A00_3E00`, device id 16) and the
+virtio-tablet at slot 30 (`0x0A00_3C00`, device id 18).
+
+### virtio-gpu driver (`gpu.rs`)
+
+- Probes and initialises the control queue, then runs
+  `VIRTIO_GPU_CMD_GET_DISPLAY_INFO` / `RESOURCE_CREATE_2D` /
+  `RESOURCE_ATTACH_BACKING` to obtain a 1280×800 BGRA framebuffer.
+- QEMU 11 keeps resource images in host memory: the guest must send
+  `VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D` (0x105) before every
+  `VIRTIO_GPU_CMD_RESOURCE_FLUSH` (0x104), or the screen stays black —
+  `flush()` does transfer-then-flush.
+- The framebuffer pages are carved out of the server region
+  (`0x407e_2000`, see above); the frame allocator reserves all server
+  regions so the GPU's attached backing pages can never collide with a
+  live server image.
+
+### virtio-tablet driver (`input.rs`)
+
+- Device id 18, one event queue (index 0); the device only starts
+  reporting after `DRIVER_OK`. `open()` fills the ring with 64 independent
+  writable 32-byte event buffers (`add_empty_buffers`).
+- Events are 8-byte LE `{u16 type; u16 code; u32 value}` records, batched
+  and terminated with `EV_SYN`/`SYN_REPORT`: `EV_ABS ABS_X/ABS_Y` carry the
+  pointer (0..0x7FFF, mapped to pixels by the display server) and
+  `EV_KEY BTN_TOUCH`/`BTN_LEFT` the button state.
+- `poll()` drains the used ring (up to 8 records per tick), updates the
+  `Pointer {x, y, buttons}`, and re-arms the consumed buffers.
+
+### M_DISPLAY protocol (`servers/libtanix-sys/src/abi.rs`)
+
+The display server serves one request per `receive` wake-up (the
+scheduler is fully cooperative; the timer tick only disarms the timer
+event, so the service loop is receive-driven):
+
+| mtype | direction | payload |
+|-------|-----------|---------|
+| `M_DISPLAY_GET_MODE` | app → display | — |
+| `M_DISPLAY_MODE_REPLY` | display → app | `data[0,1]` = width, height |
+| `M_DISPLAY_FILL_RECT` | app → display | `data[0..3]` = x, y, w, h; `data[4..6]` = r, g, b |
+| `M_DISPLAY_FLUSH` | app → display | transfer + flush the framebuffer |
+| `M_DISPLAY_TICK` | app → display | poll tablet; reply = pointer |
+| `M_DISPLAY_TICK_REPLY` | display → app | `data[0,1,2]` = px, py, buttons |
+
+`ui-demo` is a pointer-reactive app: a top-right button toggles the
+background colour, pressing or dragging elsewhere paints amber dots, and a
+white ring cursor follows the tablet. It redraws only when the pointer
+moved or the button state changed, and its TICK request/response cadence
+doubles as the input polling loop.
+
+---
+
 ## Build & run
 
 Prerequisites: Rust `nightly-2026-07-01` (pinned by `rust-toolchain.toml`),
@@ -219,7 +305,11 @@ the `aarch64-unknown-none` target, QEMU (`brew install qemu` /
 `apt install qemu-system-arm`), and optionally `just`.
 
 ```sh
-# Phase 4 demo: VirtIO ping-pong + Minix-style server set (recommended)
+# Phase 5 demo: display stack + UI (recommended) — pass the QMP socket to
+# inject mouse input and take screenshots (see "Driving the UI" below)
+just qemu-phase5 -qmp unix:/tmp/qmp.sock,server=on,wait=off
+
+# Phase 4 demo: VirtIO ping-pong + Minix-style server set
 just qemu-phase4
 
 # Phase 3 VirtIO demo only (real stub embedded)
@@ -230,12 +320,13 @@ just qemu
 
 # or manually:
 cargo build --package tanix-zephyr-stub --target aarch64-unknown-none
-cargo build --package tanix-libsys --package tanix-init \
-    --package tanix-pm --package tanix-mem --package tanix-dev \
-    --package tanix-worker --target aarch64-unknown-none
+cargo build --package tanix-libsys --package tanix-libtanix-ui \
+    --package tanix-init --package tanix-pm --package tanix-mem \
+    --package tanix-dev --package tanix-worker --package tanix-display \
+    --package tanix-ui-demo --target aarch64-unknown-none
 cargo build --package tanix-kernel --target aarch64-unknown-none \
     --features embed-zephyr-stub,embed-servers
-./scripts/qemu.sh
+./scripts/qemu.sh -device virtio-gpu-device -device virtio-tablet-device
 ```
 
 Important QEMU flags (already in `scripts/qemu.sh` / `gdb.sh`):
@@ -245,10 +336,38 @@ Important QEMU flags (already in `scripts/qemu.sh` / `gdb.sh`):
 - `gic-version=3` — the kernel's GIC driver is GICv3 (distributor +
   redistributor at `0x080A_0000`); without this the machine defaults to
   GICv2 and the redistributor access aborts.
+- `-device virtio-gpu-device -device virtio-tablet-device` — the Phase-5
+  display devices, required by the display server (`just qemu-phase5`).
+- `-qmp unix:...` — QMP monitor for screenshots and input injection (the
+  display server runs with no input until you inject events this way).
+
+### Driving the UI from QMP
+
+The guest is `-nographic`, so mouse input is injected over QMP (any QMP
+client works, e.g. `socat - UNIX-CONNECT:/tmp/qmp.sock`). Tablet abs
+values are 0..0x7FFF; convert pixels with `x × 32767 / 1280` and
+`y × 32767 / 800` (e.g. screen centre (640, 400) → (16384, 16384)):
+
+```json
+{"execute":"qmp_capabilities"}
+{"execute":"input-send-event","arguments":{"events":[
+  {"type":"abs","data":{"axis":"x","value":16384}},
+  {"type":"abs","data":{"axis":"y","value":16384}}]}}
+{"execute":"input-send-event","arguments":{"events":[
+  {"type":"btn","data":{"button":"left","down":true}}]}}
+{"execute":"input-send-event","arguments":{"events":[
+  {"type":"btn","data":{"button":"left","down":false}}]}}
+{"execute":"screendump","arguments":{"filename":"/tmp/shot.ppm"}}
+```
+
+Notes: explicit `{"type":"sync"}` events are rejected by QEMU 11 —
+synchronisation is automatic; and screendump writes PPM despite any `.png`
+extension.
 
 Recipes: `just kernel` (fallback stub), `just kernel-embed` (real stub),
-`just kernel-phase4` (servers), `just qemu-release`, `just debug` (GDB),
-`just lint-all` (clippy with `-D warnings`).
+`just kernel-phase4` (servers), `just kernel-phase5` (servers + display
+stack), `just qemu-release`, `just debug` (GDB), `just lint-all` (clippy
+with `-D warnings`).
 
 ---
 
@@ -256,11 +375,16 @@ Recipes: `just kernel` (fallback stub), `just kernel-embed` (real stub),
 
 - Single CPU, cooperative scheduling only; no SMP, no interrupts for the
   guest (the SGI doorbell is registered but the demo communicates via the
-  yield pair).
+  yield pair). The display service loop is receive-driven: there is no
+  device interrupt for the tablet, so the pointer is sampled on the app's
+  TICK cadence.
 - Page tables pre-map the whole DDR RWX; permissions are not yet tightened
-  per server region.
+  per server region (server RAM zones are reserved from the frame
+  allocator, but not yet marked read-only to other tasks).
 - The EL2 stage is a one-way drop for now; no hypervisor services exist yet
   (`hvc` handling at EL1 is only exercised under the `gunyah` feature).
+- virtio is used in legacy (pre-1.0) mode, single queue per device;
+  multi-queue and modern (PCI) transports are not implemented.
 
 ## License
 
