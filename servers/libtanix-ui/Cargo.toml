@@ -1,0 +1,8 @@
+[package]
+name = "tanix-libtanix-ui"
+version.workspace = true
+edition.workspace = true
+description = "Iced-shaped UI toolkit for Tanix — Sandbox/widgets/layout over the display server (Phase 5)"
+
+[dependencies]
+tanix-libsys = { path = "../libtanix-sys", features = ["alloc"] }

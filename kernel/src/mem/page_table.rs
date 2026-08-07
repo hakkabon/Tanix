@@ -242,6 +242,8 @@ pub unsafe fn map_block(vaddr: VirtAddr, paddr: PhysAddr, size: usize, flags: u6
 ///   • 0x4000_0000 .. 0x5000_0000  — all 256 MiB of DDR (normal WB/WA, RWX)
 ///   • 0x0800_0000 .. 0x0A00_0000  — GICv3 distributor + redistributors
 ///   • 0x0900_0000 .. 0x0B00_0000  — PL011 UARTs
+///   • 0x0A00_0000 .. 0x0C00_0000  — QEMU virtio-mmio transports
+///       (32 slots × 0x20000, Phase 5: virtio-gpu + virtio-tablet)
 ///
 /// Mapping the *entire* DDR means any frame later handed out by the frame
 /// allocator (shared memory, guest RAM, page tables) is already mapped —
@@ -260,7 +262,11 @@ pub unsafe fn enable() {
     // 3. PL011 UART (device-nGnRnE).
     map_block(0x0900_0000, 0x0900_0000, 2 * 1024 * 1024, FLAGS_BLOCK_DEVICE);
 
-    // 4. Install TTBR0_EL1 (user/low address space) — we use TTBR0 for
+    // 4. QEMU virtio-mmio transports (32 slots, device-nGnRnE) — the
+    //    Phase-5 display server drives virtio-gpu/virtio-tablet directly.
+    map_block(0x0A00_0000, 0x0A00_0000, 2 * 1024 * 1024, FLAGS_BLOCK_DEVICE);
+
+    // 5. Install TTBR0_EL1 (user/low address space) — we use TTBR0 for
     //    the identity map since our kernel VAs are below 0x0001_0000_0000.
     let ttbr0 = kernel_l0_phys() as u64;
     core::arch::asm!(
@@ -270,10 +276,10 @@ pub unsafe fn enable() {
         options(nomem, nostack)
     );
 
-    // 5. Flush TLB (all entries, all ASID).
+    // 6. Flush TLB (all entries, all ASID).
     core::arch::asm!("tlbi vmalle1", "dsb sy", "isb", options(nomem, nostack));
 
-    // 6. Enable MMU: set SCTLR_EL1.M (bit 0) and I-cache (bit 12).
+    // 7. Enable MMU: set SCTLR_EL1.M (bit 0) and I-cache (bit 12).
     let mut sctlr: u64;
     core::arch::asm!("mrs {s}, SCTLR_EL1", s = out(reg) sctlr, options(nomem, nostack));
     sctlr |= 1 | (1 << 12); // M | I

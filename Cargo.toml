@@ -9,6 +9,9 @@ members = [
     "servers/mem",
     "servers/dev",
     "servers/worker",
+    "servers/libtanix-ui",
+    "servers/display",
+    "servers/ui-demo",
 ]
 
 [workspace.package]

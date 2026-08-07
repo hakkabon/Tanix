@@ -59,4 +59,9 @@ impl StrBuf {
     pub fn as_str(&self) -> &str {
         core::str::from_utf8(&self.buf[..self.len]).unwrap_or("?")
     }
+
+    /// Empty the buffer so it can be reused.
+    pub fn reset(&mut self) {
+        self.len = 0;
+    }
 }

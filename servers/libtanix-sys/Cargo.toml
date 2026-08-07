@@ -5,3 +5,7 @@ edition.workspace = true
 description = "Tanix server ABI: message types, syscall table, boot entry (Phase 4)"
 
 [dependencies]
+
+[features]
+# Global heap allocator over kernel frames (needed by the Phase-5 UI toolkit).
+alloc = []

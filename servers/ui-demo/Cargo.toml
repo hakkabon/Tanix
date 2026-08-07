@@ -1,0 +1,9 @@
+[package]
+name = "tanix-ui-demo"
+version.workspace = true
+edition.workspace = true
+description = "Tanix Phase-5 demo app — an Iced-style counter (Phase 5)"
+
+[dependencies]
+tanix-libsys = { path = "../libtanix-sys", features = ["alloc"] }
+tanix-libtanix-ui = { path = "../libtanix-ui" }
