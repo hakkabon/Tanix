@@ -1,0 +1,7 @@
+[package]
+name = "tanix-libsys"
+version.workspace = true
+edition.workspace = true
+description = "Tanix server ABI: message types, syscall table, boot entry (Phase 4)"
+
+[dependencies]

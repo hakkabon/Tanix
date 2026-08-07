@@ -17,7 +17,8 @@
 //!     hand control back; the kernel resumes right after its switch call.
 //!   • Boot arguments (shared-memory base, yield function address, guest
 //!     context pointer) are passed in x4/x5/x6 — registers the switch stub
-//!     does not touch.
+//!     does not touch.  They are caller-saved, so `Manager` re-establishes
+//!     them on *every* guest entry (first launch and each resume).
 //!
 //! This is deliberately shaped like a tiny VMM: on Gunyah (Phase 2b) the
 //! same `start`/`resume` calls become GH_VCPU_RUN, and "the guest yielded"
@@ -169,7 +170,6 @@ impl Manager {
 
         let Manager { runtime, .. } = self;
         runtime.guest_ctx = Context::new(entry, stack_top);
-        let guest_ctx_ptr = core::ptr::addr_of_mut!(runtime.guest_ctx) as usize;
 
         log::info!(
             "vm::Manager: entering guest entry={:#x} sp={:#x}",
@@ -177,23 +177,7 @@ impl Manager {
         );
 
         unsafe {
-            // Boot args for the guest: x4 = shmem base, x5 = yield fn,
-            // x6 = guest-context pointer.  `context_switch` only touches
-            // x0/x1/x9 and x19–x30, so these survive into the guest's
-            // entry point.  The `out()` clobbers stop the compiler from
-            // reusing x4–x6 afterwards.
-            core::arch::asm!(
-                "mov x4, {s}",
-                "mov x5, {y}",
-                "mov x6, {c}",
-                s = in(reg) boot[0],
-                y = in(reg) boot[1],
-                c = in(reg) guest_ctx_ptr as u64,
-                out("x4") _, out("x5") _, out("x6") _,
-                options(nomem, nostack)
-            );
-
-            context_switch(&mut runtime.kernel_ctx, &runtime.guest_ctx);
+            enter_guest(&mut runtime.kernel_ctx, &runtime.guest_ctx, boot);
         }
 
         log::info!("vm::Manager: guest yielded control");
@@ -204,14 +188,22 @@ impl Manager {
     ///
     /// Returns when the guest yields again.
     pub fn resume(&mut self, handle: VmHandle, _hv: &mut dyn Hypervisor) -> Result<(), HvError> {
-        let running = self.find(handle).map(|v| v.running).unwrap_or(false);
-        if !running {
+        let boot = self
+            .find(handle)
+            .map(|v| (v.running, v.boot))
+            .unwrap_or((false, [0; 2]));
+        if !boot.0 {
             return Err(HvError::BadState);
         }
+        let boot = boot.1;
 
         let Manager { runtime, .. } = self;
+
         unsafe {
-            context_switch(&mut runtime.kernel_ctx, &runtime.guest_ctx);
+            // The guest's boot args are caller-saved, so the kernel clobbers
+            // x4/x5/x6 between a yield and its resume.  Re-establish them on
+            // every re-entry, exactly as at first launch.
+            enter_guest(&mut runtime.kernel_ctx, &runtime.guest_ctx, boot);
         }
         Ok(())
     }
@@ -285,4 +277,48 @@ pub extern "C" fn vm_yield_entry(guest_ctx: *mut Context) {
         let kernel_ctx = &mut *core::ptr::addr_of_mut!((*mgr).runtime.kernel_ctx);
         context_switch(guest_ctx, kernel_ctx);
     }
+}
+
+/// Switch from the kernel to the guest, re-establishing the guest's boot
+/// args in x4/x5/x6 (shared-memory base, yield function, guest-context
+/// pointer).
+///
+/// `context_switch` only saves/restores x19–x28 + fp/lr/sp, so the boot
+/// args are caller-saved and must be set on *every* entry — first launch
+/// and each resume — because the kernel's own execution between a yield
+/// and its resume clobbers them.  Everything happens inside one `asm!`
+/// block so the compiler cannot interleave instructions between the
+/// register loads and the switch; the block must therefore clobber every
+/// caller-saved register, since `bl` lets the guest run arbitrary code.
+///
+/// Returns when the guest yields control back (guest context saved,
+/// kernel context restored).
+///
+/// # Safety
+/// `kernel_ctx` must belong to the calling task and `guest_ctx` to the
+/// guest being entered.
+unsafe fn enter_guest(kernel_ctx: &mut Context, guest_ctx: &Context, boot: [u64; 2]) {
+    core::arch::asm!(
+        "mov x4, {s}",
+        "mov x5, {y}",
+        "mov x6, {c}",
+        "mov x0, {k}",
+        "mov x1, {c}",
+        "bl context_switch",
+        s = in(reg) boot[0],
+        y = in(reg) boot[1],
+        c = in(reg) core::ptr::addr_of!(*guest_ctx) as u64,
+        k = in(reg) core::ptr::addr_of_mut!(*kernel_ctx) as u64,
+        // `bl` lets the guest run arbitrary code, which clobbers every
+        // caller-saved register (x0–x18) — declare them all.  x19–x28,
+        // fp and sp are *not* clobbered: `context_switch` saves them into
+        // `kernel_ctx` before the guest runs and restores them on yield.
+        // (x19 is additionally reserved by LLVM and kept alive on its own.)
+        out("x0") _, out("x1") _, out("x2") _, out("x3") _,
+        out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+        out("x8") _, out("x9") _, out("x10") _, out("x11") _,
+        out("x12") _, out("x13") _, out("x14") _, out("x15") _,
+        out("x16") _, out("x17") _, out("x18") _,
+        out("x30") _,
+    );
 }

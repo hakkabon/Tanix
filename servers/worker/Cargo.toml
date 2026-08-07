@@ -1,8 +1,8 @@
 [package]
-name = "tanix-init"
+name = "tanix-worker"
 version.workspace = true
 edition.workspace = true
-description = "Tanix init server — root of the Phase-4 server hierarchy"
+description = "Tanix demo worker process — spawned by pm on request (Phase 4)"
 
 [dependencies]
 tanix-libsys = { path = "../libtanix-sys" }

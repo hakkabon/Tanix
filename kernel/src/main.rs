@@ -7,6 +7,7 @@ mod ipc;
 mod mem;
 mod panic;
 mod sched;
+mod server;
 mod virtio;
 mod vm;
 
@@ -22,15 +23,29 @@ static ZEPHYR_STUB_BIN: &[u8] = include_bytes!(env!("TANIX_STUB_BIN_PATH"));
 /// Fallback: an infinite yield loop — boots, hands control back to the
 /// kernel immediately, but never answers VirtIO messages.
 ///
-///   mov x0, x6   ; guest-context pointer (set by vm::Manager at launch)
-///   br  x5       ; jump to the kernel's vm_yield_entry
+/// The stub is re-entered at its top after *every* yield (the kernel
+/// resumes it at its entry point), while `vm_yield_entry`'s prologue grows
+/// the guest stack by one frame per call — so the stub first resets SP to
+/// the top of the guest RAM (0x4019_7000 = ram_base + ram_size).  It then
+/// reloads the boot args: `vm::Manager` re-establishes x5 = yield function
+/// and x6 = guest-context pointer on every resume, because the kernel's own
+/// execution clobbers caller-saved registers between yields.
+///
+///   movz x7, #0x1970, lsl #16   ; x7 = 0x40197000 (guest stack top)
+///   movk x7, #0x40,   lsl #32
+///   mov  sp, x7
+///   mov  x0, x6                  ; guest-context pointer (set by Manager)
+///   br   x5                      ; jump to the kernel's vm_yield_entry
 ///
 /// The kernel's demo loop then completes with "no Echo" warnings instead of
-/// hanging.  Encoding: 0xAA0003E0 (mov x0, x6), 0xD61F00A0 (br x5).
+/// hanging.
 #[cfg(not(feature = "embed-zephyr-stub"))]
 static ZEPHYR_STUB_BIN: &[u8] = &[
-    0xe0, 0x03, 0x00, 0xaa, // mov x0, x6
-    0xa0, 0x00, 0x1f, 0xd6, // br  x5
+    0x07, 0x2e, 0xa3, 0xd2, // movz x7, #0x1970, lsl #16
+    0x07, 0x08, 0xc0, 0xf2, // movk x7, #0x40,   lsl #32
+    0xff, 0x00, 0x00, 0x91, // mov  sp, x7
+    0xe0, 0x03, 0x06, 0xaa, // mov  x0, x6
+    0xa0, 0x00, 0x1f, 0xd6, // br   x5
 ];
 
 // ── Boot entry ────────────────────────────────────────────────────────────────
@@ -79,7 +94,14 @@ _start:
     msr  SPSR_EL2, x1
     eret
 
-1:  // EL1h: initialise the stack, then enter Rust.
+1:  // EL1h: allow SIMD/FP at EL1 (CPACR_EL1.FPEN=3) — the server tasks
+    // use NEON in libtanix-sys (e.g. buffer zeroing in `log`).
+    mov  x1, #3
+    lsl  x1, x1, #20
+    msr  CPACR_EL1, x1
+    isb
+
+    // Initialise the stack, then enter Rust.
     adrp x0, __stack_top
     add  x0, x0, :lo12:__stack_top
     mov  sp, x0
@@ -231,6 +253,41 @@ fn kmain() -> ! {
     }
 
     log::info!("phase 3: VirtIO transport demo complete");
+
+    // ── Phase 4: Minix-style server processes ─────────────────────────────────
+    //
+    // The kernel now boots a set of independent server binaries (init, pm,
+    // mem, dev, worker) as cooperative tasks, each in its own memory
+    // region with its own stack.  Servers never link against the kernel —
+    // they communicate only through the syscall table handed to them at
+    // boot (x19) and through synchronous `send` / `receive` messages.
+    //
+    // Flow: kmain spawns `init` and enters the scheduler; `init` spawns
+    // pm/mem/dev, exercises each service over IPC (dev prints, mem allocs,
+    // pm execs the worker), then exits.  When every server has blocked or
+    // finished, the scheduler returns here.
+
+    log::info!("phase 4: booting Minix-style server set");
+
+    if server::available() {
+        match server::spawn_by_name("init") {
+            Ok(id) => {
+                log::info!("phase 4: init server spawned as {:?}", id);
+                unsafe {
+                    sched::enter();
+                }
+                log::info!("phase 4: Minix-style server demo complete");
+            }
+            Err(e) => {
+                log::error!("phase 4: failed to spawn init server (err={})", e);
+            }
+        }
+    } else {
+        log::warn!(
+            "phase 4: server binaries not embedded \
+             (build with --features embed-servers)"
+        );
+    }
 
     // ── Idle ─────────────────────────────────────────────────────────────────
     arch::aarch64::halt();

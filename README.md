@@ -5,9 +5,11 @@ philosophy (a tiny kernel, most OS services in unprivileged processes) with
 an eye on automotive/embedded hypervisor use cases (Qualcomm Gunyah, Zephyr
 guest RTOS, display-oriented UI).
 
-Current state: **Phase 3 complete** — the kernel boots on QEMU's `virt`
-machine, drops from EL2 to EL1, turns on the MMU, and runs a full VirtIO
-message ping-pong with a guest "Zephyr-stub" VM embedded in the kernel image.
+Current state: **Phase 4 complete** — the kernel boots on QEMU's `virt`
+machine, drops from EL2 to EL1, turns on the MMU, runs a full VirtIO
+message ping-pong with a guest "Zephyr-stub" VM, and then boots a set of
+Minix-style server processes (init, pm, mem, dev, worker) that talk to
+each other over synchronous kernel IPC.
 
 ---
 
@@ -18,7 +20,7 @@ message ping-pong with a guest "Zephyr-stub" VM embedded in the kernel image.
 | 1 | AArch64 bare-metal bootstrap: UART, exception vectors, GICv3, timer | ✅ done |
 | 2 | Memory (frame allocator, MMU) + hypervisor backend abstraction | ✅ done |
 | 3 | VirtIO transport between kernel and guest VM (shmem + virtqueue) | ✅ done |
-| 4 | Minix-style server processes (init, memory, device) | ⏳ next |
+| 4 | Minix-style server processes (init, pm, mem, dev, worker) | ✅ done |
 | 5 | Hypervisor assist (Gunyah-style) and display/UI | 🔭 planned |
 
 ---
@@ -27,7 +29,7 @@ message ping-pong with a guest "Zephyr-stub" VM embedded in the kernel image.
 
 ```
 kernel/                  the microkernel itself (no_std, freestanding binary)
-  src/main.rs            boot entry (_start asm stub), kmain, Phase-3 demo loop
+  src/main.rs            boot entry (_start asm stub), kmain, demo loops
   src/arch/aarch64/      CPU-level code
     uart.rs              PL011 driver + log backend
     exception.rs         VBAR_EL1 install, irq/sync dispatchers (vectors.s)
@@ -50,12 +52,20 @@ kernel/                  the microkernel itself (no_std, freestanding binary)
     mod.rs               VmRuntime: cooperative vCPU pair (kernel ↔ guest)
     loader.rs            ELF64 + raw-binary loader
     shmem.rs             shared-memory allocator
-  src/sched/task.rs      register-frame context switch (switch.s asm)
+  src/ipc/               synchronous send/receive channels + syscall table
+  src/sched/             cooperative scheduler; register-frame context switch
+    task.rs              Task / Context (switch.s asm), spawn_server
+  src/server.rs          Phase-4 server registry: embed + spawn by name
   link.ld                kernel image layout (load at 0x4008_0000)
-  build.rs               linker args; embeds the stub binary path
-servers/zephyr-stub/     the guest: a tiny Zephyr-like RTOS PoC
+  build.rs               linker args; emits embedded-binary paths
+servers/zephyr-stub/     the Phase-3 guest: a tiny Zephyr-like RTOS PoC
   src/main.rs            cooperative device loop, VirtIO device side
-servers/init/            Phase-4 placeholder
+servers/init/            root server: spawns pm/mem/dev, drives the demo
+servers/pm/              process manager (spawn/exec via syscall)
+servers/mem/             memory service (grant/query)
+servers/dev/             device service (text I/O)
+servers/worker/          worker binary, exec'd by pm at runtime
+servers/link.ld          server link script (fixed LINK_BASE layout)
 scripts/qemu.sh          QEMU runner (debug/release, embed or fallback)
 scripts/gdb.sh           QEMU + GDB server attach
 justfile                 build/run/lint recipes
@@ -129,6 +139,13 @@ primitives — a 1:1 sketch of the Qualcomm Gunyah API.
   `br x5` (`vm_yield_entry`), which saves the guest context and restores the
   kernel context. `resume_vm` switches back into the guest context.
 
+The boot arguments are caller-saved registers, so the kernel re-establishes
+them on *every* entry — first launch and each resume — because the kernel's
+own execution between a yield and its resume clobbers them. The switch
+itself (`enter_guest`) is a single fused `asm!` block: it loads x4/x5/x6,
+prepares x0/x1, and `bl`s `context_switch`, so no compiler-generated
+instruction can sit between the register loads and the switch.
+
 Because the two contexts live on the same CPU, the exchange is fully
 synchronous and race-free: the guest cannot run while the kernel prepares
 the next message, and vice versa.
@@ -163,8 +180,35 @@ The guest (`servers/zephyr-stub`) is a no_std freestanding binary built to
 the same `aarch64-unknown-none` target and **embedded into the kernel image**
 at compile time via `include_bytes!` (path emitted by `kernel/build.rs`).
 Without the `embed-zephyr-stub` feature, a tiny fallback stub is used that
-boots, yields once, and never answers — so the demo completes with warnings
-instead of hanging.
+resets SP to the top of the guest RAM and loops `br x5` forever, yielding
+control back to the kernel on every resume — the demo then completes with
+warnings instead of hanging.
+
+---
+
+## Minix-style servers (Phase 4)
+
+The kernel boots a set of independent server binaries — `init`, `pm`
+(process manager), `mem` (memory service), `dev` (device service), and
+`worker` — as cooperative scheduler tasks, each in its own private 128 KiB
+memory region with its own stack.
+
+- Servers are separate no_std crates under `servers/`, **embedded into the
+  kernel image** at compile time (`embed-servers` feature, paths emitted by
+  each crate's `build.rs`). They are plain statically-linked executables
+  linked at **fixed** physical bases (`SERVER_BASES` in `kernel/src/server.rs`,
+  clear of the kernel image and Phase-3 guest RAM).
+- At spawn, the kernel zeroes the region, loads the ELF, creates the task,
+  and hands it a `BootInfo` block (syscall table + own task id) preloaded
+  into its callee-saved `x19`.
+- Servers never link against the kernel: they communicate only through the
+  syscall table and through synchronous `send`/`receive` IPC
+  (`kernel/src/ipc/`, rendezvous-style, `MSG_MAX_BYTES = 64`).
+
+Demo flow in `kmain`: spawn `init` → enter the scheduler → `init` spawns
+`pm`/`mem`/`dev` and exercises each service over IPC (dev prints, mem grants
+memory, pm execs the `worker` binary), then the demo completes when every
+server has blocked or finished.
 
 ---
 
@@ -175,13 +219,22 @@ the `aarch64-unknown-none` target, QEMU (`brew install qemu` /
 `apt install qemu-system-arm`), and optionally `just`.
 
 ```sh
-# Phase 3 VirtIO demo (real stub embedded)
+# Phase 4 demo: VirtIO ping-pong + Minix-style server set (recommended)
+just qemu-phase4
+
+# Phase 3 VirtIO demo only (real stub embedded)
 just qemu-phase3
+
+# Fallback demo (no embedded guest/servers — builds and boots anywhere)
+just qemu
 
 # or manually:
 cargo build --package tanix-zephyr-stub --target aarch64-unknown-none
+cargo build --package tanix-libsys --package tanix-init \
+    --package tanix-pm --package tanix-mem --package tanix-dev \
+    --package tanix-worker --target aarch64-unknown-none
 cargo build --package tanix-kernel --target aarch64-unknown-none \
-    --features embed-zephyr-stub
+    --features embed-zephyr-stub,embed-servers
 ./scripts/qemu.sh
 ```
 
@@ -194,8 +247,8 @@ Important QEMU flags (already in `scripts/qemu.sh` / `gdb.sh`):
   GICv2 and the redistributor access aborts.
 
 Recipes: `just kernel` (fallback stub), `just kernel-embed` (real stub),
-`just qemu-release`, `just debug` (GDB), `just lint-all` (clippy with
-`-D warnings`).
+`just kernel-phase4` (servers), `just qemu-release`, `just debug` (GDB),
+`just lint-all` (clippy with `-D warnings`).
 
 ---
 
@@ -204,8 +257,8 @@ Recipes: `just kernel` (fallback stub), `just kernel-embed` (real stub),
 - Single CPU, cooperative scheduling only; no SMP, no interrupts for the
   guest (the SGI doorbell is registered but the demo communicates via the
   yield pair).
-- Page tables pre-map the whole DDR RWX; permissions are tightened in
-  Phase 4.
+- Page tables pre-map the whole DDR RWX; permissions are not yet tightened
+  per server region.
 - The EL2 stage is a one-way drop for now; no hypervisor services exist yet
   (`hvc` handling at EL1 is only exercised under the `gunyah` feature).
 

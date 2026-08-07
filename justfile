@@ -18,6 +18,17 @@ zephyr-stub:
 zephyr-stub-release:
     cargo build --package {{STUB_PKG}} --target {{TARGET}} --release
 
+# Build all Phase-4 server binaries (must be done before kernel-phase4)
+servers:
+    cargo build --package tanix-libsys --package tanix-init \
+        --package tanix-pm --package tanix-mem --package tanix-dev \
+        --package tanix-worker --target {{TARGET}}
+
+# Build the kernel with the Phase-4 server binaries embedded
+kernel-phase4: servers
+    cargo build --package {{KERNEL_PKG}} --target {{TARGET}} \
+        --features embed-servers
+
 # Build the kernel (debug, stub embedded as fallback WFI loop)
 kernel:
     cargo build --package {{KERNEL_PKG}} --target {{TARGET}}
@@ -49,6 +60,10 @@ qemu-phase3: kernel-embed
 
 # Build with real stub embedded and run in QEMU — Phase 2 ping-pong demo
 qemu-phase2: kernel-embed
+    ./scripts/qemu.sh
+
+# Build with Phase-4 servers embedded and run in QEMU — server demo
+qemu-phase4: kernel-phase4
     ./scripts/qemu.sh
 
 # Build (release) and run in QEMU

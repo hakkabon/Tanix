@@ -1,8 +1,8 @@
 [package]
-name = "tanix-init"
+name = "tanix-pm"
 version.workspace = true
 edition.workspace = true
-description = "Tanix init server — root of the Phase-4 server hierarchy"
+description = "Tanix process manager — spawn/kill services (Phase 4)"
 
 [dependencies]
 tanix-libsys = { path = "../libtanix-sys" }

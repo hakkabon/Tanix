@@ -4,6 +4,11 @@ members = [
     "kernel",
     "servers/init",
     "servers/zephyr-stub",
+    "servers/libtanix-sys",
+    "servers/pm",
+    "servers/mem",
+    "servers/dev",
+    "servers/worker",
 ]
 
 [workspace.package]

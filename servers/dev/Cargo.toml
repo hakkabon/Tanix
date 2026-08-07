@@ -1,8 +1,8 @@
 [package]
-name = "tanix-init"
+name = "tanix-dev"
 version.workspace = true
 edition.workspace = true
-description = "Tanix init server — root of the Phase-4 server hierarchy"
+description = "Tanix device server — owns UART0 (Phase 4)"
 
 [dependencies]
 tanix-libsys = { path = "../libtanix-sys" }

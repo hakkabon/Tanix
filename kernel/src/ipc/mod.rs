@@ -6,6 +6,7 @@
 //!   • `channel`    — synchronous copy-based rendezvous channels.
 
 pub mod channel;
+pub mod syscall;
 
 /// Opaque handle identifying a kernel IPC endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

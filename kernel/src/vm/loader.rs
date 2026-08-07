@@ -58,18 +58,19 @@ struct Elf64Phdr {
 /// `ram_base` — physical base address of the guest RAM region.
 /// `ram_size` — size in bytes of the guest RAM region.
 pub fn load_flat(image: &[u8], ram_base: PhysAddr, ram_size: usize) -> Result<PhysAddr, HvError> {
-    if image.len() > ram_size {
-        log::error!(
-            "loader: image {} B > ram {} B",
-            image.len(), ram_size
-        );
-        return Err(HvError::NoMemory);
-    }
-
-    // Try ELF first.
+    // Try ELF first: an ELF's file size includes non-loadable sections
+    // (debug info, symbol tables), so the RAM check is done against the
+    // LOAD-segment footprint inside load_elf64, not the file size.
     if image.len() >= 64 && image[0..4] == ELFMAG {
         load_elf64(image, ram_base, ram_size)
     } else {
+        if image.len() > ram_size {
+            log::error!(
+                "loader: image {} B > ram {} B",
+                image.len(), ram_size
+            );
+            return Err(HvError::NoMemory);
+        }
         load_raw(image, ram_base)
     }
 }
@@ -88,7 +89,7 @@ fn load_raw(image: &[u8], ram_base: PhysAddr) -> Result<PhysAddr, HvError> {
 }
 
 /// Parse an ELF64 AArch64 image and copy LOAD segments into guest RAM.
-fn load_elf64(image: &[u8], ram_base: PhysAddr, _ram_size: usize) -> Result<PhysAddr, HvError> {
+fn load_elf64(image: &[u8], ram_base: PhysAddr, ram_size: usize) -> Result<PhysAddr, HvError> {
     // SAFETY: we have already confirmed image.len() >= 64.
     let hdr: &Elf64Hdr = unsafe { &*(image.as_ptr() as *const Elf64Hdr) };
 
@@ -105,9 +106,10 @@ fn load_elf64(image: &[u8], ram_base: PhysAddr, _ram_size: usize) -> Result<Phys
     let phentsize = { hdr.e_phentsize } as usize;
     let phnum = { hdr.e_phnum } as usize;
 
-    // The guest image links at address 0 (see servers/zephyr-stub/link.ld),
-    // so e_entry is an *offset* within the image.  The absolute guest entry
-    // is the image's load base plus that offset.
+    // The guest image links at address 0 (see servers/link.ld and
+    // servers/zephyr-stub/link.ld), so e_entry is an *offset* within the
+    // image.  The absolute guest entry is the image's load base plus that
+    // offset.
     let entry = ram_base + { hdr.e_entry } as usize;
 
     log::info!(
@@ -115,6 +117,37 @@ fn load_elf64(image: &[u8], ram_base: PhysAddr, _ram_size: usize) -> Result<Phys
         entry, phnum, phoff
     );
 
+    // First pass: validate the program headers and compute the LOAD
+    // footprint (highest vaddr + memsz) to check it fits in the RAM region.
+    let mut footprint: usize = 0;
+    for i in 0..phnum {
+        let phdr_off = phoff + i * phentsize;
+        if phdr_off + phentsize > image.len() {
+            return Err(HvError::NotSupported);
+        }
+        let phdr: &Elf64Phdr = unsafe {
+            &*(image[phdr_off..].as_ptr() as *const Elf64Phdr)
+        };
+
+        if { phdr.p_type } != PT_LOAD {
+            continue;
+        }
+
+        let end = { phdr.p_vaddr } as usize + { phdr.p_memsz } as usize;
+        if end > footprint {
+            footprint = end;
+        }
+    }
+
+    if footprint > ram_size {
+        log::error!(
+            "loader: ELF footprint {} B > ram {} B",
+            footprint, ram_size
+        );
+        return Err(HvError::NoMemory);
+    }
+
+    // Second pass: copy the LOAD segments.
     for i in 0..phnum {
         let phdr_off = phoff + i * phentsize;
         if phdr_off + phentsize > image.len() {
