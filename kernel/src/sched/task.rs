@@ -1,15 +1,18 @@
 #![allow(dead_code)]
-//! Task control block and round-robin scheduler.
+//! Task control block and priority scheduler — Phase 7.
 //!
 //! Each task has:
 //!   • A saved AArch64 register context (callee-saved + SP + PC).
 //!   • A task state (Ready / Running / Blocked / Zombie).
+//!   • A priority (0 = highest, 255 = lowest) — Phase 7.
 //!   • An identity (TaskId + name string).
 //!   • IPC state (receive wait, pending senders, boot info) — Phase 4.
+//!   • An IRQ-wait state (SYS_WAIT_IRQ) — Phase 7.
 //!
-//! The scheduler is a simple round-robin over a fixed-size static array —
-//! no heap allocation required.  This is sufficient for Phase 2 where we
-//! have at most ~4 tasks (kernel idle + init server + 1-2 VM workers).
+//! The scheduler is a fixed-size static array — no heap allocation.  The
+//! run queue is scanned for the highest-priority runnable task, with
+//! round-robin rotation among equal priorities (Phase 7).  Preemption
+//! happens on every timer tick (at EL0) and on every syscall return.
 
 use super::{BootInfo, Message, PendingSend, TaskId, TaskState, M_ANY};
 
@@ -120,6 +123,8 @@ pub struct Task {
     /// kernel contexts and the Phase-3 guest share the kernel's address
     /// space).  Used to map alloc'd frames into EL0-accessible memory.
     pub ttbr0: u64,
+    /// Scheduling priority — 0 is highest, 255 is lowest (Phase 7).
+    pub priority: u8,
     // ── Phase 4 IPC state ────────────────────────────────────────────────────
     /// True while this task is blocked in `receive`.
     pub recv_blocked: bool,
@@ -131,6 +136,11 @@ pub struct Task {
     pub pending_senders: [Option<PendingSend>; MAX_PENDING_SENDERS],
     /// Boot info handed to the task at spawn (x19 at first entry).
     pub boot: BootInfo,
+    // ── Phase 7 IRQ state ────────────────────────────────────────────────────
+    /// The IRQ this task is currently blocked in `SYS_WAIT_IRQ` on
+    /// (None = not waiting).  Only the current task can be in a wait loop
+    /// (the kernel runs on its stack with interrupts unmasked).
+    pub irq_wait: Option<u32>,
 }
 
 impl Task {
@@ -141,11 +151,13 @@ impl Task {
             ctx: Context::zeroed(),
             name: *b"idle\0\0\0\0\0\0\0\0\0\0\0\0",
             ttbr0: 0,
+            priority: super::PRIO_IDLE,
             recv_blocked: false,
             recv_filter: M_ANY,
             recv_buf: core::ptr::null_mut(),
             pending_senders: [None, None],
             boot: BootInfo { task_id: 0 },
+            irq_wait: None,
         }
     }
 
@@ -160,11 +172,13 @@ impl Task {
             ctx: Context::new(entry, stack_top),
             name: name_buf,
             ttbr0: 0,
+            priority: super::PRIO_NORMAL,
             recv_blocked: false,
             recv_filter: M_ANY,
             recv_buf: core::ptr::null_mut(),
             pending_senders: [None, None],
             boot: BootInfo { task_id: 0 },
+            irq_wait: None,
         }
     }
 
@@ -177,7 +191,10 @@ impl Task {
 // ── Scheduler ─────────────────────────────────────────────────────────────────
 
 /// Maximum number of concurrent tasks (including idle).
-pub const MAX_TASKS: usize = 8;
+///
+/// Phase 4/5/7: idle + init + pm + mem + dev + worker + display + ui-demo
+/// + hog = 9 slots in use; headroom for a couple more.
+pub const MAX_TASKS: usize = 12;
 
 pub struct Scheduler {
     tasks: [Option<Task>; MAX_TASKS],
@@ -191,7 +208,7 @@ impl Scheduler {
         Self {
             tasks: [
                 Some(Task::idle()), // slot 0 = idle task
-                None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None,
             ],
             current: 0,
             next_id: 1,
@@ -318,27 +335,37 @@ impl Scheduler {
             .unwrap_or(TaskId(0))
     }
 
-    /// Pick the next Ready task (round-robin, skipping Blocked/Zombie).
+    /// Pick the best Ready/Running task (Phase 7 priorities).
     /// Returns the index of the chosen task.
     ///
-    /// The idle slot (index 0) is a fallback only: it is chosen when no
-    /// other task is runnable (e.g. every server is blocked in IPC), so
-    /// `enter()` can resume the kernel boot context.
+    ///  • Highest priority wins (lowest numeric value).
+    ///  • Equal priorities rotate round-robin: ties are broken by forward
+    ///    distance from the current slot, so the same task is never picked
+    ///    twice in a row while others are runnable.
+    ///  • The idle slot (index 0) is a fallback only: it is chosen when no
+    ///    other task is runnable (e.g. every server is blocked in IPC), so
+    ///    `enter()` can resume the kernel boot context.
     pub fn pick_next(&mut self) -> usize {
         let n = self.tasks.len();
-        let start = (self.current + 1) % n;
-        for i in 0..n {
-            let idx = (start + i) % n;
-            if idx == 0 {
-                continue;
-            }
+        let cur = self.current;
+        let mut best: Option<(u8, usize)> = None; // (priority, slot)
+        for idx in 1..n {
             if let Some(ref t) = self.tasks[idx] {
                 if t.state == TaskState::Ready || t.state == TaskState::Running {
-                    return idx;
+                    let forward = (idx + n - cur - 1) % n;
+                    match best {
+                        None => best = Some((t.priority, idx)),
+                        Some((bp, bi)) => {
+                            let bfwd = (bi + n - cur - 1) % n;
+                            if t.priority < bp || (t.priority == bp && forward < bfwd) {
+                                best = Some((t.priority, idx));
+                            }
+                        }
+                    }
                 }
             }
         }
-        0 // nothing runnable — idle
+        best.map(|(_, idx)| idx).unwrap_or(0)
     }
 
     /// Return a raw pointer to task `idx`'s context.
@@ -361,6 +388,18 @@ impl Scheduler {
         if let Some(ref mut t) = self.tasks[idx] {
             t.state = state;
         }
+    }
+
+    /// Change a task's scheduling priority (0 = highest, 255 = lowest).
+    pub fn set_priority(&mut self, id: TaskId, priority: u8) {
+        if let Some(t) = self.task_by_id_mut(id) {
+            t.priority = priority;
+        }
+    }
+
+    /// (Priority, name) of the task in slot `idx`.
+    pub fn priority_and_name(&self, idx: usize) -> Option<(u8, &str)> {
+        self.tasks[idx].as_ref().map(|t| (t.priority, t.name_str()))
     }
 }
 
@@ -420,9 +459,118 @@ pub fn current_ttbr0() -> u64 {
     }
 }
 
+/// Change a task's scheduling priority (0 = highest, 255 = lowest).
+pub fn set_task_priority(id: TaskId, priority: u8) {
+    unsafe {
+        (*core::ptr::addr_of_mut!(SCHEDULER)).set_priority(id, priority);
+    }
+}
+
+/// Core of every preemptive reschedule: if the current task is runnable
+/// and a better task exists, switch to it.  Returns `true` if a switch
+/// happened (the caller is now a different task).
+///
+/// The current task's state must be `Running` for it to be rotated back
+/// into the run queue; blocked tasks are left alone.
+///
+/// `strict` selects the eligibility rule:
+///   • `false` (timer tick at EL0): any better pick — including an
+///     equal-priority RR rotation.  Safe: the current task is at EL0 and
+///     will reach a blocking point / the next tick naturally.
+///   • `true` (syscall tail, yield): only a *strictly higher*-priority
+///     task.  Same-priority tasks whose syscall tails are suspended must
+///     not switch into each other — that would ping-pong forever between
+///     two tails with neither ever returning to EL0.  Equal-priority
+///     rotation happens on ticks instead.
+///
+/// # Safety
+/// Must be called from EL1 with interrupts masked (the caller owns the
+/// stack that the preempted context is saved on).
+unsafe fn switch_best(strict: bool) -> bool {
+    let sched = &mut *core::ptr::addr_of_mut!(SCHEDULER);
+    let cur = sched.current_idx();
+    if cur == 0 {
+        return false; // boot context — never preempt it
+    }
+    let cur_running = sched.tasks[cur]
+        .as_ref()
+        .map(|t| t.state == TaskState::Running)
+        .unwrap_or(false);
+    if !cur_running {
+        return false;
+    }
+    let next = sched.pick_next();
+    if next == cur {
+        return false;
+    }
+    let cur_prio = sched.priority_and_name(cur).map(|(p, _)| p).unwrap_or(255);
+    let next_prio = sched
+        .priority_and_name(next)
+        .map(|(p, _)| p)
+        .unwrap_or(255);
+    if strict && next_prio >= cur_prio {
+        return false;
+    }
+    log::trace!(
+        "sched: preempt '{}'(p{}) -> '{}'(p{})",
+        sched.priority_and_name(cur).map(|(_, n)| n).unwrap_or("?"),
+        cur_prio,
+        sched.priority_and_name(next).map(|(_, n)| n).unwrap_or("?"),
+        next_prio,
+    );
+    let from = sched.ctx_ptr(cur);
+    let to = sched.ctx_ptr(next);
+    sched.set_state(cur, TaskState::Ready);
+    sched.set_state(next, TaskState::Running);
+    sched.set_current(next);
+    context_switch(from, to);
+    true
+}
+
+/// Preemption entry point for the timer-tick IRQ handler (Phase 7).
+///
+/// `from_el0` must be `true` only when the tick interrupted an EL0 task —
+/// ticks landing in the kernel (e.g. inside the `SYS_WAIT_IRQ` wait loop,
+/// which runs with IRQs unmasked) never preempt; they just record the
+/// tick.  When the preempted task is later resumed, it continues inside
+/// `irq_handler` after the switch and returns to its interrupted EL0 point
+/// via the IRQ frame's saved ELR/SPSR.
+///
+/// # Safety
+/// Called from `irq_handler` (interrupts masked by hardware).
+pub unsafe fn tick_preempt(from_el0: bool) {
+    if !from_el0 {
+        return;
+    }
+    let sched = &mut *core::ptr::addr_of_mut!(SCHEDULER);
+    let cur = sched.current_idx();
+    if cur == 0 {
+        return; // tick landed in the boot context — nothing to preempt
+    }
+    let _ = switch_best(false);
+}
+
+/// Cooperative `SYS_YIELD` — hand the CPU to a strictly higher-priority
+/// task, if any is runnable (equal-priority rotation happens on ticks).
+///
+/// # Safety
+/// Called from the syscall dispatcher (EL1, interrupts masked).
+pub unsafe fn yield_cpu() {
+    let _ = switch_best(true);
+}
+
+/// Preemption check run at the end of every syscall: if a strictly
+/// higher-priority task became runnable (woken by this syscall), switch to
+/// it before returning to EL0.
+///
+/// # Safety
+/// Called from the syscall dispatcher (EL1, interrupts masked).
+pub unsafe fn reschedule() {
+    let _ = switch_best(true);
+}
+
 /// Name of the currently running task.
-pub fn current_name() -> &'static str {
-    // SAFETY: the scheduler's static task table lives for the whole program.
+pub fn current_name() -> &'static str {    // SAFETY: the scheduler's static task table lives for the whole program.
     unsafe {
         let sched = &*core::ptr::addr_of!(SCHEDULER);
         let name = sched.current_name();

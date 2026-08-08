@@ -37,9 +37,13 @@ __vectors:
 1:  b    1b
 .endm
 
-// ── Macro: save caller-saves, call irq_handler(), restore, return ────────────
+// ── Macro: save caller-saves, call irq_handler(from_el0), restore, return ────
+//
+// `\lower` is 0 for current-EL IRQs (slot 5 — landed inside the kernel,
+// e.g. the SYS_WAIT_IRQ wait loop) and 1 for lower-EL IRQs (slot 9 — an
+// EL0 task was interrupted).  The scheduler only preempts on the latter.
 
-.macro IRQ_ENTRY
+.macro IRQ_ENTRY lower
     // Save all caller-saved registers (x0-x18, x29, x30, SP alignment).
     sub  sp, sp, #176
     stp  x0,  x1,  [sp,   #0]
@@ -56,6 +60,7 @@ __vectors:
     mrs  x1,  SPSR_EL1
     stp  x0,  x1,  [sp, #160]
 
+    mov  x0, #\lower
     bl   irq_handler
 
     // Restore and return.
@@ -171,9 +176,9 @@ __vectors:
 .balign 128
     EXCEPTION_ENTRY 4
 
-// 5: Current EL / SPx — IRQ  ← real IRQ handler
+// 5: Current EL / SPx — IRQ  ← IRQ landed inside the kernel (wait loop)
 .balign 128
-    IRQ_ENTRY
+    IRQ_ENTRY 0
 
 // 6: Current EL / SPx — FIQ
 .balign 128
@@ -187,9 +192,9 @@ __vectors:
 .balign 128
     LOWER_SYNC_ENTRY
 
-// 9: Lower EL (AArch64) — IRQ  ← real IRQ handler
+// 9: Lower EL (AArch64) — IRQ  ← EL0 task interrupted; preemption point
 .balign 128
-    IRQ_ENTRY
+    IRQ_ENTRY 1
 
 // 10: Lower EL (AArch64) — FIQ
 .balign 128

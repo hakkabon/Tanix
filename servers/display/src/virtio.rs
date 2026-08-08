@@ -7,9 +7,12 @@
 //! 1), so this driver uses the old interface: a single-page-aligned vring
 //! addressed by physical frame number (`QueuePFN`).
 //!
-//! Everything here is plain MMIO (device-nGnRnE, pre-mapped by the kernel)
-//! — the display server never needs interrupts: it polls the used ring
-//! right after kicking, like a synchronous block-device request.
+//! Everything here is plain MMIO (device-nGnRnE, pre-mapped by the kernel).
+//! Transfers are interrupt-driven (Phase 7): after kicking a queue the
+//! driver blocks on `SYS_WAIT_IRQ` for the device's interrupt (SPI 48+slot,
+//! level-triggered), acknowledges it via INT_STATUS/INT_ACK, and then
+//! drains the used ring.  The poll loop below is kept as a fallback for
+//! requests that completed before the wait returned.
 
 use core::ptr;
 
@@ -21,6 +24,8 @@ pub const MMIO_BASE: usize = 0x0A00_0000;
 pub const SLOT_SIZE: usize = 0x200;
 /// Number of slots to probe.
 pub const SLOTS: usize = 32;
+/// First interrupt the virtio-mmio devices use (see kernel gic.rs).
+pub const IRQ_BASE: u32 = 48;
 
 // Transport registers (virtio-mmio; QEMU hw/virtio/virtio-mmio.h).  This
 // build of QEMU shares one register map between legacy and modern modes:
@@ -38,6 +43,8 @@ const REG_QUEUE_NUM: usize = 0x038;
 const REG_QUEUE_ALIGN: usize = 0x03C;
 const REG_QUEUE_PFN: usize = 0x040;
 const REG_QUEUE_NOTIFY: usize = 0x050;
+const REG_INTERRUPT_STATUS: usize = 0x060;
+const REG_INTERRUPT_ACK: usize = 0x064;
 const REG_STATUS: usize = 0x070;
 
 const MAGIC_VALUE: u32 = 0x7472_6976; // "virt" (see note on legacy layout)
@@ -151,6 +158,20 @@ pub fn find(device_id: u32) -> Option<Device> {
 }
 
 impl Device {
+    /// The interrupt number (SPI) this transport uses on the kernel's GIC:
+    /// `48 + slot` (QEMU `virt` machine).
+    pub fn irq(&self) -> u32 {
+        IRQ_BASE + ((self.base - MMIO_BASE) / SLOT_SIZE) as u32
+    }
+
+    /// Acknowledge the device's interrupt.  The transport is level-triggered:
+    /// reading INT_STATUS returns the pending bits; writing them back to
+    /// INT_ACK deasserts the line, so the GIC's SPI drops.
+    pub fn ack_interrupt(&self) {
+        let status = read32(self.base, REG_INTERRUPT_STATUS);
+        write32(self.base, REG_INTERRUPT_ACK, status);
+    }
+
     /// Reset the device: status = 0, then ACKNOWLEDGE | DRIVER.
     pub fn reset(&self) {
         write32(self.base, REG_STATUS, 0);
@@ -199,9 +220,10 @@ impl Device {
     /// chain, `response` is the final WRITE buffer.
     ///
     /// The caller must keep `request`/`response` alive until this returns.
-    /// Synchronous: kicks the queue, then polls the used ring until the
-    /// chain's head descriptor is returned.  Returns the length the device
-    /// wrote into `response`.
+    /// Synchronous: kicks the queue, blocks on `SYS_WAIT_IRQ` until the
+    /// device interrupts, acknowledges it, then drains the used ring until
+    /// the chain's head descriptor is returned.  Returns the length the
+    /// device wrote into `response`.
     pub fn submit(
         &self,
         queue: &mut VirtQueue,
@@ -240,6 +262,15 @@ impl Device {
 
         // Kick.
         write32(self.base, REG_QUEUE_NOTIFY, 0);
+
+        // Phase 7: block until the device raises its interrupt (the kernel
+        // enables the SPI on first wait, records the pending edge, and
+        // wakes us), then deassert it.  Level-triggered, so a completion
+        // that beat the wait still leaves the line high → no lost wakeup.
+        let irq = self.irq();
+        if sys::wait_irq(irq) >= 0 {
+            self.ack_interrupt();
+        }
 
         // Poll until the device completes our head descriptor.
         let mut used_tail = queue.used_tail; // copy before vring borrow

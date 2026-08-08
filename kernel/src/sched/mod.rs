@@ -3,7 +3,12 @@
 //!
 //! Provides:
 //!   • `TaskId` / `TaskState` — core scheduler types.
-//!   • `task`   — Task control block, Context, and round-robin Scheduler.
+//!   • `task`   — Task control block, Context, and priority Scheduler.
+//!
+//! Phase 7: the scheduler is preemptive — a periodic timer tick (1 ms)
+//! preempts EL0 tasks (highest priority first, round-robin within a
+//! priority), and every syscall return re-evaluates the run queue so a
+//! woken higher-priority task runs immediately.
 
 pub mod task;
 
@@ -27,6 +32,17 @@ pub enum TaskState {
     Blocked,
     Zombie,
 }
+
+// ── Priorities (Phase 7) ──────────────────────────────────────────────────────
+//
+// Lower number = higher priority.  Idle is the lowest; everything else is
+// assigned per server in `server.rs` (display: 32, ui-demo: 96, the
+// Phase-4 servers: 128, the `hog` spin demo: 192).
+
+/// The idle slot — never wins the run queue while anything else runs.
+pub const PRIO_IDLE: u8 = 255;
+/// Default for plain tasks (kernel-side tasks, the Phase-4 servers).
+pub const PRIO_NORMAL: u8 = 128;
 
 // ── IPC primitives (shared ABI with the server binaries) ─────────────────────
 

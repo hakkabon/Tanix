@@ -4,6 +4,7 @@
 mod arch;
 mod hypervisor;
 mod ipc;
+mod irq;
 mod mem;
 mod panic;
 mod sched;
@@ -148,6 +149,14 @@ fn kmain() -> ! {
     unsafe { mem::frame::init(kernel_end); }
     unsafe { mem::page_table::enable(); }
 
+    // Reserve the server regions in the frame allocator *before* any
+    // dynamic allocation (shmem, guest RAM, framebuffers): the regions are
+    // fixed addresses (the servers link there), so nobody else may receive
+    // frames that overlap a live server image.
+    if server::available() {
+        server::reserve_regions();
+    }
+
     let hv = hypervisor::detect_backend();
 
     // ── Phase 3: VirtIO shared-memory transport ───────────────────────────────
@@ -270,7 +279,6 @@ fn kmain() -> ! {
     log::info!("phase 4: booting Minix-style server set");
 
     if server::available() {
-        server::reserve_regions();
         match server::spawn_by_name("init") {
             Ok(id) => {
                 log::info!("phase 4: init server spawned as {:?}", id);
@@ -310,6 +318,41 @@ fn kmain() -> ! {
             sched::enter();
         }
         log::info!("phase 5: display stack idle");
+    }
+
+    // ── Phase 7: preemptive priority scheduler + device IRQs ─────────────────
+    //
+    // The scheduler is now preemptive: a 1 ms EL1 physical timer tick
+    // (GIC PPI 26) fires even while a task spins at EL0, and `SYS_WAIT_IRQ`
+    // lets a server block until its device interrupt arrives (the display
+    // server uses it for the virtio-gpu).
+    //
+    // `hog` is the proof: a CPU-bound EL0 spin at the lowest priority.
+    // Under the Phase-4/5 cooperative scheduler `enter` would never return
+    // while hog spins; with tick preemption higher-priority work (and the
+    // device IRQ path) always gets its quantum.  kmain never returns from
+    // the final `enter` — hog runs forever — and the tick trace lines show
+    // preemption in action.
+
+    if server::available() {
+        let hog = server::spawn_by_name("hog");
+        log::info!("phase 7: hog spawned ({:?})", hog);
+
+        // Enable the EL1 physical-timer interrupt (PPI 26) and arm the
+        // periodic 1 ms tick.
+        arch::aarch64::gic::enable_irq(26);
+        arch::aarch64::timer::init_tick();
+        log::info!("phase 7: preemption tick armed (PPI 26)");
+
+        unsafe {
+            sched::enter();
+        }
+        log::info!("phase 7: scheduler idle (unreachable — hog never blocks)");
+    } else {
+        log::warn!(
+            "phase 7: server binaries not embedded \
+             (build with --features embed-servers)"
+        );
     }
 
     // ── Idle ─────────────────────────────────────────────────────────────────

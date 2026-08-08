@@ -23,6 +23,8 @@ pub const SYS_EXIT: u64 = 5;
 pub const SYS_ALLOC_FRAMES: u64 = 6;
 pub const SYS_FREE_FRAMES: u64 = 7;
 pub const SYS_LOG: u64 = 8;
+pub const SYS_WAIT_IRQ: u64 = 9; // Phase 7: block until a device IRQ fires
+pub const SYS_YIELD: u64 = 10; // Phase 7: cooperative yield
 
 /// Invoke syscall `nr` with arguments `a0..a2`; returns the kernel's x0.
 ///
@@ -127,6 +129,23 @@ pub fn log(level: u32, msg: &str) {
     let n = msg.len().min(buf.len() - 1);
     buf[..n].copy_from_slice(&msg.as_bytes()[..n]);
     unsafe { raw_syscall(SYS_LOG, level as u64, buf.as_ptr() as u64, 0) };
+}
+
+/// `wait_irq(irq)` — Phase 7.  Blocks until the device interrupt `irq` has
+/// been delivered; the kernel enables it in the GIC on the first wait.
+/// Returns `0` on success (negative = invalid IRQ).
+///
+/// Intended for virtio-mmio devices: `irq = 48 + slot` (see the display
+/// server's virtio driver).
+pub fn wait_irq(irq: u32) -> i32 {
+    unsafe { raw_syscall(SYS_WAIT_IRQ, irq as u64, 0, 0) as i32 }
+}
+
+/// `yield_cpu()` — Phase 7.  Cooperative yield: hand the CPU to a strictly
+/// higher-priority runnable task, if any (equal-priority rotation happens
+/// on the preemption tick).
+pub fn yield_cpu() {
+    unsafe { raw_syscall(SYS_YIELD, 0, 0, 0) };
 }
 
 /// Own-task id, cached from boot info (cheap).

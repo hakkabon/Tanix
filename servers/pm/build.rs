@@ -9,5 +9,5 @@ fn main() {
     println!("cargo:rustc-link-arg=--entry=_start");
     println!("cargo:rustc-link-arg=--no-dynamic-linker");
     // Link the server at its final runtime address (see kernel server.rs).
-    println!("cargo:rustc-link-arg=--defsym=LINK_BASE=0x40720000");
+    println!("cargo:rustc-link-arg=--defsym=LINK_BASE=0x40920000");
 }

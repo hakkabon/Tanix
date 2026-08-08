@@ -1,12 +1,21 @@
 #![allow(dead_code)]
-//! aarch64 generic timer — Phase 1 stub.
+//! aarch64 generic timer — Phase 7 scheduler tick.
 //!
 //! The ARM Generic Timer provides per-CPU physical and virtual countdown
-//! timers.  We use the EL1 Physical Timer (CNTP_*) which is available
+//! timers.  We use the EL1 Physical Timer (CNTP_*), which is available
 //! without EL2/EL3 configuration on QEMU `virt`.
 //!
 //! Phase 1: initialise the timer and confirm it counts (used for busy-wait
-//! delays and future scheduler tick).
+//! delays).
+//!
+//! Phase 7: the timer is the preemption source.  `init_tick` grants EL1
+//! access to the CNTP registers (CNTKCTL_EL1), enables the physical timer
+//! interrupt in the GIC (**PPI 26** — CNTPNSIRQ on QEMU `virt`; PPI 30 is
+//! the EL2/secure-only CNTHP) and arms a periodic 1 ms tick.  Every tick
+//! fires the current-EL / lower-EL IRQ vector and the scheduler decides
+//! whether to preempt.
+
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Read the current counter frequency (Hz) from CNTFRQ_EL0.
 #[inline]
@@ -49,10 +58,21 @@ pub fn busy_wait_ms(ms: u64) {
     }
 }
 
+/// Milliseconds per scheduler tick (the preemption quantum).
+pub const TICK_PERIOD_MS: u64 = 1;
+
+/// Number of ticks delivered since `init_tick` (informational / tests).
+static TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Total ticks delivered so far.
+pub fn ticks() -> u64 {
+    TICKS.load(Ordering::Relaxed)
+}
+
 /// Arm the EL1 physical timer to fire after `ticks` counts.
 ///
-/// The interrupt (GIC IRQ 30 = PPI CNTP) must be enabled in the GIC
-/// separately.  This just sets CNTP_TVAL_EL0 and enables the timer.
+/// The interrupt (GIC PPI 26) must be enabled separately.  This just sets
+/// CNTP_TVAL_EL0 and enables the timer.
 pub fn arm(ticks: u64) {
     unsafe {
         core::arch::asm!(
@@ -64,6 +84,11 @@ pub fn arm(ticks: u64) {
             options(nomem, nostack)
         );
     }
+}
+
+/// Arm the periodic tick: `TICK_PERIOD_MS` from now.
+pub fn arm_next() {
+    arm(frequency() / 1000 * TICK_PERIOD_MS);
 }
 
 /// Disarm / mask the EL1 physical timer.
@@ -82,4 +107,31 @@ pub fn disarm() {
 /// For Phase 1 this just disarms the timer so it doesn't fire spuriously.
 pub fn init() {
     disarm();
+}
+
+/// Start the Phase-7 preemption tick.
+///
+/// 1. Grants EL1 access to the CNTP registers (CNTKCTL_EL1.ENPCT/ENPTC/
+///    ENVTC) — without ENPTC the `msr CNTP_TVAL_EL0` above would trap.
+/// 2. Arms the periodic 1 ms tick.  The interrupt must already be enabled
+///    in the GIC (`gic::enable_irq(26)`).
+pub fn init_tick() {
+    unsafe {
+        core::arch::asm!(
+            "msr cntkctl_el1, {ctl}",
+            "isb",
+            ctl = in(reg) 0b111u64, // ENPCT | ENPTC | ENVTC
+            options(nomem, nostack)
+        );
+    }
+    TICKS.store(0, Ordering::Relaxed);
+    arm_next();
+    log::info!("timer: preemption tick armed ({} ms, {} Hz)", TICK_PERIOD_MS, frequency() / 1000 * 1000 / TICK_PERIOD_MS);
+}
+
+/// Called from the IRQ handler on every physical-timer interrupt: count it
+/// and re-arm the next tick.
+pub fn tick() {
+    TICKS.fetch_add(1, Ordering::Relaxed);
+    arm_next();
 }

@@ -43,6 +43,8 @@ pub const SYS_EXIT: u64 = 5;
 pub const SYS_ALLOC_FRAMES: u64 = 6;
 pub const SYS_FREE_FRAMES: u64 = 7;
 pub const SYS_LOG: u64 = 8;
+pub const SYS_WAIT_IRQ: u64 = 9; // Phase 7: block until a device IRQ fires
+pub const SYS_YIELD: u64 = 10; // Phase 7: cooperative yield (RR rotation)
 
 // ── Active TTBR0 helpers ──────────────────────────────────────────────────────
 
@@ -317,6 +319,63 @@ unsafe fn sys_free_frames(base: u64, pages: u32) -> i32 {
     0
 }
 
+// ── IRQ syscalls (Phase 7) ────────────────────────────────────────────────────
+
+/// `wait_irq(irq) -> 0`.  Blocks the calling task until the device
+/// interrupt `irq` has been delivered; the interrupt is enabled in the GIC
+/// lazily on the first wait.
+///
+/// Implementation notes:
+///   • The caller is parked in a *kernel* wait loop.  IRQs are masked
+///     whenever the CPU is in the kernel, so the loop runs with IRQs
+///     unmasked (`daifclr #2`) and sleeps in `wfi` — the device IRQ (or the
+///     tick) wakes the core, `irq_handler` records the pending bit, and the
+///     loop re-tests it.  The handler never switches away from this loop
+///     (its `from_el0` is false), so the waiter's kernel stack stays
+///     consistent.
+///   • An IRQ that arrived *before* the wait is recorded by the handler and
+///     returns immediately (test-and-clear first).
+unsafe fn sys_wait_irq(irq: u32) -> i32 {
+    let sched = crate::sched::task::scheduler();
+    let my_idx = sched.current_idx();
+
+    // PPIs 16..31, SPIs 32..1019 — anything the GIC can deliver.
+    if !(16..=1019).contains(&irq) {
+        return -10; // invalid IRQ
+    }
+    crate::arch::aarch64::gic::enable_irq(irq);
+
+    if crate::irq::take_pending(irq) {
+        return 0; // already serviced
+    }
+
+    sched.task_at_mut(my_idx).unwrap().irq_wait = Some(irq);
+
+    // Wait loop: interrupts unmasked, sleeping in wfi.
+    //
+    // The pending check is the FIRST instruction after `daifclr`: if the
+    // IRQ was already asserted (level-triggered device, completed request
+    // before we armed the GIC), the delivery fires immediately after
+    // unmasking and the handler records the bit *before* eret — so the
+    // re-executed check observes it.  With the check placed after the
+    // `wfi` instead, eret would resume at the `wfi` (the IRQ can land at
+    // any instruction, even the branch before it) and sleep forever: the
+    // level is high but `irq_handler` disabled the SPI, so no wake ever
+    // comes again.
+    core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); // clear I
+    loop {
+        if crate::irq::pending(irq) {
+            break;
+        }
+        core::arch::asm!("wfi", options(nomem, nostack));
+    }
+    core::arch::asm!("msr daifset, #2", options(nomem, nostack)); // set I
+    let t = sched.task_at_mut(my_idx).unwrap();
+    t.irq_wait = None;
+    crate::irq::clear_pending(irq);
+    0
+}
+
 // ── Logging syscall ───────────────────────────────────────────────────────────
 
 /// `log(level, msg)` — kernel log line prefixed with the sender's name.
@@ -351,7 +410,7 @@ unsafe fn sys_log(level: u32, msg: *const u8) {
 #[no_mangle]
 pub unsafe extern "C" fn tanix_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     let _ = a2; // reserved (Phase 6 ABI: x3 defined, unused so far)
-    match nr {
+    let result = match nr {
         SYS_SEND => sys_send(a0 as u32, a1 as *const Message) as u64,
         SYS_RECEIVE => sys_receive(a0 as i32, a1 as *mut Message) as u64,
         SYS_SPAWN => sys_spawn(a0 as *const u8) as u64,
@@ -366,6 +425,11 @@ pub unsafe extern "C" fn tanix_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> u6
             sys_log(a0 as u32, a1 as *const u8);
             0
         }
+        SYS_WAIT_IRQ => sys_wait_irq(a0 as u32) as u64,
+        SYS_YIELD => {
+            crate::sched::task::yield_cpu();
+            0
+        }
         other => {
             log::error!(
                 "syscall: task '{}' invoked unknown syscall {}",
@@ -374,5 +438,11 @@ pub unsafe extern "C" fn tanix_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> u6
             );
             0
         }
-    }
+    };
+    // Phase 7: every syscall return re-evaluates the run queue.  A task
+    // woken by this syscall (higher priority, or next in the RR rotation)
+    // runs before we return to EL0.  When we are resumed, the saved
+    // syscall frame continues here and hands `result` to the caller.
+    crate::sched::task::reschedule();
+    result
 }

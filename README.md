@@ -27,6 +27,7 @@ input injected through QEMU's QMP monitor.
 | 4 | Minix-style server processes (init, pm, mem, dev, worker) | ✅ done |
 | 5 | Display/UI stack: virtio-gpu framebuffer + virtio-tablet pointer, driven by a Minix-style display server | ✅ done |
 | 6 | Hypervisor assist (Gunyah-style) | 🔭 planned |
+| 7 | Preemptive priority scheduler + device IRQs (timer tick, GIC PPIs/SPIs, `SYS_WAIT_IRQ` for virtio devices) | ✅ done |
 
 ---
 
@@ -298,6 +299,48 @@ doubles as the input polling loop.
 
 ---
 
+## Preemptive scheduler + device IRQs (Phase 7)
+
+Phase 7 replaces the cooperative scheduler with a preemptive,
+priority-based one, and turns the virtio-gpu path interrupt-driven:
+
+- **Priorities** — each server gets a fixed priority (lower number runs
+  first): display `32`, ui-demo `96`, the Phase-4 servers `128`, the `hog`
+  demo `192`, idle `255`.  Equal priorities rotate round-robin on ticks.
+- **Timer tick** — `timer.rs` arms the EL1 physical timer (GIC **PPI 26**
+  = CNTPNSIRQ on QEMU `virt`; the old PPI 30 was the EL2-only CNTHP and
+  never fired) for a periodic 1 ms tick.  `CNTKCTL_EL1 = 0b111` grants EL1
+  access to the CNTP_EL0 registers.
+- **Preemption** — every tick that lands on an EL0 task runs the scheduler
+  (`tick_preempt`); ticks inside the kernel (e.g. the `SYS_WAIT_IRQ` wait
+  loop) only count.  `IRQ_ENTRY` in `vectors.s` passes `from_el0` to
+  `irq_handler`, and a preempted task resumes through its saved IRQ frame
+  (the kernel stack the frame lives on is the task's own).
+- **Syscall-tail reschedule** — every syscall return re-evaluates the run
+  queue; a strictly higher-priority task woken by the syscall runs
+  immediately (equal-priority rotation stays on the tick, which avoids
+  ping-ponging between suspended syscall tails).
+- **`SYS_WAIT_IRQ`** — a server blocks until its device interrupt arrives.
+  The kernel enables the IRQ in the GIC lazily (Group 1NS — the kernel
+  runs non-secure EL1, so Group 0 interrupts would never be delivered),
+  records the delivery in a pending bitmap, and the waiter sleeps in `wfi`
+  with IRQs unmasked.  Level-triggered virtio-mmio lines can't lose
+  completions: an IRQ that beats the wait leaves the line high.
+- **virtio-gpu interrupt-driven** — `Device::irq()` computes the SPI
+  (`48 + slot`), and `submit()` blocks on `SYS_WAIT_IRQ` then deasserts
+  the line via INT_STATUS/INT_ACK before draining the used ring.
+- **`hog`** — a lowest-priority CPU-bound server (spin + periodic log +
+  `yield_cpu`).  Under the old cooperative scheduler a spinning task would
+  starve the system forever; now the tick keeps preempting and the log
+  shows `irq: tick #N` + `sched: preempt` lines while hog spins.
+
+```sh
+# Phase 7 demo: preemptive scheduler + IRQ-driven GPU (recommended)
+just qemu-phase7 -qmp unix:/tmp/qmp.sock,server=on,wait=off
+```
+
+---
+
 ## Build & run
 
 Prerequisites: Rust `nightly-2026-07-01` (pinned by `rust-toolchain.toml`),
@@ -305,6 +348,10 @@ the `aarch64-unknown-none` target, QEMU (`brew install qemu` /
 `apt install qemu-system-arm`), and optionally `just`.
 
 ```sh
+# Phase 7 demo: preemptive scheduler + IRQ-driven GPU (recommended) — pass
+# the QMP socket to inject mouse input and take screenshots
+just qemu-phase7 -qmp unix:/tmp/qmp.sock,server=on,wait=off
+
 # Phase 5 demo: display stack + UI (recommended) — pass the QMP socket to
 # inject mouse input and take screenshots (see "Driving the UI" below)
 just qemu-phase5 -qmp unix:/tmp/qmp.sock,server=on,wait=off
@@ -323,7 +370,7 @@ cargo build --package tanix-zephyr-stub --target aarch64-unknown-none
 cargo build --package tanix-libsys --package tanix-libtanix-ui \
     --package tanix-init --package tanix-pm --package tanix-mem \
     --package tanix-dev --package tanix-worker --package tanix-display \
-    --package tanix-ui-demo --target aarch64-unknown-none
+    --package tanix-ui-demo --package tanix-hog --target aarch64-unknown-none
 cargo build --package tanix-kernel --target aarch64-unknown-none \
     --features embed-zephyr-stub,embed-servers
 ./scripts/qemu.sh -device virtio-gpu-device -device virtio-tablet-device
