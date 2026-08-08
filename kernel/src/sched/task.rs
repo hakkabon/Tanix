@@ -14,7 +14,7 @@
 //! round-robin rotation among equal priorities (Phase 7).  Preemption
 //! happens on every timer tick (at EL0) and on every syscall return.
 
-use super::{BootInfo, Message, PendingSend, TaskId, TaskState, M_ANY};
+use super::{BootInfo, Message, PendingSend, StagedSend, TaskId, TaskState, M_ANY};
 
 // ── Saved register context ────────────────────────────────────────────────────
 
@@ -23,9 +23,11 @@ use super::{BootInfo, Message, PendingSend, TaskId, TaskState, M_ANY};
 /// but no interrupt source is ever enabled, so DAIF stays masked).
 pub const SPSR_KERNEL: u64 = 0x3C5;
 
-/// SPSR_EL1 value for EL0 tasks: EL0t, all exceptions masked (same DAIF
-/// policy as the kernel itself).
-pub const SPSR_USER: u64 = 0x3C0;
+/// SPSR_EL1 value for EL0 tasks: EL0t with IRQs **unmasked** — the timer
+/// tick must be able to interrupt user code (slot 9, `from_el0=1`) or the
+/// lower-priority tasks would starve: ticks would only ever land inside
+/// the kernel's `SYS_WAIT_IRQ` wait loop, where no preemption is allowed.
+pub const SPSR_USER: u64 = 0x0;
 
 /// Saved register context.
 ///
@@ -134,6 +136,12 @@ pub struct Task {
     pub recv_buf: *mut Message,
     /// Senders blocked because their `send` could not rendezvous yet.
     pub pending_senders: [Option<PendingSend>; MAX_PENDING_SENDERS],
+    /// Task we are blocked in `send` on because its `pending_senders`
+    /// queue was full (None = not queue-waiting).  A send parked in this
+    /// state never drops the message: the receiver's `receive` delivers
+    /// the staged message directly the moment its filter matches and wakes
+    /// us (see `sys_receive`); the resumed send returns success.
+    pub send_full_wait: Option<StagedSend>,
     /// Boot info handed to the task at spawn (x19 at first entry).
     pub boot: BootInfo,
     // ── Phase 7 IRQ state ────────────────────────────────────────────────────
@@ -141,6 +149,11 @@ pub struct Task {
     /// (None = not waiting).  Only the current task can be in a wait loop
     /// (the kernel runs on its stack with interrupts unmasked).
     pub irq_wait: Option<u32>,
+    // ── Phase 8 sleep state ──────────────────────────────────────────────────
+    /// Tick deadline for `SYS_SLEEP`; 0 = not sleeping.  Set while the task
+    /// is Blocked in `sys_sleep`; the timer-tick handler wakes the task once
+    /// `timer::ticks()` passes it.
+    pub sleep_deadline: u64,
 }
 
 impl Task {
@@ -156,8 +169,10 @@ impl Task {
             recv_filter: M_ANY,
             recv_buf: core::ptr::null_mut(),
             pending_senders: [None, None],
+            send_full_wait: None,
             boot: BootInfo { task_id: 0 },
             irq_wait: None,
+            sleep_deadline: 0,
         }
     }
 
@@ -177,8 +192,10 @@ impl Task {
             recv_filter: M_ANY,
             recv_buf: core::ptr::null_mut(),
             pending_senders: [None, None],
+            send_full_wait: None,
             boot: BootInfo { task_id: 0 },
             irq_wait: None,
+            sleep_deadline: 0,
         }
     }
 
@@ -192,14 +209,19 @@ impl Task {
 
 /// Maximum number of concurrent tasks (including idle).
 ///
-/// Phase 4/5/7: idle + init + pm + mem + dev + worker + display + ui-demo
-/// + hog = 9 slots in use; headroom for a couple more.
-pub const MAX_TASKS: usize = 12;
+/// Phase 8: idle + init + pm + mem + dev + worker + display + ui-demo +
+/// wm + counter + clock + hog = 12 slots in use; headroom for more.
+pub const MAX_TASKS: usize = 16;
 
 pub struct Scheduler {
     tasks: [Option<Task>; MAX_TASKS],
     current: usize, // index into `tasks`
     next_id: u32,
+    /// Slot of the task most recently woken by the current syscall, if any.
+    /// The syscall tail (`reschedule`) switches to it only when it is
+    /// strictly higher priority than the caller — wakeup-driven preemption,
+    /// so a busy high-priority task (wm) cannot starve the others.
+    woken: Option<usize>,
 }
 
 impl Scheduler {
@@ -209,10 +231,23 @@ impl Scheduler {
             tasks: [
                 Some(Task::idle()), // slot 0 = idle task
                 None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None,
             ],
             current: 0,
             next_id: 1,
+            woken: None,
         }
+    }
+
+    /// Record that the syscall currently executing has just woken the task
+    /// in `slot`.
+    pub fn set_woken(&mut self, slot: usize) {
+        self.woken = Some(slot);
+    }
+
+    /// Take the woken-task record (consumed once, by the syscall tail).
+    pub fn take_woken(&mut self) -> Option<usize> {
+        self.woken.take()
     }
 
     /// Spawn a new task.  Returns its `TaskId`.
@@ -256,6 +291,7 @@ impl Scheduler {
     /// EL1-side kernel stack, and `boot` is copied into the memory at
     /// `boot_info` (an EL0-readable page in the task's region, whose
     /// address is preloaded into x19).
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_user(
         &mut self,
         name: &str,
@@ -266,7 +302,8 @@ impl Scheduler {
         boot_info: usize,
         boot: BootInfo,
     ) -> Option<TaskId> {
-        let slot = self.tasks.iter_mut().skip(1).find(|s| s.is_none())?;
+        let slot_idx = (1..MAX_TASKS).find(|i| self.tasks[*i].is_none())?;
+        let slot = &mut self.tasks[slot_idx];
         let id = TaskId(self.next_id);
         self.next_id += 1;
         let t = slot.insert(Task::new(id, name, 0, 0));
@@ -277,6 +314,9 @@ impl Scheduler {
         }
         t.ttbr0 = ttbr0;
         t.ctx = Context::new_user(entry, sp_el0, ttbr0, kernel_stack_top, boot_info);
+        // The new task is ready and waiting: record it so the spawner's
+        // syscall tail can hand over to it if it is higher priority.
+        self.woken = Some(slot_idx);
         log::debug!(
             "spawned EL0 task {:?} '{}' entry={:#x} ttbr0={:#x} sp_el0={:#x} boot={:#x}",
             id, name, entry, ttbr0, sp_el0, boot_info
@@ -366,6 +406,36 @@ impl Scheduler {
             }
         }
         best.map(|(_, idx)| idx).unwrap_or(0)
+    }
+
+    /// Round-robin pick: the runnable slot with the smallest forward
+    /// distance from the current one, ignoring priorities — the tick uses
+    /// this so every ready task gets its time slice even while a higher-
+    /// priority task stays busy.  `exclude` (the preempted task) is skipped.
+    /// Returns 0 (idle) only when nothing else is runnable.
+    pub fn pick_next_rr(&mut self, exclude: usize) -> usize {
+        let n = self.tasks.len();
+        let cur = self.current;
+        let mut best: Option<usize> = None;
+        for idx in 1..n {
+            if idx == exclude {
+                continue;
+            }
+            if let Some(ref t) = self.tasks[idx] {
+                if t.state == TaskState::Ready || t.state == TaskState::Running {
+                    let forward = (idx + n - cur - 1) % n;
+                    match best {
+                        None => best = Some(idx),
+                        Some(bi) => {
+                            if forward < (bi + n - cur - 1) % n {
+                                best = Some(idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        best.unwrap_or(0)
     }
 
     /// Return a raw pointer to task `idx`'s context.
@@ -499,9 +569,19 @@ unsafe fn switch_best(strict: bool) -> bool {
     if !cur_running {
         return false;
     }
-    let next = sched.pick_next();
-    if next == cur {
-        return false;
+    // Strict picks (yields, wakeup tails) may re-select the current task —
+    // it stays eligible and wins ties.  A tick preemption must *rotate*:
+    // the current task just consumed its whole quantum, so it is excluded
+    // from the pick; the tick hands the slice to the next runnable slot in
+    // round-robin order, otherwise a busy high-priority task would be
+    // re-picked forever and the lower priorities would starve.
+    let next = if strict {
+        sched.pick_next()
+    } else {
+        sched.pick_next_rr(cur)
+    };
+    if next == cur || next == 0 {
+        return false; // nothing else runnable — stay put (never idle-switch from a tick)
     }
     let cur_prio = sched.priority_and_name(cur).map(|(p, _)| p).unwrap_or(255);
     let next_prio = sched
@@ -527,6 +607,31 @@ unsafe fn switch_best(strict: bool) -> bool {
     true
 }
 
+/// Wake every task whose `SYS_SLEEP` deadline has passed.  Returns whether
+/// any task was woken.  Called from the timer-tick handler; waking is a
+/// pure state change, the actual hand-off happens at the next scheduling
+/// point (tick on EL0, syscall tail, or — for the otherwise-idle boot
+/// context — an immediate switch in `tick_preempt`).
+///
+/// # Safety
+/// Called from `irq_handler` (interrupts masked by hardware).
+pub unsafe fn wake_sleepers() -> bool {
+    let sched = &mut *core::ptr::addr_of_mut!(SCHEDULER);
+    let now = crate::arch::aarch64::timer::ticks();
+    let mut woke = false;
+    for idx in 1..sched.tasks.len() {
+        if let Some(t) = sched.task_at_mut(idx) {
+            if t.sleep_deadline != 0 && t.sleep_deadline <= now {
+                t.sleep_deadline = 0;
+                t.state = TaskState::Ready;
+                woke = true;
+                log::trace!("sched: woke sleeper {:?}", t.id);
+            }
+        }
+    }
+    woke
+}
+
 /// Preemption entry point for the timer-tick IRQ handler (Phase 7).
 ///
 /// `from_el0` must be `true` only when the tick interrupted an EL0 task —
@@ -536,16 +641,35 @@ unsafe fn switch_best(strict: bool) -> bool {
 /// `irq_handler` after the switch and returns to its interrupted EL0 point
 /// via the IRQ frame's saved ELR/SPSR.
 ///
+/// Phase 8: every tick first wakes expired `SYS_SLEEP` sleepers.  If the
+/// tick landed in the boot context (idle slot — kmain resumed because
+/// every task was blocked) and a sleeper expired, we switch straight into
+/// it; otherwise the normal preemption/syscall-tail points pick the woken
+/// task up.
+///
 /// # Safety
 /// Called from `irq_handler` (interrupts masked by hardware).
 pub unsafe fn tick_preempt(from_el0: bool) {
-    if !from_el0 {
-        return;
-    }
     let sched = &mut *core::ptr::addr_of_mut!(SCHEDULER);
     let cur = sched.current_idx();
+    let woke = wake_sleepers();
     if cur == 0 {
-        return; // tick landed in the boot context — nothing to preempt
+        // Boot context: normally untouchable, but an expired sleeper needs
+        // the CPU handed over (nothing else can run the scheduler).
+        if woke {
+            let next = sched.pick_next();
+            if next != 0 {
+                let from = sched.ctx_ptr(0);
+                let to = sched.ctx_ptr(next);
+                sched.set_state(next, TaskState::Running);
+                sched.set_current(next);
+                context_switch(from, to);
+            }
+        }
+        return;
+    }
+    if !from_el0 {
+        return; // tick landed in the kernel — syscall tails pick up sleepers
     }
     let _ = switch_best(false);
 }
@@ -559,14 +683,45 @@ pub unsafe fn yield_cpu() {
     let _ = switch_best(true);
 }
 
-/// Preemption check run at the end of every syscall: if a strictly
-/// higher-priority task became runnable (woken by this syscall), switch to
-/// it before returning to EL0.
+/// Preemption check run at the end of every syscall: if the syscall woke a
+/// task that is strictly higher priority than the caller, switch to it
+/// immediately (wakeup-driven preemption — the message gets delivered
+/// without waiting for the next tick).  A merely-ready higher-priority task
+/// does not steal the CPU: it gets its turn via the tick rotation, so a
+/// busy compositor cannot starve the apps.
 ///
 /// # Safety
 /// Called from the syscall dispatcher (EL1, interrupts masked).
 pub unsafe fn reschedule() {
-    let _ = switch_best(true);
+    let sched = &mut *core::ptr::addr_of_mut!(SCHEDULER);
+    let Some(wslot) = sched.take_woken() else {
+        return;
+    };
+    let cur = sched.current_idx();
+    if cur == 0 {
+        return; // boot context — never preempt it
+    }
+    let cur_prio = sched.priority_and_name(cur).map(|(p, _)| p).unwrap_or(255);
+    let w_prio = sched
+        .priority_and_name(wslot)
+        .map(|(p, _)| p)
+        .unwrap_or(255);
+    if w_prio >= cur_prio {
+        return; // woken task is not strictly better — no preemption
+    }
+    log::trace!(
+        "sched: wake-preempt '{}'(p{}) -> '{}'(p{})",
+        sched.priority_and_name(cur).map(|(_, n)| n).unwrap_or("?"),
+        cur_prio,
+        sched.priority_and_name(wslot).map(|(_, n)| n).unwrap_or("?"),
+        w_prio,
+    );
+    let from = sched.ctx_ptr(cur);
+    let to = sched.ctx_ptr(wslot);
+    sched.set_state(cur, TaskState::Ready);
+    sched.set_state(wslot, TaskState::Running);
+    sched.set_current(wslot);
+    context_switch(from, to);
 }
 
 /// Name of the currently running task.

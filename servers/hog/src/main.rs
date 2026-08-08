@@ -25,7 +25,7 @@ pub extern "C" fn server_main(_info: *const BootInfo) -> ! {
     let mut i = 0u64;
     loop {
         i += 1;
-        if i % SPIN_LIMIT == 0 {
+        if i.is_multiple_of(SPIN_LIMIT) {
             sys::log(0, "hog: still hogging");
         }
         sys::yield_cpu();

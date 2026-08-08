@@ -9,6 +9,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "tanix-clock"
+version = "0.1.0"
+dependencies = [
+ "tanix-libsys",
+ "tanix-libtanix-ui",
+]
+
+[[package]]
+name = "tanix-counter"
+version = "0.1.0"
+dependencies = [
+ "tanix-libsys",
+ "tanix-libtanix-ui",
+]
+
+[[package]]
 name = "tanix-dev"
 version = "0.1.0"
 dependencies = [
@@ -20,6 +36,7 @@ name = "tanix-display"
 version = "0.1.0"
 dependencies = [
  "tanix-libsys",
+ "tanix-libtanix-ui",
 ]
 
 [[package]]
@@ -74,6 +91,13 @@ version = "0.1.0"
 dependencies = [
  "tanix-libsys",
  "tanix-libtanix-ui",
+]
+
+[[package]]
+name = "tanix-wm"
+version = "0.1.0"
+dependencies = [
+ "tanix-libsys",
 ]
 
 [[package]]

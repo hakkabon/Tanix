@@ -45,6 +45,12 @@ pub struct Heap {
     pages: usize,
 }
 
+impl Default for Heap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Heap {
     pub const fn new() -> Self {
         Self { head: ptr::null_mut(), pages: 0 }

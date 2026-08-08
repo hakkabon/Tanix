@@ -12,7 +12,7 @@
 //! secure-only and would never be delivered.
 //!
 //! Device IRQs (virtio-mmio: SPIs 48..79) are enabled lazily by the
-//! `SYS_WAIT_IRQ` syscall; the EL1 physical timer (PPI 26) is enabled at
+//! `SYS_WAIT_IRQ` syscall; the EL1 physical timer (PPI 30) is enabled at
 //! boot by the scheduler tick setup.
 
 // ── GICD register offsets ────────────────────────────────────────────────────
@@ -32,8 +32,8 @@ const GICR_WAKER: usize = GICR_BASE + 0x014;   // Wake register
 /// Redistributor SGI/PPI bank (128 KiB into the 256 KiB frame).
 const GICR_SGI_BASE: usize = GICR_BASE + 0x1_0000;
 const GICR_IGROUPR0: usize = GICR_SGI_BASE + 0x080; // Group 1 for SGIs/PPIs
-const GICR_ISENABLER0: usize = GICR_SGI_BASE + 0x104; // Set-enable for SGIs/PPIs
-const GICR_ICENABLER0: usize = GICR_SGI_BASE + 0x184; // Clear-enable for SGIs/PPIs
+const GICR_ISENABLER0: usize = GICR_SGI_BASE + 0x100; // Set-enable for SGIs/PPIs
+const GICR_ICENABLER0: usize = GICR_SGI_BASE + 0x180; // Clear-enable for SGIs/PPIs
 
 // ── CPU interface (ICC system registers, GICv3 system register mode) ─────────
 
@@ -102,6 +102,12 @@ fn enable_ppi(intid: u32) {
     let igroup = read_gicr(GICR_IGROUPR0) | bit;
     write_gicr(GICR_IGROUPR0, igroup);
     write_gicr(GICR_ISENABLER0, bit);
+    log::trace!(
+        "gic: ppi {} enabled — ISENABLER0={:#x} IGROUP0={:#x}",
+        intid,
+        read_gicr(GICR_ISENABLER0),
+        read_gicr(GICR_IGROUPR0)
+    );
 }
 
 /// Enable an SPI (32..1019) as a Group 1NS interrupt in the distributor.

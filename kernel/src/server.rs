@@ -67,6 +67,9 @@ static SERVER_BINS: &[(&str, &[u8])] = &[
     ("worker", include_bytes!(env!("TANIX_WORKER_BIN_PATH"))),
     ("display", include_bytes!(env!("TANIX_DISPLAY_BIN_PATH"))),
     ("ui-demo", include_bytes!(env!("TANIX_UI_DEMO_BIN_PATH"))),
+    ("wm", include_bytes!(env!("TANIX_WM_BIN_PATH"))),
+    ("counter", include_bytes!(env!("TANIX_COUNTER_BIN_PATH"))),
+    ("clock", include_bytes!(env!("TANIX_CLOCK_BIN_PATH"))),
     ("hog", include_bytes!(env!("TANIX_HOG_BIN_PATH"))),
 ];
 
@@ -77,24 +80,28 @@ static SERVER_BINS: &[(&str, &[u8])] = &[];
 /// each crate's `servers/*/build.rs`.
 ///
 /// The bases must stay clear of everything the frame allocator hands out:
-/// the kernel image (which embeds the server binaries; in a debug build
-/// they are ~0.9 MB each, so image end can sit around 0x4070_0000) and the
-/// Phase-3 guest RAM / shmem allocated just after it.  The 0x4090_0000
-/// block (8 × 128 KiB slots = 1 MiB) leaves ~1 MiB of headroom above the
-/// Phase-3 allocations in a full debug build.
+/// the kernel image (which embeds the server binaries; in a debug build the
+/// ~0.9 MB-per-binary set pushes the image end to ~0x409B_0000) and the
+/// Phase-3 guest RAM / shmem and the display framebuffer (4 MiB) allocated
+/// just after it.  The 0x4100_0000 block (11 × 128 KiB slots = 1.375 MiB)
+/// leaves ~6 MiB of headroom above the Phase-3 + framebuffer allocations in
+/// a full debug build.
 ///
 /// `reserve_regions()` runs *before* any dynamic allocation (kmain, right
 /// after the frame allocator starts), so neither the guest nor any server
 /// can receive frames that overlap a live server image.
 pub const SERVER_BASES: &[(&str, usize)] = &[
-    ("init",    0x4090_0000),
-    ("pm",      0x4092_0000),
-    ("mem",     0x4094_0000),
-    ("dev",     0x4096_0000),
-    ("worker",  0x4098_0000),
-    ("display", 0x409A_0000),
-    ("ui-demo", 0x409C_0000),
-    ("hog",     0x409E_0000),
+    ("init",    0x4100_0000),
+    ("pm",      0x4102_0000),
+    ("mem",     0x4104_0000),
+    ("dev",     0x4106_0000),
+    ("worker",  0x4108_0000),
+    ("display", 0x410A_0000),
+    ("ui-demo", 0x410C_0000),
+    ("hog",     0x410E_0000),
+    ("wm",      0x4110_0000),
+    ("counter", 0x4112_0000),
+    ("clock",   0x4114_0000),
 ];
 
 /// Scheduling priority per server (Phase 7) — lower runs first.  The
@@ -108,7 +115,10 @@ pub const SERVER_PRIOS: &[(&str, u8)] = &[
     ("dev",     128),
     ("worker",  128),
     ("display",  32),
+    ("wm",       48),
     ("ui-demo",  96),
+    ("counter",  96),
+    ("clock",    96),
     ("hog",     192),
 ];
 

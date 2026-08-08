@@ -81,77 +81,18 @@ __vectors:
     eret
 .endm
 
-// ── Macro: lower-EL synchronous → SVC fast path or sync_handler(esr, elr, far, sp) ──
+// ── Slot 8: lower-EL synchronous → SVC fast path or sync_handler(esr, elr, far, sp) ──
+//
+// IMPORTANT: each vector slot is exactly 128 bytes.  The full handler
+// (full register frame + SVC64 dispatch) does not fit, so the slot is a
+// branch stub and the real code lives OUT-OF-LINE (`lower_sync_full`).
+// Inlining it used to overflow the slot, and the `.balign 128` shifted
+// every following entry down by one: slot 9 (IRQ) then contained the tail
+// of this handler (an `eret`), so IRQs from EL0 were silently dismissed
+// instead of being handled.
 
 .macro LOWER_SYNC_ENTRY
-    sub  sp, sp, #176
-    stp  x0,  x1,  [sp,   #0]
-    stp  x2,  x3,  [sp,  #16]
-    stp  x4,  x5,  [sp,  #32]
-    stp  x6,  x7,  [sp,  #48]
-    stp  x8,  x9,  [sp,  #64]
-    stp  x10, x11, [sp,  #80]
-    stp  x12, x13, [sp,  #96]
-    stp  x14, x15, [sp, #112]
-    stp  x16, x17, [sp, #128]
-    stp  x18, x30, [sp, #144]
-    mrs  x4,  ELR_EL1
-    mrs  x5,  SPSR_EL1
-    stp  x4,  x5,  [sp, #160]
-
-    // ── Phase 6 fast path: SVC64 (EC 0x15) from EL0 → tanix_syscall ──────
-    // x0 = syscall number, x1-x3 = arguments, result back in x0.
-    // The kernel clobbers x1-x18 freely (the server-side wrapper declares
-    // them clobbered); x30 is preserved below because the wrapper's `svc`
-    // does not list it.
-    mrs  x4, ESR_EL1
-    lsr  x5, x4, #26
-    cmp  x5, #0x15
-    b.ne 1f
-    bl   tanix_syscall         // result in x0
-    // Restore everything except x0 (the result).  ELR_EL1/SPSR_EL1 must be
-    // reloaded from the frame: the hardware already sets ELR to the address
-    // after the `svc` (eret resumes at the wrapper's epilogue), and blocking
-    // syscalls that context-switched leave ELR/SPSR pointing at the EL1h
-    // resume point.
-    ldp  x4,  x5,  [sp, #160]
-    msr  ELR_EL1,  x4
-    msr  SPSR_EL1, x5
-    ldp  x2,  x3,  [sp,  #16]
-    ldp  x4,  x5,  [sp,  #32]
-    ldp  x6,  x7,  [sp,  #48]
-    ldp  x8,  x9,  [sp,  #64]
-    ldp  x10, x11, [sp,  #80]
-    ldp  x12, x13, [sp,  #96]
-    ldp  x14, x15, [sp, #112]
-    ldp  x16, x17, [sp, #128]
-    ldp  x18, x30, [sp, #144]
-    add  sp, sp, #176
-    eret
-1:
-    // Arguments: esr, elr, far, kernel_sp
-    mrs  x0, ESR_EL1
-    mrs  x1, ELR_EL1
-    mrs  x2, FAR_EL1
-    mov  x3, sp
-    bl   sync_handler
-
-    // Restore (sync_handler may have modified ELR to advance past HVC).
-    ldp  x4,  x5,  [sp, #160]
-    msr  ELR_EL1,  x4
-    msr  SPSR_EL1, x5
-    ldp  x0,  x1,  [sp,   #0]
-    ldp  x2,  x3,  [sp,  #16]
-    ldp  x4,  x5,  [sp,  #32]
-    ldp  x6,  x7,  [sp,  #48]
-    ldp  x8,  x9,  [sp,  #64]
-    ldp  x10, x11, [sp,  #80]
-    ldp  x12, x13, [sp,  #96]
-    ldp  x14, x15, [sp, #112]
-    ldp  x16, x17, [sp, #128]
-    ldp  x18, x30, [sp, #144]
-    add  sp, sp, #176
-    eret
+    b   lower_sync_full
 .endm
 
 // ── Vector table entries ──────────────────────────────────────────────────────
@@ -219,3 +160,84 @@ __vectors:
 // 15: Lower EL (AArch32) — SError
 .balign 128
     EXCEPTION_ENTRY 15
+
+// ── Out-of-line: slot 8 stub target (lower-EL synchronous dispatch) ──────────
+//    Kept OUTSIDE the vector table: the full body with its SVC64 fast path
+//    and non-SVC fallback is larger than a 128-byte slot.  Inlining it used
+//    to overflow slot 8, and the `.balign 128` shifted every following entry
+//    down by one — slot 9 (IRQ) then contained this handler's trailing
+//    `eret`, so IRQs from EL0 were silently dismissed instead of handled.
+
+lower_sync_full:
+    sub  sp, sp, #176
+    stp  x0,  x1,  [sp,   #0]
+    stp  x2,  x3,  [sp,  #16]
+    stp  x4,  x5,  [sp,  #32]
+    stp  x6,  x7,  [sp,  #48]
+    stp  x8,  x9,  [sp,  #64]
+    stp  x10, x11, [sp,  #80]
+    stp  x12, x13, [sp,  #96]
+    stp  x14, x15, [sp, #112]
+    stp  x16, x17, [sp, #128]
+    stp  x18, x30, [sp, #144]
+    mrs  x4,  ELR_EL1
+    mrs  x5,  SPSR_EL1
+    stp  x4,  x5,  [sp, #160]
+
+    // ── Phase 6 fast path: SVC64 (EC 0x15) from EL0 → tanix_syscall ──────
+    // x0 = syscall number, x1-x3 = arguments, result back in x0.
+    // The kernel clobbers x1-x18 freely (the server-side wrapper declares
+    // them clobbered); x30 is preserved below because the wrapper's `svc`
+    // does not list it.
+    mrs  x4, ESR_EL1
+    lsr  x5, x4, #26
+    cmp  x5, #0x15
+    b.ne lower_sync_fallback
+    bl   tanix_syscall         // result in x0
+    // Restore everything except x0 (the result).  ELR_EL1/SPSR_EL1 must be
+    // reloaded from the frame: the hardware already sets ELR to the address
+    // after the `svc` (eret resumes at the wrapper's epilogue), and blocking
+    // syscalls that context-switched leave ELR/SPSR pointing at the EL1h
+    // resume point.
+    ldp  x4,  x5,  [sp, #160]
+    msr  ELR_EL1,  x4
+    msr  SPSR_EL1, x5
+    ldp  x2,  x3,  [sp,  #16]
+    ldp  x4,  x5,  [sp,  #32]
+    ldp  x6,  x7,  [sp,  #48]
+    ldp  x8,  x9,  [sp,  #64]
+    ldp  x10, x11, [sp,  #80]
+    ldp  x12, x13, [sp,  #96]
+    ldp  x14, x15, [sp, #112]
+    ldp  x16, x17, [sp, #128]
+    ldp  x18, x30, [sp, #144]
+    add  sp, sp, #176
+    eret
+
+// ── Out-of-line fallback: lower-EL synchronous exceptions that are not
+//    SVC64 (HVC, aborts). ──────────────────────────────────────────────────
+
+lower_sync_fallback:
+    // Arguments: esr, elr, far, kernel_sp
+    mrs  x0, ESR_EL1
+    mrs  x1, ELR_EL1
+    mrs  x2, FAR_EL1
+    mov  x3, sp
+    bl   sync_handler
+
+    // Restore (sync_handler may have modified ELR to advance past HVC).
+    ldp  x4,  x5,  [sp, #160]
+    msr  ELR_EL1,  x4
+    msr  SPSR_EL1, x5
+    ldp  x0,  x1,  [sp,   #0]
+    ldp  x2,  x3,  [sp,  #16]
+    ldp  x4,  x5,  [sp,  #32]
+    ldp  x6,  x7,  [sp,  #48]
+    ldp  x8,  x9,  [sp,  #64]
+    ldp  x10, x11, [sp,  #80]
+    ldp  x12, x13, [sp,  #96]
+    ldp  x14, x15, [sp, #112]
+    ldp  x16, x17, [sp, #128]
+    ldp  x18, x30, [sp, #144]
+    add  sp, sp, #176
+    eret

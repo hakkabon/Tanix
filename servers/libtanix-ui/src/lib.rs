@@ -1,10 +1,14 @@
-//! Iced-shaped UI toolkit for Tanix (Phase 5).
+//! Shared UI helpers for Tanix apps (Phase 8).
 //!
-//! Applications are written exactly like `iced::Sandbox` apps (init/update/
-//! view + a widget tree) and rendered by the Tanix display server through a
-//! shared framebuffer.  Porting a Tanix UI app to desktop Iced is a matter
-//! of switching the backend: the API surface mirrors Iced's.
+//! Applications run as Minix-style servers and draw through the window
+//! manager (`wm`): each app owns an off-screen canvas (`Window`), renders
+//! into it with the raster helpers here, and the compositor blits windows
+//! onto the display server's framebuffer.  `font` is the shared 5×7 bitmap
+//! font — the display server uses it for title bars too.
 
 #![no_std]
 
-extern crate alloc;
+pub mod font;
+pub mod window;
+
+pub use window::{PointerEvent, Window};

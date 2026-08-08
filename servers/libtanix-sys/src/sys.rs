@@ -25,6 +25,9 @@ pub const SYS_FREE_FRAMES: u64 = 7;
 pub const SYS_LOG: u64 = 8;
 pub const SYS_WAIT_IRQ: u64 = 9; // Phase 7: block until a device IRQ fires
 pub const SYS_YIELD: u64 = 10; // Phase 7: cooperative yield
+pub const SYS_SHARE_FRAMES: u64 = 11; // Phase 8: map frames into another task's table
+pub const SYS_UNSHARE_FRAMES: u64 = 12; // Phase 8: demote frames in another task's table
+pub const SYS_SLEEP: u64 = 13; // Phase 8: block for `ms` scheduler ticks
 
 /// Invoke syscall `nr` with arguments `a0..a2`; returns the kernel's x0.
 ///
@@ -121,6 +124,27 @@ pub fn alloc_frames(n: u32) -> u64 {
 /// `free_frames(base, n)`.
 pub fn free_frames(base: u64, n: u32) -> i32 {
     unsafe { raw_syscall(SYS_FREE_FRAMES, base, n as u64, 0) as i32 }
+}
+
+/// `share_frames(base, pages, task)` — Phase 8.  Maps the frame run
+/// `base .. base+pages*4096` into `task`'s address space (identity VA ==
+/// phys), so the two servers can share a buffer.  The caller must own the
+/// frames (`alloc_frames`).
+pub fn share_frames(base: u64, pages: u32, task: u32) -> i32 {
+    unsafe { raw_syscall(SYS_SHARE_FRAMES, base, pages as u64, task as u64) as i32 }
+}
+
+/// `unshare_frames(base, pages, task)` — Phase 8 mirror: demote the run in
+/// `task`'s table (the owning task keeps its own mapping; free the frames
+/// only after unsharing).
+pub fn unshare_frames(base: u64, pages: u32, task: u32) -> i32 {
+    unsafe { raw_syscall(SYS_UNSHARE_FRAMES, base, pages as u64, task as u64) as i32 }
+}
+
+/// `sleep(ms)` — Phase 8.  Blocks this task for roughly `ms` milliseconds
+/// (scheduler ticks are 1 ms).  Returns `0` on success.
+pub fn sleep(ms: u32) -> i32 {
+    unsafe { raw_syscall(SYS_SLEEP, ms as u64, 0, 0) as i32 }
 }
 
 /// `log(level, msg)` — kernel log line, prefixed with this server's name.
