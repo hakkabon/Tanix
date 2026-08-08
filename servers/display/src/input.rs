@@ -18,7 +18,8 @@ use tanix_libsys::sys;
 pub const DEVICE_ID_INPUT: u32 = 18;
 
 // Event types (linux/input.h).
-const EV_SYN: u16 = 0x00;
+// (EV_SYN = 0x00 marks the end of an event batch; the parser below only
+// consumes EV_ABS payloads and treats any other type as a batch boundary.)
 const EV_KEY: u16 = 0x01;
 const EV_ABS: u16 = 0x03;
 
@@ -90,7 +91,7 @@ impl Tablet {
         dev.negotiate(0);
         dev.driver_ok();
 
-        let base = unsafe { EVBUF.as_mut_ptr() } as *mut u8;
+        let base = core::ptr::addr_of_mut!(EVBUF) as *mut u8;
         let added =
             dev.add_empty_buffers(&mut queue, base, size_of::<InputEvent>() as u32, QUEUE_SIZE);
         if added == 0 {
@@ -113,7 +114,7 @@ impl Tablet {
             return self.state;
         }
         for &(id, _len) in &done[..n] {
-            let ev = unsafe { &EVBUF[id as usize % QUEUE_SIZE] };
+            let ev = unsafe { &(*core::ptr::addr_of_mut!(EVBUF))[id as usize % QUEUE_SIZE] };
             match (ev.kind, ev.code) {
                 (EV_ABS, ABS_X) => self.state.x = ev.value,
                 (EV_ABS, ABS_Y) => self.state.y = ev.value,
@@ -124,7 +125,7 @@ impl Tablet {
             }
         }
         // Hand the consumed buffers back to the device.
-        let base = unsafe { EVBUF.as_mut_ptr() } as *mut u8;
+        let base = core::ptr::addr_of_mut!(EVBUF) as *mut u8;
         self.dev
             .add_empty_buffers(&mut self.queue, base, size_of::<InputEvent>() as u32, n);
         self.state

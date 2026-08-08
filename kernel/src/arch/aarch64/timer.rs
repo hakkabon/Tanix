@@ -10,10 +10,9 @@
 //!
 //! Phase 7: the timer is the preemption source.  `init_tick` grants EL1
 //! access to the CNTP registers (CNTKCTL_EL1), enables the physical timer
-//! interrupt in the GIC (**PPI 26** — CNTPNSIRQ on QEMU `virt`; PPI 30 is
-//! the EL2/secure-only CNTHP) and arms a periodic 1 ms tick.  Every tick
-//! fires the current-EL / lower-EL IRQ vector and the scheduler decides
-//! whether to preempt.
+//! interrupt in the GIC (**PPI 30** — CNTPNSIRQ on QEMU `virt`) and arms a
+//! periodic 1 ms tick.  Every tick fires the current-EL / lower-EL IRQ
+//! vector and the scheduler decides whether to preempt.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -71,7 +70,7 @@ pub fn ticks() -> u64 {
 
 /// Arm the EL1 physical timer to fire after `ticks` counts.
 ///
-/// The interrupt (GIC PPI 26) must be enabled separately.  This just sets
+/// The interrupt (GIC PPI 30) must be enabled separately.  This just sets
 /// CNTP_TVAL_EL0 and enables the timer.
 pub fn arm(ticks: u64) {
     unsafe {
@@ -114,7 +113,7 @@ pub fn init() {
 /// 1. Grants EL1 access to the CNTP registers (CNTKCTL_EL1.ENPCT/ENPTC/
 ///    ENVTC) — without ENPTC the `msr CNTP_TVAL_EL0` above would trap.
 /// 2. Arms the periodic 1 ms tick.  The interrupt must already be enabled
-///    in the GIC (`gic::enable_irq(26)`).
+///    in the GIC (`gic::enable_irq(30)`).
 pub fn init_tick() {
     unsafe {
         core::arch::asm!(
@@ -126,6 +125,44 @@ pub fn init_tick() {
     }
     TICKS.store(0, Ordering::Relaxed);
     arm_next();
+
+    // Boot self-test: does the timer actually assert?  Arm for 10 ms and
+    // wait for ISTATUS with IRQs masked — if this never fires, the CNTP
+    // interrupt line is not reaching the GIC.
+    unsafe {
+        core::arch::asm!("msr daifset, #2", options(nomem, nostack)); // mask IRQ
+        arm(frequency() / 100);
+        let t0 = read_count();
+        for _ in 0..100_000 {
+            core::hint::spin_loop();
+        }
+        let t1 = read_count();
+        let st: u64;
+        core::arch::asm!("mrs {s}, CNTP_CTL_EL0", s = out(reg) st, options(nomem, nostack));
+        log::info!(
+            "timer: self-test — CNTPCT delta={} over 100k spins, CNTP_CTL_EL0={:#x}",
+            t1.saturating_sub(t0),
+            st
+        );
+        let deadline = read_count() + frequency() / 100;
+        let mut ok = false;
+        while read_count() < deadline {
+            let st: u64;
+            core::arch::asm!("mrs {s}, CNTP_CTL_EL0", s = out(reg) st, options(nomem, nostack));
+            if st & (1 << 2) != 0 {
+                ok = true;
+                break;
+            }
+        }
+        if ok {
+            log::info!("timer: self-test — CNTP asserts (IRQ line works)");
+        } else {
+            log::error!("timer: self-test — CNTP never asserted ISTATUS");
+        }
+        core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); // unmask IRQ
+        arm_next();
+    }
+
     log::info!("timer: preemption tick armed ({} ms, {} Hz)", TICK_PERIOD_MS, frequency() / 1000 * 1000 / TICK_PERIOD_MS);
 }
 

@@ -226,7 +226,7 @@ impl Gpu {
 
     /// Query the display modes; returns the first enabled scanout size.
     pub fn display_info(&mut self) -> Option<DisplayMode> {
-        let cmd = unsafe { &mut CMD_DISP_INFO };
+        let cmd = unsafe { &mut *core::ptr::addr_of_mut!(CMD_DISP_INFO) };
         *cmd = Command::new(CMD_GET_DISPLAY_INFO);
         let resp = unsafe { &mut RESP[..1024] };
         let n = self.dev.submit(&mut self.queue, &[bytes(&*cmd)], resp);
@@ -273,7 +273,7 @@ impl Gpu {
 
         // RESOURCE_CREATE_2D.
         {
-            let cmd = unsafe { &mut CMD_CREATE };
+            let cmd = unsafe { &mut *core::ptr::addr_of_mut!(CMD_CREATE) };
             *cmd = Command::new(CMD_RESOURCE_CREATE_2D);
             let create = unsafe { &mut *(bytes(&*cmd).as_ptr() as *mut ResourceCreate2d) };
             create.resource_id = 1;
@@ -291,7 +291,7 @@ impl Gpu {
         // RESOURCE_ATTACH_BACKING: header + one entry per 4 KiB frame,
         // sent as separate chained descriptors (the response follows).
         {
-            let cmd = unsafe { &mut CMD_ATTACH };
+            let cmd = unsafe { &mut *core::ptr::addr_of_mut!(CMD_ATTACH) };
             *cmd = Command::new(CMD_RESOURCE_ATTACH_BACKING);
             let attach = unsafe { &mut *(bytes(&*cmd).as_ptr() as *mut AttachBacking) };
             attach.resource_id = 1;
@@ -319,7 +319,7 @@ impl Gpu {
 
         // RESOURCE_SET_SCANOUT.
         {
-            let cmd = unsafe { &mut CMD_SET_SCANOUT };
+            let cmd = unsafe { &mut *core::ptr::addr_of_mut!(CMD_SET_SCANOUT) };
             *cmd = Command::new(CMD_RESOURCE_SET_SCANOUT);
             let set = unsafe { &mut *(bytes(&*cmd).as_ptr() as *mut SetScanout) };
             set.resource_id = 1;
@@ -343,7 +343,7 @@ impl Gpu {
         // TRANSFER_TO_HOST_2D: the scanout displays the *host* resource
         // image; the attached guest pages only reach it via this copy.
         {
-            let cmd = unsafe { &mut CMD_TRANSFER };
+            let cmd = unsafe { &mut *core::ptr::addr_of_mut!(CMD_TRANSFER) };
             *cmd = Command::new(CMD_TRANSFER_TO_HOST_2D);
             let t = unsafe { &mut *(bytes(&*cmd).as_ptr() as *mut Transfer2d) };
             t.rect = Rect {
@@ -362,7 +362,7 @@ impl Gpu {
             }
         }
 
-        let cmd = unsafe { &mut CMD_FLUSH };
+        let cmd = unsafe { &mut *core::ptr::addr_of_mut!(CMD_FLUSH) };
         *cmd = Command::new(CMD_RESOURCE_FLUSH);
         let flush = unsafe { &mut *(bytes(&*cmd).as_ptr() as *mut Flush) };
         flush.resource_id = 1;
@@ -407,6 +407,34 @@ impl Gpu {
                 fb[off + 3] = 0xFF;
             }
         }
+    }
+
+    /// Copy a window canvas rectangle into the framebuffer (Phase 8
+    /// compositor blit).  `src` points at the canvas base (shared with the
+    /// compositor via `share_frames`), `src_stride` is its row stride in
+    /// bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit(&mut self, src: *const u8, src_stride: usize, sx: u32, sy: u32, w: u32, h: u32, dx: u32, dy: u32) {
+        let width = self.width;
+        let height = self.height;
+        let dst_stride = self.stride;
+        let fb = self.fb_mut();
+        let rows = h.min(height.saturating_sub(dy));
+        let cols = w.min(width.saturating_sub(dx));
+        for row in 0..rows {
+            let src_off = (sy as usize + row as usize) * src_stride + sx as usize * 4;
+            let dst_off = (dy as usize + row as usize) * dst_stride + dx as usize * 4;
+            let src_row = unsafe { core::slice::from_raw_parts(src.add(src_off), cols as usize * 4) };
+            fb[dst_off..dst_off + cols as usize * 4].copy_from_slice(src_row);
+        }
+    }
+
+    /// Draw text into the framebuffer (Phase 8 title bars) with the shared
+    /// 5×7 bitmap font.
+    pub fn draw_text(&mut self, x: u32, y: u32, rgb: (u8, u8, u8), s: &str) {
+        let stride = self.stride;
+        let fb = self.fb_mut();
+        tanix_libtanix_ui::font::draw_str(fb, stride, x as i32, y as i32, 1, rgb, s);
     }
 }
 

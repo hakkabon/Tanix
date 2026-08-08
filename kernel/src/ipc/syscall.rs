@@ -30,7 +30,7 @@
 
 use crate::mem::{frame, page_table, PAGE_SIZE};
 use crate::sched::task::{context_switch, current_ttbr0, kill_task};
-use crate::sched::{Message, PendingSend, TaskId, TaskState, M_ANY};
+use crate::sched::{Message, PendingSend, StagedSend, TaskId, TaskState, M_ANY};
 
 // ── Syscall numbers (must match `servers/libtanix-sys/src/sys.rs`) ────────────
 
@@ -45,6 +45,9 @@ pub const SYS_FREE_FRAMES: u64 = 7;
 pub const SYS_LOG: u64 = 8;
 pub const SYS_WAIT_IRQ: u64 = 9; // Phase 7: block until a device IRQ fires
 pub const SYS_YIELD: u64 = 10; // Phase 7: cooperative yield (RR rotation)
+pub const SYS_SHARE_FRAMES: u64 = 11; // Phase 8: map frames into another task's table
+pub const SYS_UNSHARE_FRAMES: u64 = 12; // Phase 8: demote frames in another task's table
+pub const SYS_SLEEP: u64 = 13; // Phase 8: block until the tick counter passes a deadline
 
 // ── Active TTBR0 helpers ──────────────────────────────────────────────────────
 
@@ -134,6 +137,7 @@ unsafe fn sys_send(dst: u32, msg: *const Message) -> i32 {
         // Rendezvous: receiver is waiting for us — copy directly.
         let dst_task = sched.task_at_mut(dst_idx).unwrap();
         deliver(dst_task, me, msg);
+        sched.set_woken(dst_idx);
         log::trace!("ipc: {} → {} rendezvous (direct)", me, dst);
         return 0;
     }
@@ -141,6 +145,13 @@ unsafe fn sys_send(dst: u32, msg: *const Message) -> i32 {
     // Receiver not waiting — park ourselves as a pending sender.  Copy the
     // message now, while our table is still active (the receiver runs on a
     // different TTBR0 and must not dereference our pointers later).
+    //
+    // If the receiver's send queue is full we never drop the message: we
+    // block in a queue-wait state and the receiver's `receive` delivers the
+    // staged message directly the moment its filter matches (see
+    // `sys_receive`).  Dropping a reply because the queue was full would
+    // deadlock request/response pairs (the wm once lost the display's
+    // MODE_REPLY this way).
     let queued = {
         let dst_task = sched.task_at_mut(dst_idx).unwrap();
         match dst_task.pending_senders.iter_mut().find(|s| s.is_none()) {
@@ -152,7 +163,20 @@ unsafe fn sys_send(dst: u32, msg: *const Message) -> i32 {
         }
     };
     if !queued {
-        return -4;
+        // Queue full — stage the message on ourselves and block.  The only
+        // way out is the receiver's `receive` delivering it directly, so a
+        // resumed send knows its message was consumed.
+        log::trace!("ipc: {} → {} queue full, staging send", me, dst);
+        {
+            let t = sched.task_at_mut(my_idx).unwrap();
+            t.send_full_wait = Some(StagedSend { dst, src: me, msg: *msg });
+            t.state = TaskState::Blocked;
+        }
+        let next = sched.pick_next();
+        sched.set_state(next, TaskState::Running);
+        sched.set_current(next);
+        context_switch(sched.ctx_ptr(my_idx), sched.ctx_ptr(next));
+        return 0; // delivered by the receiver's receive
     }
 
     log::trace!("ipc: {} → {} queued, sender blocks", me, dst);
@@ -170,6 +194,7 @@ unsafe fn sys_send(dst: u32, msg: *const Message) -> i32 {
 unsafe fn sys_receive(filter: i32, out: *mut Message) -> i32 {
     let sched = crate::sched::task::scheduler();
     let my_idx = sched.current_idx();
+    let my_id = sched.current_id().0;
 
     // Any pending sender already waiting for us?  The parked message is a
     // value copy, valid under *our* table — no switch needed.
@@ -193,9 +218,33 @@ unsafe fn sys_receive(filter: i32, out: *mut Message) -> i32 {
         core::ptr::write_volatile(out, m);
         if let Some(src_idx) = sched.task_idx(TaskId(p.src)) {
             sched.task_at_mut(src_idx).unwrap().state = TaskState::Ready;
+            sched.set_woken(src_idx);
             log::trace!("ipc: {} wakes pending sender {}", my_idx, p.src);
         }
         return p.src as i32;
+    }
+
+    // Nothing parked matches our filter.  A sender may be staged on us
+    // because its send hit our full queue before we ever got here — deliver
+    // the staged message directly instead of blocking (the sender keeps
+    // `send_full_wait` set until this point).
+    for idx in 1..crate::sched::task::MAX_TASKS {
+        let Some(t) = sched.task_at_mut(idx) else {
+            continue;
+        };
+        let hit = t.send_full_wait.is_some_and(|s| {
+            s.dst == my_id && (filter == M_ANY || s.src == filter as u32)
+        });
+        if hit {
+            let s = t.send_full_wait.take().unwrap();
+            let mut m = s.msg;
+            m.src = s.src;
+            core::ptr::write_volatile(out, m);
+            t.state = TaskState::Ready;
+            sched.set_woken(idx);
+            log::trace!("ipc: {} delivers staged send from {}", my_idx, s.src);
+            return s.src as i32;
+        }
     }
 
     // Nothing available — block until a sender rendezvouses with us.  Our
@@ -319,6 +368,70 @@ unsafe fn sys_free_frames(base: u64, pages: u32) -> i32 {
     0
 }
 
+/// `share_frames(base, pages, task)` — Phase 8.
+///
+/// Maps the physical run `base .. base + pages*PAGE_SIZE` into task
+/// `task`'s address space as EL0-visible (identity VA == phys), so two
+/// servers can share a buffer (the window compositor blits canvases that
+/// the owning app allocated).  The frames are NOT re-allocated: the caller
+/// must own them (`alloc_frames`) and the target must not already map them.
+unsafe fn sys_share_frames(base: u64, pages: u32, task: u32) -> i32 {
+    if base == 0 || pages == 0 || pages > 4096 {
+        return -11;
+    }
+    let sched = crate::sched::task::scheduler();
+    let ttbr0 = match sched.task_by_id(TaskId(task)) {
+        Some(dst) => dst.ttbr0,
+        None => return -3, // no such task
+    };
+    if ttbr0 == 0 {
+        return 0; // kernel-side task — nothing to map
+    }
+    with_ttbr0(ttbr0, || {
+        page_table::map_user_pages(
+            ttbr0 as usize,
+            base as usize,
+            pages as usize * PAGE_SIZE,
+            page_table::FLAGS_USER_RWX,
+        );
+    });
+    page_table::flush_tlb();
+    log::trace!(
+        "share_frames: {:#x}+{} pages → task {}",
+        base, pages, task
+    );
+    0
+}
+
+/// `unshare_frames(base, pages, task)` — Phase 8 mirror: demote the run
+/// back to EL1-only in `task`'s table (the owning task keeps its own
+/// mapping; free the frames only after unsharing).
+unsafe fn sys_unshare_frames(base: u64, pages: u32, task: u32) -> i32 {
+    if base == 0 || pages == 0 || pages > 4096 {
+        return -11;
+    }
+    let sched = crate::sched::task::scheduler();
+    let ttbr0 = match sched.task_by_id(TaskId(task)) {
+        Some(dst) => dst.ttbr0,
+        None => return -3,
+    };
+    if ttbr0 == 0 {
+        return 0;
+    }
+    with_ttbr0(ttbr0, || {
+        for i in 0..pages as usize {
+            page_table::map_user_pages(
+                ttbr0 as usize,
+                base as usize + i * PAGE_SIZE,
+                PAGE_SIZE,
+                page_table::FLAGS_KERNEL_RWX,
+            );
+        }
+    });
+    page_table::flush_tlb();
+    0
+}
+
 // ── IRQ syscalls (Phase 7) ────────────────────────────────────────────────────
 
 /// `wait_irq(irq) -> 0`.  Blocks the calling task until the device
@@ -376,6 +489,34 @@ unsafe fn sys_wait_irq(irq: u32) -> i32 {
     0
 }
 
+// ── Sleep syscall (Phase 8) ───────────────────────────────────────────────────
+
+/// `sleep(ms) -> 0`.  Blocks the calling task until `ms` scheduler ticks
+/// (1 ms each, Phase 7) have elapsed, then returns.
+///
+/// The deadline is stored in the task's `sleep_deadline`; the timer-tick
+/// IRQ handler wakes expired sleepers (`task::tick_preempt`).  Waking is
+/// purely a state change — the CPU is handed over here and picked up again
+/// by the regular scheduling points (next tick, next syscall tail), so a
+/// sleeping task never occupies the core.
+unsafe fn sys_sleep(ms: u32) -> i32 {
+    let ms = ms.clamp(1, 60_000);
+    let sched = crate::sched::task::scheduler();
+    let my_idx = sched.current_idx();
+    let deadline = crate::arch::aarch64::timer::ticks().saturating_add(ms as u64);
+
+    sched.task_at_mut(my_idx).unwrap().sleep_deadline = deadline;
+    sched.set_state(my_idx, TaskState::Blocked);
+    let next = sched.pick_next();
+    sched.set_state(next, TaskState::Running);
+    sched.set_current(next);
+    context_switch(sched.ctx_ptr(my_idx), sched.ctx_ptr(next));
+
+    // Resumed once the deadline passed (tick_preempt woke us).
+    sched.task_at_mut(my_idx).unwrap().sleep_deadline = 0;
+    0
+}
+
 // ── Logging syscall ───────────────────────────────────────────────────────────
 
 /// `log(level, msg)` — kernel log line prefixed with the sender's name.
@@ -421,6 +562,9 @@ pub unsafe extern "C" fn tanix_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> u6
         }
         SYS_ALLOC_FRAMES => sys_alloc_frames(a0 as u32),
         SYS_FREE_FRAMES => sys_free_frames(a0, a1 as u32) as u64,
+        SYS_SHARE_FRAMES => sys_share_frames(a0, a1 as u32, a2 as u32) as u64,
+        SYS_UNSHARE_FRAMES => sys_unshare_frames(a0, a1 as u32, a2 as u32) as u64,
+        SYS_SLEEP => sys_sleep(a0 as u32) as u64,
         SYS_LOG => {
             sys_log(a0 as u32, a1 as *const u8);
             0

@@ -52,7 +52,5 @@ fn panic(info: &PanicInfo) -> ! {
 
     // Deliberate undefined instruction → EL0 fault → the kernel kills this
     // task (Phase-6 isolation proof) instead of hanging the system.
-    loop {
-        unsafe { core::arch::asm!("udf #0", options(noreturn, nostack)) }
-    }
+    unsafe { core::arch::asm!("udf #0", options(noreturn, nostack)) }
 }

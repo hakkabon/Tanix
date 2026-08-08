@@ -6,3 +6,4 @@ description = "Tanix display server — owns virtio-gpu + virtio-tablet (Phase 5
 
 [dependencies]
 tanix-libsys = { path = "../libtanix-sys" }
+tanix-libtanix-ui = { path = "../libtanix-ui" }

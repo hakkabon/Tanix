@@ -57,14 +57,31 @@ pub const M_PM_NOTIFY_EXIT: u32 = 0x0304;
 /// Display server (`display`) — owns the virtio-gpu framebuffer and the
 /// virtio-tablet pointer.  Clients draw with FILL_RECT, present with FLUSH,
 /// and sample the pointer with TICK (the display server drains the tablet
-/// event queue on every TICK and reports the latest position).
+/// event queue on every TICK and reports the latest position).  Phase 8
+/// adds BLIT (the compositor copies window canvases into the framebuffer)
+/// and DRAW_TEXT (title bars — the font lives in libtanix-ui).
 pub const M_DISPLAY_GET_MODE: u32 = 0x0500;
 pub const M_DISPLAY_MODE_REPLY: u32 = 0x0501; // data[0]=width, data[1]=height
 pub const M_DISPLAY_FILL_RECT: u32 = 0x0502; // data[0..3]=x,y,w,h, data[4..6]=r,g,b
-pub const M_DISPLAY_DONE: u32 = 0x0503; // reply to FILL_RECT / FLUSH (data[0]=ok)
+pub const M_DISPLAY_DONE: u32 = 0x0503; // reply to FILL_RECT / FLUSH / BLIT / DRAW_TEXT (data[0]=ok)
 pub const M_DISPLAY_FLUSH: u32 = 0x0504;
 pub const M_DISPLAY_TICK: u32 = 0x0505;
 pub const M_DISPLAY_TICK_REPLY: u32 = 0x0506; // data[0]=pointer x, data[1]=pointer y, data[2]=buttons
+pub const M_DISPLAY_BLIT: u32 = 0x0507; // data[0,1]=src base, data[2..4]=src x,y,w,h, data[5,6]=dst x,y
+pub const M_DISPLAY_DRAW_TEXT: u32 = 0x0508; // data[0]=x, data[1]=y, data[2]=rgb, data[3]=len, data[4..8]=chars
+
+/// Window manager (`wm`) — Phase 8 compositor.  Apps create a window, get a
+/// winid + screen placement, draw into their own canvas (allocated and
+/// shared with the display server by the app), then FLUSH to composite and
+/// TICK to receive routed pointer events in window coordinates.
+pub const M_WM_CREATE: u32 = 0x0600; // data[0]=w, data[1]=h, data[2,3]=canvas base, data[4]=pages, data[5..8]=title (12 chars)
+pub const M_WM_CREATE_REPLY: u32 = 0x0601; // data[0]=winid, data[1]=x, data[2]=y, data[3]=w, data[4]=h, data[5]=ok
+pub const M_WM_CLOSE: u32 = 0x0602; // data[0]=winid
+pub const M_WM_DONE: u32 = 0x0603; // reply to CLOSE / FLUSH (data[0]=ok)
+pub const M_WM_FLUSH: u32 = 0x0604; // data[0]=winid — composite + present
+pub const M_WM_TICK: u32 = 0x0605; // data[0]=winid — sample pointer, route events
+pub const M_WM_TICK_REPLY: u32 = 0x0606; // data[0,1]=px,py (window-local, 0xFFFFFFFF=no event), data[2]=buttons, data[3]=focused
+pub const M_WM_NOTIFY: u32 = 0x0607; // wm → app (unsolicited, receive-time): data[0]=winid, data[1]=x, data[2]=y, data[3]=w, data[4]=h
 
 /// Maximum string payload carried inside a message (28 chars + NUL).
 pub const MAX_INLINE_STR: usize = 28;

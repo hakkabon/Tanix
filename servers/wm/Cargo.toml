@@ -1,0 +1,8 @@
+[package]
+name = "tanix-wm"
+version.workspace = true
+edition.workspace = true
+description = "Tanix window manager / compositor — window table, Z-order, drag/focus, compositing (Phase 8)"
+
+[dependencies]
+tanix-libsys = { path = "../libtanix-sys" }

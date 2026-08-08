@@ -58,11 +58,12 @@ pub extern "C" fn irq_handler(from_el0: u64) {
     let intid = gic::ack();
 
     match intid {
-        // PPI 26 — EL1 physical timer (CNTPNSIRQ on QEMU `virt`).
+        // PPI 30 — EL1 physical timer (CNTPNSIRQ on QEMU `virt`; the board
+        // maps the EL1 timer to INTID 30, the EL2 timer to 26).
         // Phase 7: count + re-arm the tick, then let the scheduler
         // preempt (only when the tick hit an EL0 task — ticks inside the
         // kernel, e.g. the SYS_WAIT_IRQ wait loop, just tick).
-        26 => {
+        30 => {
             super::timer::tick();
             log::trace!("irq: tick #{}", super::timer::ticks());
             gic::eoi(intid);

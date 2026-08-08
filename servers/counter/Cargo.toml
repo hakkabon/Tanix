@@ -1,8 +1,8 @@
 [package]
-name = "tanix-ui-demo"
+name = "tanix-counter"
 version.workspace = true
 edition.workspace = true
-description = "Tanix Phase-8 demo app \"paint\" — pointer canvas in a window (Phase 8)"
+description = "Tanix Phase-8 demo app \"counter\" — a +/− button window (Phase 8)"
 
 [dependencies]
 tanix-libsys = { path = "../libtanix-sys" }

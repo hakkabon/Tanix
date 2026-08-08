@@ -33,6 +33,16 @@ servers-ui: servers
 servers-phase7: servers
     cargo build --package tanix-hog --target {{TARGET}}
 
+# Build the Phase-8 window stack (all 11 server binaries)
+servers-phase8: servers-ui servers-phase7
+    cargo build --package tanix-wm --package tanix-counter \
+        --package tanix-clock --target {{TARGET}}
+
+# Build the kernel with all Phase-8 servers embedded
+kernel-phase8: servers-phase8
+    cargo build --package {{KERNEL_PKG}} --target {{TARGET}} \
+        --features embed-servers
+
 # Build the kernel with the Phase-4 server binaries embedded
 kernel-phase4: servers
     cargo build --package {{KERNEL_PKG}} --target {{TARGET}} \
@@ -95,6 +105,18 @@ qemu-phase5: kernel-phase5
 # ticks fire; the display server's virtio-gpu runs interrupt-driven)
 qemu-phase7: kernel-phase7
     ./scripts/qemu.sh -device virtio-gpu-device -device virtio-tablet-device
+
+# Build with the Phase-8 window stack and run in QEMU — composited desktop
+# demo (window manager + ui-demo/counter/clock apps + hog, all preempted
+# by the 1 kHz tick)
+qemu-phase8: kernel-phase8
+    ./scripts/qemu.sh -device virtio-gpu-device -device virtio-tablet-device
+
+# Phase-8 mouse demo: boots the desktop, injects virtio-tablet pointer
+# events over the QEMU monitor and screendumps the cursor following the
+# injected path (screenshot in /tmp/tanix-mouse.ppm)
+qemu-phase8-mouse: kernel-phase8
+    ./scripts/mouse-demo.sh
 
 # Build (release) and run in QEMU
 qemu-release: release

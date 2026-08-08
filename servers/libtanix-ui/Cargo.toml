@@ -2,7 +2,7 @@
 name = "tanix-libtanix-ui"
 version.workspace = true
 edition.workspace = true
-description = "Iced-shaped UI toolkit for Tanix — Sandbox/widgets/layout over the display server (Phase 5)"
+description = "Shared UI helpers for Tanix apps: window canvas + 5x7 bitmap font (Phase 8)"
 
 [dependencies]
 tanix-libsys = { path = "../libtanix-sys", features = ["alloc"] }

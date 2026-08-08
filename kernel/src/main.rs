@@ -301,56 +301,59 @@ fn kmain() -> ! {
     // ── Phase 5: display stack ────────────────────────────────────────────────
     //
     // The kernel boots the display server (owns the QEMU virtio-gpu
-    // framebuffer + virtio-tablet pointer) and the `ui-demo` application
-    // server.  The Phase-4 demo needs `init` to exit, so it can no longer
-    // act as the root for the Phase-5 servers; kmain spawns them directly
-    // once the Phase-4 demo has run its course.  `ui-demo` parks on a
-    // receive (nothing has sent yet), so the scheduler never returns here.
+    // framebuffer + virtio-tablet pointer).  The Phase-4 demo needs `init`
+    // to exit, so it can no longer act as the root for the display-stack
+    // servers; kmain spawns them directly once the Phase-4 demo has run its
+    // course.  The Phase-8 window manager and the apps are spawned after
+    // this block; `display` is highest-priority (32) so it initialises the
+    // GPU before wm or any app runs.
 
     if server::available() {
         let display = server::spawn_by_name("display");
-        let ui_demo = server::spawn_by_name("ui-demo");
         log::info!(
-            "phase 5: display stack spawned (display={:?}, ui-demo={:?})",
-            display, ui_demo
+            "phase 5: display server spawned (display={:?})",
+            display
         );
-        unsafe {
-            sched::enter();
-        }
-        log::info!("phase 5: display stack idle");
     }
 
-    // ── Phase 7: preemptive priority scheduler + device IRQs ─────────────────
+    // ── Phase 8: window manager + multiple concurrent apps ───────────────────
     //
-    // The scheduler is now preemptive: a 1 ms EL1 physical timer tick
-    // (GIC PPI 26) fires even while a task spins at EL0, and `SYS_WAIT_IRQ`
-    // lets a server block until its device interrupt arrives (the display
-    // server uses it for the virtio-gpu).
+    // `wm` (window manager / compositor, priority 48) owns the window
+    // table: apps create windows (off-screen canvases they draw into),
+    // flush them to the scanout, and receive pointer events routed into
+    // their window coordinates.  `wm` handles placement, z-order
+    // (click-to-raise), dragging via the title bar, and composites the
+    // desktop through the display server.
     //
-    // `hog` is the proof: a CPU-bound EL0 spin at the lowest priority.
-    // Under the Phase-4/5 cooperative scheduler `enter` would never return
-    // while hog spins; with tick preemption higher-priority work (and the
-    // device IRQ path) always gets its quantum.  kmain never returns from
-    // the final `enter` — hog runs forever — and the tick trace lines show
-    // preemption in action.
+    // Three demo apps run concurrently (priority 96): `ui-demo` (paint),
+    // `counter` and `clock`.  `hog` (192) spins in the background; the
+    // preemptive tick (armed below) keeps everything moving and wakes
+    // `clock`'s SYS_SLEEP deadlines.
 
     if server::available() {
+        let wm = server::spawn_by_name("wm");
+        let ui_demo = server::spawn_by_name("ui-demo");
+        let counter = server::spawn_by_name("counter");
+        let clock = server::spawn_by_name("clock");
         let hog = server::spawn_by_name("hog");
-        log::info!("phase 7: hog spawned ({:?})", hog);
+        log::info!(
+            "phase 8: window stack spawned (wm={:?}, ui-demo={:?}, counter={:?}, clock={:?}, hog={:?})",
+            wm, ui_demo, counter, clock, hog
+        );
 
-        // Enable the EL1 physical-timer interrupt (PPI 26) and arm the
-        // periodic 1 ms tick.
-        arch::aarch64::gic::enable_irq(26);
+        // Enable the EL1 physical-timer interrupt (PPI 30) and arm the
+        // periodic 1 ms tick (preemption + SYS_SLEEP wake-ups).
+        arch::aarch64::gic::enable_irq(30);
         arch::aarch64::timer::init_tick();
-        log::info!("phase 7: preemption tick armed (PPI 26)");
+        log::info!("phase 8: preemption tick armed (PPI 30)");
 
         unsafe {
             sched::enter();
         }
-        log::info!("phase 7: scheduler idle (unreachable — hog never blocks)");
+        log::info!("phase 8: window stack idle (unreachable — hog never blocks)");
     } else {
         log::warn!(
-            "phase 7: server binaries not embedded \
+            "phase 8: server binaries not embedded \
              (build with --features embed-servers)"
         );
     }

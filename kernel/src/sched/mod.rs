@@ -93,3 +93,16 @@ pub struct PendingSend {
     pub src: u32,
     pub msg: Message,
 }
+
+/// A message staged on the *sender* because the receiver's
+/// `pending_senders` queue was full.  Never dropped: the receiver's
+/// `receive` either wakes the sender when a slot frees or delivers the
+/// staged message directly when the filter matches (`sys_receive`).
+#[derive(Clone, Copy)]
+pub struct StagedSend {
+    /// Receiver task id the message is destined for.
+    pub dst: u32,
+    /// Sender task id (message `src`).
+    pub src: u32,
+    pub msg: Message,
+}
