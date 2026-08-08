@@ -29,6 +29,10 @@ servers-ui: servers
     cargo build --package tanix-libtanix-ui --package tanix-display \
         --package tanix-ui-demo --target {{TARGET}}
 
+# Build the Phase-4 server binaries + the Phase-7 hog demo
+servers-phase7: servers
+    cargo build --package tanix-hog --target {{TARGET}}
+
 # Build the kernel with the Phase-4 server binaries embedded
 kernel-phase4: servers
     cargo build --package {{KERNEL_PKG}} --target {{TARGET}} \
@@ -36,6 +40,11 @@ kernel-phase4: servers
 
 # Build the kernel with the Phase-4 servers + Phase-5 display stack embedded
 kernel-phase5: servers-ui
+    cargo build --package {{KERNEL_PKG}} --target {{TARGET}} \
+        --features embed-servers
+
+# Build the kernel with the Phase-5 display stack + Phase-7 scheduler embedded
+kernel-phase7: servers-ui servers-phase7
     cargo build --package {{KERNEL_PKG}} --target {{TARGET}} \
         --features embed-servers
 
@@ -79,6 +88,12 @@ qemu-phase4: kernel-phase4
 # Build with the Phase-5 display stack embedded and run in QEMU — UI demo
 # (virtio-gpu + virtio-tablet devices; a window shows the UI)
 qemu-phase5: kernel-phase5
+    ./scripts/qemu.sh -device virtio-gpu-device -device virtio-tablet-device
+
+# Build with the Phase-7 preemptive scheduler and run in QEMU — IRQ-driven
+# GPU + tick preemption demo (the hog spins at the lowest priority while
+# ticks fire; the display server's virtio-gpu runs interrupt-driven)
+qemu-phase7: kernel-phase7
     ./scripts/qemu.sh -device virtio-gpu-device -device virtio-tablet-device
 
 # Build (release) and run in QEMU

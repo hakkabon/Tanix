@@ -12,6 +12,7 @@ members = [
     "servers/libtanix-ui",
     "servers/display",
     "servers/ui-demo",
+    "servers/hog",
 ]
 
 [workspace.package]

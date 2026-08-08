@@ -1,4 +1,4 @@
-//! Server-process registry and spawn (Phase 6).
+//! Server-process registry and spawn (Phase 6/7).
 //!
 //! Each server is a separate no_std binary (a member of the workspace under
 //! `servers/`), embedded into the kernel at compile time via
@@ -16,6 +16,10 @@
 //!      block in its region (task id) preloaded into its callee-saved x19,
 //!   5. hands it the task via `spawn_server_user`; from then on the server
 //!      calls the kernel through `svc #0` (see `ipc::syscall`).
+//!
+//! Phase 7 assigns each server a scheduling priority (see `SERVER_PRIOS`):
+//! the display server (GPU owner) is highest, the `hog` spin-demo is
+//! lowest, the Phase-4 services sit in the middle.
 //!
 //! Unlike the Phase-3 guest (loaded at a dynamic address), the servers link
 //! at a **fixed** physical address (`LINK_BASE` in each crate's build.rs).
@@ -63,6 +67,7 @@ static SERVER_BINS: &[(&str, &[u8])] = &[
     ("worker", include_bytes!(env!("TANIX_WORKER_BIN_PATH"))),
     ("display", include_bytes!(env!("TANIX_DISPLAY_BIN_PATH"))),
     ("ui-demo", include_bytes!(env!("TANIX_UI_DEMO_BIN_PATH"))),
+    ("hog", include_bytes!(env!("TANIX_HOG_BIN_PATH"))),
 ];
 
 #[cfg(not(feature = "embed-servers"))]
@@ -71,17 +76,40 @@ static SERVER_BINS: &[(&str, &[u8])] = &[];
 /// Fixed link/runtime base per server — MUST match `--defsym=LINK_BASE` in
 /// each crate's `servers/*/build.rs`.
 ///
-/// The kernel image ends around 0x40530000 and the Phase-3 guest occupies
-/// 0x4052f000..0x4062f000, so the first free 128 KiB-aligned slot is
-/// 0x40700000 (256 MiB DDR window starts at 0x40000000).
+/// The bases must stay clear of everything the frame allocator hands out:
+/// the kernel image (which embeds the server binaries; in a debug build
+/// they are ~0.9 MB each, so image end can sit around 0x4070_0000) and the
+/// Phase-3 guest RAM / shmem allocated just after it.  The 0x4090_0000
+/// block (8 × 128 KiB slots = 1 MiB) leaves ~1 MiB of headroom above the
+/// Phase-3 allocations in a full debug build.
+///
+/// `reserve_regions()` runs *before* any dynamic allocation (kmain, right
+/// after the frame allocator starts), so neither the guest nor any server
+/// can receive frames that overlap a live server image.
 pub const SERVER_BASES: &[(&str, usize)] = &[
-    ("init",    0x4070_0000),
-    ("pm",      0x4072_0000),
-    ("mem",     0x4074_0000),
-    ("dev",     0x4076_0000),
-    ("worker",  0x4078_0000),
-    ("display", 0x407A_0000),
-    ("ui-demo", 0x407C_0000),
+    ("init",    0x4090_0000),
+    ("pm",      0x4092_0000),
+    ("mem",     0x4094_0000),
+    ("dev",     0x4096_0000),
+    ("worker",  0x4098_0000),
+    ("display", 0x409A_0000),
+    ("ui-demo", 0x409C_0000),
+    ("hog",     0x409E_0000),
+];
+
+/// Scheduling priority per server (Phase 7) — lower runs first.  The
+/// display server owns the GPU, so it is highest; the `hog` demo spins on
+/// the CPU at the lowest priority and is only scheduled when everything
+/// else is idle.
+pub const SERVER_PRIOS: &[(&str, u8)] = &[
+    ("init",    128),
+    ("pm",      128),
+    ("mem",     128),
+    ("dev",     128),
+    ("worker",  128),
+    ("display",  32),
+    ("ui-demo",  96),
+    ("hog",     192),
 ];
 
 // ── Spawn ─────────────────────────────────────────────────────────────────────
@@ -165,10 +193,17 @@ pub fn spawn_by_name(name: &str) -> Result<TaskId, i32> {
         boot,
     )
     .ok_or(-8)?;
+    // Phase 7: assign the server's scheduling priority.
+    let prio = SERVER_PRIOS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, p)| *p)
+        .unwrap_or(crate::sched::PRIO_NORMAL);
+    crate::sched::task::set_task_priority(id, prio);
 
     log::info!(
-        "server: spawned '{}' {:?} EL0 region={:#x}+{} KB entry={:#x} image_end={:#x} ttbr0={:#x} sp_el0={:#x}",
-        name, id, base, ram_size / 1024, entry, image_end, ttbr0, sp_el0
+        "server: spawned '{}' {:?} EL0 region={:#x}+{} KB entry={:#x} image_end={:#x} ttbr0={:#x} sp_el0={:#x} prio={}",
+        name, id, base, ram_size / 1024, entry, image_end, ttbr0, sp_el0, prio
     );
     Ok(id)
 }

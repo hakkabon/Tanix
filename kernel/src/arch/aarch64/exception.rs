@@ -45,49 +45,73 @@ const EC_DABT_LOWER:     u64 = 0x24; // Data abort from lower EL
 
 // ── IRQ handler ───────────────────────────────────────────────────────────────
 
-/// Called from `vectors.s` slot 5 (current EL/SPx IRQ) and slot 9
-/// (lower EL AArch64 IRQ).
+/// Called from `vectors.s` slot 5 (current EL/SPx IRQ — `from_el0 == 0`)
+/// and slot 9 (lower EL AArch64 IRQ — `from_el0 == 1`).
 ///
-/// Acknowledges the interrupt, dispatches it, then signals EOI.
+/// Acknowledges the interrupt, dispatches it, signals EOI, then lets the
+/// scheduler preempt when the tick interrupted an EL0 task.
 #[no_mangle]
-pub extern "C" fn irq_handler() {
+pub extern "C" fn irq_handler(from_el0: u64) {
     use super::gic;
+    use crate::sched::task;
 
     let intid = gic::ack();
 
     match intid {
+        // PPI 26 — EL1 physical timer (CNTPNSIRQ on QEMU `virt`).
+        // Phase 7: count + re-arm the tick, then let the scheduler
+        // preempt (only when the tick hit an EL0 task — ticks inside the
+        // kernel, e.g. the SYS_WAIT_IRQ wait loop, just tick).
+        26 => {
+            super::timer::tick();
+            log::trace!("irq: tick #{}", super::timer::ticks());
+            gic::eoi(intid);
+            unsafe {
+                task::tick_preempt(from_el0 != 0);
+            }
+        }
+
         // SGI 1 — inter-VM doorbell (guest → kernel reply notification).
         1 => {
             log::debug!("irq: SGI 1 received (VM doorbell)");
-            // The actual reply is already in the used ring; the transport's
-            // poll_replies() call in kmain picks it up on the next iteration.
-            // Nothing more to do here.
-        }
-
-        // PPI 30 — EL1 physical timer.
-        30 => {
-            log::trace!("irq: timer tick");
-            // Disarm to prevent continuous firing; the scheduler would
-            // re-arm for the next tick (Phase 4).
-            super::timer::disarm();
+            gic::eoi(intid);
         }
 
         // SGI 0 — used for IPI / reschedule in SMP (Phase 4).
         0 => {
             log::trace!("irq: SGI 0 (reschedule)");
+            gic::eoi(intid);
+        }
+
+        // Any other wired interrupt (device IRQs: virtio-mmio SPIs
+        // 48..79): record it for SYS_WAIT_IRQ and signal EOI.  The waiter
+        // may be inside its wait loop (current-EL IRQ) or about to call
+        // wait_irq from EL0 — in both cases the pending bit is how it
+        // learns the device completed.
+        other if (16..crate::irq::IRQ_MAX as u32).contains(&other) => {
+            log::trace!("irq: device INTID={} (pending)", other);
+            crate::irq::note_pending(other);
+            // Level-triggered device IRQ: mask it *before* EOI.  The level
+            // stays asserted until the driver's INT_ACK, so an unmasked
+            // EOI would make the GIC re-fire in the instruction window
+            // before the SYS_WAIT_IRQ wait loop resumes — starving the
+            // loop (it can never observe the pending bit).  The waiter
+            // consumes the bit and the next wait_irq re-enables the IRQ.
+            gic::disable_irq(other);
+            gic::eoi(intid);
         }
 
         1023 => {
-            // Spurious interrupt — GICv3 sends 1023 when no real IRQ is pending.
-            // This can happen during init; just ignore it.
+            // Spurious interrupt — GICv3 sends 1023 when no real IRQ is
+            // pending.  This can happen during init; just ignore it.
+            gic::eoi(intid);
         }
 
         other => {
             log::warn!("irq: unexpected INTID={}", other);
+            gic::eoi(intid);
         }
     }
-
-    gic::eoi(intid);
 }
 
 // ── Synchronous handler (lower EL) ───────────────────────────────────────────

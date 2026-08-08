@@ -23,6 +23,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tanix-hog"
+version = "0.1.0"
+dependencies = [
+ "tanix-libsys",
+]
+
+[[package]]
 name = "tanix-init"
 version = "0.1.0"
 dependencies = [
