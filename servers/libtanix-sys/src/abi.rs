@@ -24,24 +24,14 @@ impl Message {
 /// Sentinel filter for `receive`: accept any sender.
 pub const M_ANY: i32 = -1;
 
-/// The kernel's syscall table, handed to every server at boot.
-#[repr(C)]
-pub struct SyscallTable {
-    pub send: unsafe extern "C" fn(u32, *const Message) -> i32,
-    pub receive: unsafe extern "C" fn(i32, *mut Message) -> i32,
-    pub spawn: unsafe extern "C" fn(*const u8) -> i32,
-    pub who: unsafe extern "C" fn(*const u8) -> i32,
-    pub exit_task: unsafe extern "C" fn(u32) -> i32,
-    pub exit: unsafe extern "C" fn() -> !,
-    pub alloc_frames: unsafe extern "C" fn(u32) -> u64,
-    pub free_frames: unsafe extern "C" fn(u64, u32) -> i32,
-    pub log: unsafe extern "C" fn(u32, *const u8),
-}
-
 /// Boot info block: the server receives this in its callee-saved x19.
+///
+/// Phase 6: servers run at EL0 and call the kernel with `svc #0` — the
+/// syscall number goes in x0, arguments in x1-x3, result back in x0 (see
+/// `sys.rs` for the numbers).  There is no function-pointer table anymore.
 #[repr(C)]
 pub struct BootInfo {
-    pub syscalls: *const SyscallTable,
+    /// This task's own id.
     pub task_id: u32,
 }
 

@@ -1,11 +1,12 @@
-// AArch64 exception vector table — Phase 3.
+// AArch64 exception vector table — Phase 6.
 //
 // Each slot is 128 bytes (32 instructions).  The table is 2 KiB-aligned.
 //
-// Improvements over Phase 1:
+// Improvements over Phase 3:
 //   • Current-EL SPx IRQ (slot 5) → calls irq_handler instead of panicking.
-//   • Lower-EL AArch64 Synchronous (slot 8) → dispatches HVC and data-abort
-//     separately via sync_handler; only truly unexpected exceptions panic.
+//   • Lower-EL AArch64 Synchronous (slot 8) → dispatches SVC64 (EC 0x15,
+//     Phase 6 EL0 servers) in the fast path via tanix_syscall, HVC and
+//     aborts via sync_handler; only truly unexpected exceptions panic.
 //   • Lower-EL AArch64 IRQ (slot 9) → calls irq_handler.
 //   • All other slots still call exception_handler (which panics) — they
 //     represent configurations we don't expect and should not ignore.
@@ -14,6 +15,7 @@
 //   exception_handler(kind: u64, esr: u64, elr: u64, far: u64) -> !
 //   irq_handler()                                                -> ()
 //   sync_handler(esr: u64, elr: u64, far: u64, sp: u64)        -> ()
+//   tanix_syscall(nr: u64, a0: u64, a1: u64, a2: u64)         -> u64
 
 .section .text.vectors, "ax"
 .align 11
@@ -74,7 +76,7 @@ __vectors:
     eret
 .endm
 
-// ── Macro: lower-EL synchronous → sync_handler(esr, elr, far, sp) ───────────
+// ── Macro: lower-EL synchronous → SVC fast path or sync_handler(esr, elr, far, sp) ──
 
 .macro LOWER_SYNC_ENTRY
     sub  sp, sp, #176
@@ -92,6 +94,36 @@ __vectors:
     mrs  x5,  SPSR_EL1
     stp  x4,  x5,  [sp, #160]
 
+    // ── Phase 6 fast path: SVC64 (EC 0x15) from EL0 → tanix_syscall ──────
+    // x0 = syscall number, x1-x3 = arguments, result back in x0.
+    // The kernel clobbers x1-x18 freely (the server-side wrapper declares
+    // them clobbered); x30 is preserved below because the wrapper's `svc`
+    // does not list it.
+    mrs  x4, ESR_EL1
+    lsr  x5, x4, #26
+    cmp  x5, #0x15
+    b.ne 1f
+    bl   tanix_syscall         // result in x0
+    // Restore everything except x0 (the result).  ELR_EL1/SPSR_EL1 must be
+    // reloaded from the frame: the hardware already sets ELR to the address
+    // after the `svc` (eret resumes at the wrapper's epilogue), and blocking
+    // syscalls that context-switched leave ELR/SPSR pointing at the EL1h
+    // resume point.
+    ldp  x4,  x5,  [sp, #160]
+    msr  ELR_EL1,  x4
+    msr  SPSR_EL1, x5
+    ldp  x2,  x3,  [sp,  #16]
+    ldp  x4,  x5,  [sp,  #32]
+    ldp  x6,  x7,  [sp,  #48]
+    ldp  x8,  x9,  [sp,  #64]
+    ldp  x10, x11, [sp,  #80]
+    ldp  x12, x13, [sp,  #96]
+    ldp  x14, x15, [sp, #112]
+    ldp  x16, x17, [sp, #128]
+    ldp  x18, x30, [sp, #144]
+    add  sp, sp, #176
+    eret
+1:
     // Arguments: esr, elr, far, kernel_sp
     mrs  x0, ESR_EL1
     mrs  x1, ELR_EL1
@@ -151,7 +183,7 @@ __vectors:
 .balign 128
     EXCEPTION_ENTRY 7
 
-// 8: Lower EL (AArch64) — Synchronous  ← HVC + data-abort dispatch
+// 8: Lower EL (AArch64) — Synchronous  ← SVC64 fast path + HVC/abort dispatch
 .balign 128
     LOWER_SYNC_ENTRY
 

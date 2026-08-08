@@ -1,10 +1,8 @@
-//! Kernel-side implementation of the Phase-4 syscall table.
+//! Kernel-side implementation of the Phase-6 SVC syscall interface.
 //!
-//! Servers are separate binaries; they never link against the kernel.
-//! Instead each server receives a `SyscallTable` pointer at boot and invokes
-//! these functions through it.  The table is deliberately value-based (no
-//! function addresses are resolvable from inside a server) — the same ABI
-//! would be the SVC dispatch index once servers move to EL0.
+//! Servers run at EL0 in their own address spaces (per-task TTBR0) and call
+//! the kernel with `svc #0`: the syscall number in x0, arguments in x1-x3,
+//! result in x0 (vectors.s dispatches EC 0x15 to `tanix_syscall`).
 //!
 //! IPC model (Minix `send` / `receive`):
 //!   • `send(dst, msg)` blocks the sender until the receiver *accepts* the
@@ -15,28 +13,105 @@
 //!   • A sender that cannot rendezvous immediately parks itself in the
 //!     receiver's `pending_senders` queue and blocks until the receiver
 //!     picks the message up.
+//!
+//! Address-space notes (Phase 6):
+//!   • The kernel runs with the *current* task's TTBR0 active.  The task's
+//!     own pages are mapped EL1-accessible (AP 0b01), so pointers the task
+//!     passes in are directly dereferenceable — except when the target of
+//!     the copy is another task's memory (receive buffers of blocked
+//!     receivers).  Those are written under the receiver's own table via
+//!     `with_ttbr0`.
+//!   • `PendingSend` stores the message *by value*, copied while the
+//!     sender's table is still active, so no cross-address-space pointers
+//!     are kept.
+//!   • `alloc_frames` / `free_frames` map / demote the frames in the
+//!     *calling* task's table (identity VA == phys), so the returned
+//!     physical base stays directly dereferenceable by the server.
 
-use crate::mem::frame;
-use crate::sched::task::{context_switch, kill_task, scheduler};
+use crate::mem::{frame, page_table, PAGE_SIZE};
+use crate::sched::task::{context_switch, current_ttbr0, kill_task};
 use crate::sched::{Message, PendingSend, TaskId, TaskState, M_ANY};
 
-/// Deliver `msg` from `src` into `dst`'s receive buffer, stamping `src`.
+// ── Syscall numbers (must match `servers/libtanix-sys/src/sys.rs`) ────────────
+
+pub const SYS_SEND: u64 = 0;
+pub const SYS_RECEIVE: u64 = 1;
+pub const SYS_SPAWN: u64 = 2;
+pub const SYS_WHO: u64 = 3;
+pub const SYS_EXIT_TASK: u64 = 4;
+pub const SYS_EXIT: u64 = 5;
+pub const SYS_ALLOC_FRAMES: u64 = 6;
+pub const SYS_FREE_FRAMES: u64 = 7;
+pub const SYS_LOG: u64 = 8;
+
+// ── Active TTBR0 helpers ──────────────────────────────────────────────────────
+
+/// Read the currently active TTBR0_EL1.
+unsafe fn active_ttbr0() -> u64 {
+    let t: u64;
+    core::arch::asm!("mrs {0}, ttbr0_el1", out(reg) t, options(nomem, nostack));
+    t
+}
+
+/// Run `f` with the task table `ttbr0` active (the kernel's own table when
+/// 0), restoring the previous table afterwards.  Each switch flushes the
+/// TLB (we use no ASIDs).
+///
+/// Safe to use for *live* tasks only; `ttbr0` must not be a dead task's
+/// (freed) tables.
 ///
 /// # Safety
-/// `dst.recv_buf` must be valid while `dst` is blocked in `receive`.
+/// Must be called from EL1.
+unsafe fn with_ttbr0<T>(ttbr0: u64, f: impl FnOnce() -> T) -> T {
+    let cur = active_ttbr0();
+    if ttbr0 != cur {
+        core::arch::asm!(
+            "msr ttbr0_el1, {0}",
+            "isb",
+            in(reg) ttbr0,
+            options(nomem, nostack)
+        );
+        page_table::flush_tlb();
+    }
+    let r = f();
+    if ttbr0 != cur {
+        core::arch::asm!(
+            "msr ttbr0_el1, {0}",
+            "isb",
+            in(reg) cur,
+            options(nomem, nostack)
+        );
+        page_table::flush_tlb();
+    }
+    r
+}
+
+// ── IPC ───────────────────────────────────────────────────────────────────────
+
+/// Deliver `msg` (a pointer valid under the *current* table — the
+/// sender's) into `dst`'s receive buffer, stamping `src`.
+///
+/// `dst.recv_buf` lives in the receiver's own address space, so the copy
+/// is performed with the receiver's table temporarily active.
+///
+/// # Safety
+/// `dst` must be a live, blocked-in-receive task; `msg` must point to a
+/// valid message in the caller's address space.
 unsafe fn deliver(dst: &mut crate::sched::task::Task, src: u32, msg: *const Message) {
     let out = dst.recv_buf;
-    // Copy first, then stamp: the sender's message carries its own (zeroed)
-    // `src` field, which must not overwrite the stamp.
-    core::ptr::copy_nonoverlapping(msg, out, 1);
-    (*out).src = src;
+    let saved = *msg; // read under the current (sender's) table
+    with_ttbr0(dst.ttbr0, || {
+        let mut m = saved;
+        m.src = src;
+        core::ptr::write_volatile(out, m);
+    });
     dst.recv_blocked = false;
     dst.state = TaskState::Ready;
 }
 
 /// `send(dst, msg)` syscall.
-unsafe extern "C" fn sys_send(dst: u32, msg: *const Message) -> i32 {
-    let sched = scheduler();
+unsafe fn sys_send(dst: u32, msg: *const Message) -> i32 {
+    let sched = crate::sched::task::scheduler();
     let me = sched.current_id().0;
     let my_idx = sched.current_idx();
 
@@ -61,12 +136,14 @@ unsafe extern "C" fn sys_send(dst: u32, msg: *const Message) -> i32 {
         return 0;
     }
 
-    // Receiver not waiting — park ourselves as a pending sender.
+    // Receiver not waiting — park ourselves as a pending sender.  Copy the
+    // message now, while our table is still active (the receiver runs on a
+    // different TTBR0 and must not dereference our pointers later).
     let queued = {
         let dst_task = sched.task_at_mut(dst_idx).unwrap();
         match dst_task.pending_senders.iter_mut().find(|s| s.is_none()) {
             Some(slot) => {
-                *slot = Some(PendingSend { src: me, buf: msg });
+                *slot = Some(PendingSend { src: me, msg: *msg });
                 true
             }
             None => false, // receiver's send queue full
@@ -88,11 +165,12 @@ unsafe extern "C" fn sys_send(dst: u32, msg: *const Message) -> i32 {
 }
 
 /// `receive(filter, out)` syscall.  Returns the sender's id (or -errno).
-unsafe extern "C" fn sys_receive(filter: i32, out: *mut Message) -> i32 {
-    let sched = scheduler();
+unsafe fn sys_receive(filter: i32, out: *mut Message) -> i32 {
+    let sched = crate::sched::task::scheduler();
     let my_idx = sched.current_idx();
 
-    // Any pending sender already waiting for us?
+    // Any pending sender already waiting for us?  The parked message is a
+    // value copy, valid under *our* table — no switch needed.
     let pending = {
         let t = sched.task_at_mut(my_idx).unwrap();
         let mut found = None;
@@ -108,9 +186,9 @@ unsafe extern "C" fn sys_receive(filter: i32, out: *mut Message) -> i32 {
         found
     };
     if let Some(p) = pending {
-        // Copy from the (still blocked) sender's buffer, stamp, wake sender.
-        core::ptr::copy_nonoverlapping(p.buf, out, 1);
-        (*out).src = p.src;
+        let mut m = p.msg;
+        m.src = p.src;
+        core::ptr::write_volatile(out, m);
         if let Some(src_idx) = sched.task_idx(TaskId(p.src)) {
             sched.task_at_mut(src_idx).unwrap().state = TaskState::Ready;
             log::trace!("ipc: {} wakes pending sender {}", my_idx, p.src);
@@ -118,7 +196,9 @@ unsafe extern "C" fn sys_receive(filter: i32, out: *mut Message) -> i32 {
         return p.src as i32;
     }
 
-    // Nothing available — block until a sender rendezvouses with us.
+    // Nothing available — block until a sender rendezvouses with us.  Our
+    // `out` buffer is stored as a pointer into *our* address space; the
+    // kernel switches to our table when it must write it.
     {
         let t = sched.task_at_mut(my_idx).unwrap();
         t.recv_blocked = true;
@@ -137,23 +217,29 @@ unsafe extern "C" fn sys_receive(filter: i32, out: *mut Message) -> i32 {
 
 // ── Process-management syscalls ───────────────────────────────────────────────
 
-/// `spawn(name) -> new task id | -errno`.  Name is a NUL-terminated string
-/// in the caller's memory (same address space, so a plain deref is fine).
-unsafe extern "C" fn sys_spawn(name: *const u8) -> i32 {
-    let len = {
-        let mut n = 0usize;
-        while *name.add(n) != 0 {
-            n += 1;
-            if n > 15 {
-                return -5; // name too long
-            }
+/// Read a NUL-terminated string from the caller's address space (the
+/// caller's table is active, so plain reads are fine) into `buf`, returning
+/// it as a `&str` (or `None` if it is too long / not valid UTF-8).
+unsafe fn read_cstr(mut p: *const u8, buf: &mut [u8]) -> Option<&str> {
+    let mut n = 0usize;
+    while n < buf.len() {
+        let b = *p;
+        if b == 0 {
+            return core::str::from_utf8(&buf[..n]).ok();
         }
-        n
-    };
-    let buf = core::slice::from_raw_parts(name, len);
-    let s = match core::str::from_utf8(buf) {
-        Ok(s) => s,
-        Err(_) => return -6, // not UTF-8
+        buf[n] = b;
+        n += 1;
+        p = p.add(1);
+    }
+    None
+}
+
+/// `spawn(name) -> new task id | -errno`.  Name is a NUL-terminated string
+/// in the caller's memory (the caller's table is active — plain deref).
+unsafe fn sys_spawn(name: *const u8) -> i32 {
+    let mut buf = [0u8; 16];
+    let Some(s) = read_cstr(name, &mut buf) else {
+        return -5; // too long / not UTF-8
     };
     match crate::server::spawn_by_name(s) {
         Ok(id) => id.0 as i32,
@@ -162,23 +248,12 @@ unsafe extern "C" fn sys_spawn(name: *const u8) -> i32 {
 }
 
 /// `who(name) -> task id | -1`.
-unsafe extern "C" fn sys_who(name: *const u8) -> i32 {
-    let len = {
-        let mut n = 0usize;
-        while *name.add(n) != 0 {
-            n += 1;
-            if n > 15 {
-                return -1;
-            }
-        }
-        n
+unsafe fn sys_who(name: *const u8) -> i32 {
+    let mut buf = [0u8; 16];
+    let Some(s) = read_cstr(name, &mut buf) else {
+        return -1;
     };
-    let buf = core::slice::from_raw_parts(name, len);
-    let s = match core::str::from_utf8(buf) {
-        Ok(s) => s,
-        Err(_) => return -1,
-    };
-    let sched = scheduler();
+    let sched = crate::sched::task::scheduler();
     for t in sched.task_slots().iter().flatten() {
         if t.name_str() == s && t.state != TaskState::Zombie {
             return t.id.0 as i32;
@@ -188,7 +263,7 @@ unsafe extern "C" fn sys_who(name: *const u8) -> i32 {
 }
 
 /// `exit_task(pid)` — kill another task.
-unsafe extern "C" fn sys_exit_task(pid: u32) -> i32 {
+unsafe fn sys_exit_task(pid: u32) -> i32 {
     if kill_task(TaskId(pid)) {
         0
     } else {
@@ -197,23 +272,47 @@ unsafe extern "C" fn sys_exit_task(pid: u32) -> i32 {
 }
 
 /// `exit()` — terminate the calling task.
-unsafe extern "C" fn sys_exit() -> ! {
+unsafe fn sys_exit() -> ! {
     crate::sched::task::exit_current()
 }
 
-// ── Memory syscalls (behind the mem server) ───────────────────────────────────
+// ── Memory syscalls ───────────────────────────────────────────────────────────
 
 /// `alloc_frames(n) -> physical base | 0`.
-unsafe extern "C" fn sys_alloc_frames(pages: u32) -> u64 {
-    frame::alloc_frames(pages as usize)
-        .map(|p| p as u64)
-        .unwrap_or(0)
+///
+/// The frames are mapped into the *calling task's* address space at their
+/// physical address (identity), so the returned base is directly usable —
+/// same ABI as Phase 4, where servers simply dereferenced the physical
+/// addresses the kernel handed out.
+unsafe fn sys_alloc_frames(pages: u32) -> u64 {
+    let base = match frame::alloc_frames(pages as usize) {
+        Some(b) => b,
+        None => return 0,
+    };
+    let ttbr0 = current_ttbr0();
+    if ttbr0 != 0 {
+        page_table::map_user_pages(ttbr0 as usize, base, pages as usize * PAGE_SIZE, page_table::FLAGS_USER_RWX);
+        page_table::flush_tlb();
+    }
+    log::trace!("alloc_frames: {} pages → {:#x} (ttbr0={:#x})", pages, base, ttbr0);
+    base as u64
 }
 
 /// `free_frames(base, n)`.
-unsafe extern "C" fn sys_free_frames(base: u64, pages: u32) -> i32 {
+///
+/// Demotes the pages back to EL1-only in the calling task's table before
+/// releasing the frames (the frames' contents stay valid for the kernel).
+unsafe fn sys_free_frames(base: u64, pages: u32) -> i32 {
+    let ttbr0 = current_ttbr0();
     for i in 0..pages as usize {
-        frame::free_frame(base as usize + i * crate::mem::PAGE_SIZE);
+        let pa = base as usize + i * PAGE_SIZE;
+        if ttbr0 != 0 {
+            page_table::map_user_pages(ttbr0 as usize, pa, PAGE_SIZE, page_table::FLAGS_KERNEL_RWX);
+        }
+        frame::free_frame(pa);
+    }
+    if ttbr0 != 0 {
+        page_table::flush_tlb();
     }
     0
 }
@@ -221,9 +320,8 @@ unsafe extern "C" fn sys_free_frames(base: u64, pages: u32) -> i32 {
 // ── Logging syscall ───────────────────────────────────────────────────────────
 
 /// `log(level, msg)` — kernel log line prefixed with the sender's name.
-unsafe extern "C" fn sys_log(level: u32, msg: *const u8) {
-    let sched = scheduler();
-    let name = sched.current_name();
+unsafe fn sys_log(level: u32, msg: *const u8) {
+    let name = crate::sched::task::current_name();
     let len = {
         let mut n = 0usize;
         while *msg.add(n) != 0 {
@@ -242,21 +340,39 @@ unsafe extern "C" fn sys_log(level: u32, msg: *const u8) {
     }
 }
 
-// ── The syscall table handed to servers ───────────────────────────────────────
+// ── SVC dispatcher ────────────────────────────────────────────────────────────
 
-static SYSCALL_TABLE: crate::sched::SyscallTable = crate::sched::SyscallTable {
-    send: sys_send,
-    receive: sys_receive,
-    spawn: sys_spawn,
-    who: sys_who,
-    exit_task: sys_exit_task,
-    exit: sys_exit,
-    alloc_frames: sys_alloc_frames,
-    free_frames: sys_free_frames,
-    log: sys_log,
-};
-
-/// Pointer to the kernel's syscall table, given to every server at boot.
-pub fn table_ptr() -> *const crate::sched::SyscallTable {
-    core::ptr::addr_of!(SYSCALL_TABLE)
+/// Phase-6 SVC dispatch entry, called from `vectors.s` (EC 0x15) with the
+/// syscall number in x0 and arguments in x1-x3.  Returns the result in x0.
+///
+/// Must not clobber x30 (the stub preserves it for the caller) and must
+/// return the result in x0.  x4+ are freely clobberable — the server-side
+/// wrappers list them as clobbered.
+#[no_mangle]
+pub unsafe extern "C" fn tanix_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    let _ = a2; // reserved (Phase 6 ABI: x3 defined, unused so far)
+    match nr {
+        SYS_SEND => sys_send(a0 as u32, a1 as *const Message) as u64,
+        SYS_RECEIVE => sys_receive(a0 as i32, a1 as *mut Message) as u64,
+        SYS_SPAWN => sys_spawn(a0 as *const u8) as u64,
+        SYS_WHO => sys_who(a0 as *const u8) as u64,
+        SYS_EXIT_TASK => sys_exit_task(a0 as u32) as u64,
+        SYS_EXIT => {
+            sys_exit();
+        }
+        SYS_ALLOC_FRAMES => sys_alloc_frames(a0 as u32),
+        SYS_FREE_FRAMES => sys_free_frames(a0, a1 as u32) as u64,
+        SYS_LOG => {
+            sys_log(a0 as u32, a1 as *const u8);
+            0
+        }
+        other => {
+            log::error!(
+                "syscall: task '{}' invoked unknown syscall {}",
+                crate::sched::task::current_name(),
+                other
+            );
+            0
+        }
+    }
 }

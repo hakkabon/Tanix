@@ -1,11 +1,11 @@
-//! aarch64 exception vector table and dispatcher — Phase 3.
+//! aarch64 exception vector table and dispatcher — Phase 6.
 //!
-//! Phase 3 changes from Phase 1:
-//!   • `irq_handler`  — dispatches GIC interrupts (timer PPI, SGI doorbells).
+//! Phase 6 changes from Phase 3:
 //!   • `sync_handler` — dispatches synchronous exceptions from lower EL:
-//!       EC 0x16 (HVC)        → hypervisor::doorbell::handle_hvc
-//!       EC 0x25 (data abort) → panic with fault info
-//!       other                → panic
+//!       EC 0x15 (SVC64)     → handled in vectors.s (tanix_syscall fast path)
+//!       EC 0x16 (HVC)       → hypervisor::doorbell::handle_hvc
+//!       EC 0x20/0x24 (aborts) → EL0 tasks are killed (isolation proof);
+//!                                EL1 guest aborts panic as before
 //!   • `exception_handler` retained for unexpected/fatal exceptions.
 
 use core::arch::global_asm;
@@ -40,8 +40,8 @@ fn esr_ec(esr: u64) -> u64 {
 }
 
 const EC_HVC64:          u64 = 0x16; // HVC from AArch64
-const EC_DABT_LOWER:     u64 = 0x24; // Data abort from lower EL
 const EC_IABT_LOWER:     u64 = 0x20; // Instruction abort from lower EL
+const EC_DABT_LOWER:     u64 = 0x24; // Data abort from lower EL
 
 // ── IRQ handler ───────────────────────────────────────────────────────────────
 
@@ -92,6 +92,52 @@ pub extern "C" fn irq_handler() {
 
 // ── Synchronous handler (lower EL) ───────────────────────────────────────────
 
+/// SPSR_EL1 saved in the exception frame — the exception level of the
+/// interrupted context is PSTATE.M[3:0] (0 = EL0t, 4 = EL1h, 5 = EL1t).
+fn from_el0(frame: *const u64) -> bool {
+    unsafe { core::ptr::read_volatile(frame.add(21)) & 0xF == 0 }
+}
+
+/// Abort from an EL0 task: log, mark it zombie and switch away.  Never
+/// returns.  The kernel itself (and the EL1 guest) are unaffected — this
+/// is the Phase-6 isolation guarantee.
+unsafe fn kill_faulting_task(esr: u64, elr: u64, far: u64) -> ! {
+    use crate::sched::task::{context_switch, scheduler};
+    use crate::sched::TaskState;
+
+    let sched = scheduler();
+    let idx = sched.current_idx();
+    let name = sched.current_name();
+    let id = sched.current_id();
+    log::error!(
+        "EL0 fault: task {:?} '{}' ESR={:#010x} ELR={:#018x} FAR={:#018x} — killed",
+        id, name, esr, elr, far
+    );
+    sched.set_state(idx, TaskState::Zombie);
+    if let Some(t) = sched.task_at_mut(idx) {
+        t.recv_blocked = false;
+        t.recv_buf = core::ptr::null_mut();
+    }
+
+    // Switch to the next runnable task; the zombie never runs again.
+    loop {
+        let next = sched.pick_next();
+        if next == idx {
+            // Nothing else runnable — fall back to the boot context.
+            let from = sched.ctx_ptr(idx);
+            let to = sched.ctx_ptr(0);
+            sched.set_current(0);
+            context_switch(from, to);
+        } else {
+            let from = sched.ctx_ptr(idx);
+            let to = sched.ctx_ptr(next);
+            sched.set_state(next, TaskState::Running);
+            sched.set_current(next);
+            context_switch(from, to);
+        }
+    }
+}
+
 /// Called from `vectors.s` slot 8 (lower EL AArch64 synchronous exception).
 ///
 /// Handles HVC calls and data/instruction aborts from guest code.
@@ -141,6 +187,11 @@ pub extern "C" fn sync_handler(esr: u64, elr: u64, _far: u64, sp: u64) {
         }
 
         EC_DABT_LOWER | EC_IABT_LOWER => {
+            let frame = sp as *const u64;
+            if from_el0(frame) {
+                // An EL0 server faulted — isolate it (Phase 6).
+                unsafe { kill_faulting_task(esr, elr, _far) }
+            }
             panic!(
                 "guest abort EC={:#x} ESR={:#010x} ELR={:#018x} FAR={:#018x}",
                 ec, esr, elr, _far
@@ -148,6 +199,13 @@ pub extern "C" fn sync_handler(esr: u64, elr: u64, _far: u64, sp: u64) {
         }
 
         other => {
+            let frame = sp as *const u64;
+            if from_el0(frame) {
+                // Anything unexpected from EL0 (undefined instruction,
+                // alignment, …) is treated as a task fault, not a kernel
+                // bug — the server must be quarantined.
+                unsafe { kill_faulting_task(esr, elr, _far) }
+            }
             panic!(
                 "unhandled sync exception EC={:#x} ESR={:#010x} ELR={:#018x}",
                 other, esr, elr

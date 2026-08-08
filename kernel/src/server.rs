@@ -1,4 +1,4 @@
-//! Server-process registry and spawn (Phase 4).
+//! Server-process registry and spawn (Phase 6).
 //!
 //! Each server is a separate no_std binary (a member of the workspace under
 //! `servers/`), embedded into the kernel at compile time via
@@ -7,9 +7,15 @@
 //!
 //!   1. zeroes the server's private RAM region,
 //!   2. loads the binary (ELF, linked at its final address),
-//!   3. creates a scheduler task whose stack sits at the top of the region,
-//!   4. hands the task a `BootInfo` block (syscall table + own task id)
-//!      preloaded into its callee-saved x19.
+//!   3. **clones the kernel's page tables** into a per-task address space
+//!      (Phase 6): every EL1-only mapping is kept, and the server's own
+//!      region pages (plus, for the display server, its virtio-mmio window)
+//!      are made EL0-visible,
+//!   4. creates an **EL0** scheduler task (SPSR_EL1 = EL0t) with a user
+//!      stack, a kernel stack at the top of its region, and a `BootInfo`
+//!      block in its region (task id) preloaded into its callee-saved x19,
+//!   5. hands it the task via `spawn_server_user`; from then on the server
+//!      calls the kernel through `svc #0` (see `ipc::syscall`).
 //!
 //! Unlike the Phase-3 guest (loaded at a dynamic address), the servers link
 //! at a **fixed** physical address (`LINK_BASE` in each crate's build.rs).
@@ -25,14 +31,26 @@
 //! `spawn` syscall, and a `worker` binary exists so `pm` has something
 //! realistic to exec.
 
-use crate::ipc::syscall::table_ptr;
-use crate::mem::PAGE_SIZE;
-use crate::sched::task::spawn_server;
+use crate::mem::{page_table, PAGE_SIZE};
+use crate::sched::task::spawn_server_user;
 use crate::sched::{BootInfo, TaskId};
 use crate::vm::loader;
 
 /// Private memory region size per server (frames).  128 KiB each.
 pub const SERVER_RAM_PAGES: usize = 32;
+
+/// User stack size per server (below the EL1-only kernel stack at the top
+/// of the region).
+pub const USER_STACK_SIZE: usize = 16 * 1024;
+
+/// virtio-mmio window granted to the display server: 32 transports × 0x200
+/// bytes, all within 16 KiB (see `servers/display/src/virtio.rs`).
+const DISPLAY_MMIO_BASE: usize = 0x0A00_0000;
+const DISPLAY_MMIO_SIZE: usize = 32 * 0x200;
+
+/// PL011 UART0 page granted to the `dev` server (its `M_DEV_WRITE` service
+/// writes the console directly).
+const UART0_BASE: usize = 0x0900_0000;
 
 // ── Embedded binaries ─────────────────────────────────────────────────────────
 
@@ -92,19 +110,65 @@ pub fn spawn_by_name(name: &str) -> Result<TaskId, i32> {
     unsafe {
         core::ptr::write_bytes(base as *mut u8, 0, ram_size);
     }
-    let entry = loader::load_flat(bin, 0, base + ram_size).map_err(|_| -9)?;
+    let img = loader::load_flat_full(bin, 0, base + ram_size).map_err(|_| -9)?;
+    let entry = img.entry;
+    let image_end = img.image_end; // absolute (servers link at LINK_BASE)
 
-    // Task with its stack at the top of the region.
-    let stack_top = base + ram_size;
-    let boot = BootInfo {
-        syscalls: table_ptr(),
-        task_id: 0, // filled by the scheduler with the real id
-    };
-    let id = spawn_server(name, entry, stack_top, boot).ok_or(-8)?;
+    // ── Phase 6: per-task address space ─────────────────────────────────────
+    // Clone the kernel's identity map (all of it EL1-only) and open up
+    // exactly what this server may touch at EL0:
+    //   • its own region: image + bootinfo page + user stack (RWX for now;
+    //     RO-for-text is a later tightening),
+    //   • display only: the virtio-mmio transport window.
+    // The kernel stack at the top of the region stays EL1-only.
+    let ttbr0 = unsafe { page_table::clone_kernel_table() };
+
+    let boot_page = image_end;
+    let user_area_end = boot_page + PAGE_SIZE + USER_STACK_SIZE;
+    assert!(
+        user_area_end <= base + ram_size,
+        "server '{}': image too large for its region ({:#x} .. {:#x})",
+        name, base, base + ram_size
+    );
+    unsafe {
+        page_table::map_user_pages(ttbr0, base, boot_page - base, page_table::FLAGS_USER_RWX);
+        page_table::map_user_pages(ttbr0, boot_page, PAGE_SIZE, page_table::FLAGS_USER_RWX);
+        page_table::map_user_pages(
+            ttbr0,
+            boot_page + PAGE_SIZE,
+            USER_STACK_SIZE,
+            page_table::FLAGS_USER_RWX,
+        );
+        if name == "display" {
+            page_table::map_user_pages(
+                ttbr0,
+                DISPLAY_MMIO_BASE,
+                DISPLAY_MMIO_SIZE,
+                page_table::FLAGS_USER_DEVICE,
+            );
+        }
+        if name == "dev" {
+            page_table::map_user_pages(ttbr0, UART0_BASE, PAGE_SIZE, page_table::FLAGS_USER_DEVICE);
+        }
+    }
+
+    let kernel_stack_top = base + ram_size;
+    let sp_el0 = boot_page + PAGE_SIZE + USER_STACK_SIZE;
+    let boot = BootInfo { task_id: 0 };
+    let id = spawn_server_user(
+        name,
+        entry,
+        ttbr0 as u64,
+        sp_el0,
+        kernel_stack_top,
+        boot_page,
+        boot,
+    )
+    .ok_or(-8)?;
 
     log::info!(
-        "server: spawned '{}' {:?} region={:#x}+{} KB entry={:#x}",
-        name, id, base, ram_size / 1024, entry
+        "server: spawned '{}' {:?} EL0 region={:#x}+{} KB entry={:#x} image_end={:#x} ttbr0={:#x} sp_el0={:#x}",
+        name, id, base, ram_size / 1024, entry, image_end, ttbr0, sp_el0
     );
     Ok(id)
 }
