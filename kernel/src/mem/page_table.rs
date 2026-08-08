@@ -35,6 +35,8 @@ pub const DESC_SH_INNER: u64 = 0b11 << 8;
 // AP[2:1] — access permissions
 pub const DESC_AP_RW_EL1: u64 = 0b00 << 6; // R/W at EL1, no access EL0
 pub const DESC_AP_RO_EL1: u64 = 0b10 << 6; // R/O at EL1, no access EL0
+/// R/W at EL1 and EL0 — the EL0 task's own pages (Phase 6).
+pub const DESC_AP_RW_EL0: u64 = 0b01 << 6;
 
 // UXN / PXN — execute-never bits
 pub const DESC_UXN: u64 = 1 << 54;
@@ -82,6 +84,25 @@ pub const FLAGS_BLOCK_NORMAL: u64 = DESC_VALID
 pub const FLAGS_BLOCK_DEVICE: u64 = DESC_VALID
     | DESC_AF
     | DESC_AP_RW_EL1
+    | DESC_UXN
+    | DESC_PXN
+    | ATTR_DEVICE;
+
+/// Normal (WB/WA cacheable) 4 KiB page, RW at EL1 **and EL0**, executable
+/// by EL0 — the body of a server's private region (Phase 6).
+pub const FLAGS_USER_RWX: u64 = DESC_VALID
+    | DESC_PAGE
+    | DESC_AF
+    | DESC_SH_INNER
+    | DESC_AP_RW_EL0
+    | ATTR_NORMAL;
+
+/// Device-nGnRnE 4 KiB page, RW at EL1 and EL0, non-executable — MMIO
+/// windows granted to a trusted server (the display server's virtio-mmio).
+pub const FLAGS_USER_DEVICE: u64 = DESC_VALID
+    | DESC_PAGE
+    | DESC_AF
+    | DESC_AP_RW_EL0
     | DESC_UXN
     | DESC_PXN
     | ATTR_DEVICE;
@@ -228,6 +249,152 @@ pub unsafe fn map_block(vaddr: VirtAddr, paddr: PhysAddr, size: usize, flags: u6
         (*l2).set_entry(l2_idx(vaddr + offset), (paddr as u64 + offset as u64) | flags);
         offset += 2 * 1024 * 1024;
     }
+}
+
+// ── Per-task address spaces (Phase 6) ─────────────────────────────────────────
+
+/// Allocate a page-table frame and reserve it in the frame allocator so it
+/// is never handed out as normal memory while a task's tables are live.
+///
+/// # Safety
+/// Frame allocator must be initialised.
+unsafe fn alloc_table_frame() -> usize {
+    let phys = alloc_frame().expect("page table: out of memory");
+    super::frame::reserve_region(phys, PAGE_SIZE);
+    phys
+}
+
+/// Recursively clone the kernel's table levels into freshly allocated
+/// frames.  `src` is the physical address of a table page, `level` 0 = L0.
+///
+/// Every valid table descriptor is cloned; block/page descriptors (and
+/// zero entries) are copied verbatim.
+///
+/// # Safety
+/// Frame allocator must be initialised.  `src` must be a valid table.
+unsafe fn clone_level(src: PhysAddr, level: usize) -> PhysAddr {
+    let dst = alloc_table_frame() as *mut PageTable;
+    let src_tbl = src as *const PageTable;
+    for i in 0..512 {
+        let e = (*src_tbl).entry(i);
+        if e & DESC_VALID != 0 && e & DESC_TABLE != 0 && level < 3 {
+            let child_phys = clone_level((e & 0x0000_FFFF_FFFF_F000) as usize, level + 1);
+            (*dst).set_entry(i, (child_phys as u64) | DESC_VALID | DESC_TABLE);
+        } else {
+            (*dst).set_entry(i, e);
+        }
+    }
+    dst as usize
+}
+
+/// Clone the kernel's identity map into a fresh set of tables and return
+/// the physical address of the new L0 root.
+///
+/// The clone maps the entire DDR + MMIO EL1-only — exactly like the kernel
+/// table — so the kernel can run (and touch any task's memory) while this
+/// table is active.  EL0-visible pages are added afterwards with
+/// `map_user_pages` / `set_user_block`.
+///
+/// # Safety
+/// Frame allocator must be initialised.
+pub unsafe fn clone_kernel_table() -> PhysAddr {
+    let root = clone_level(kernel_l0_phys(), 0);
+    log::debug!("page_table: cloned kernel table root={:#x}", root);
+    root
+}
+
+/// Map the 4 KiB pages `[va .. va + size)` of the table rooted at `root`
+/// with `flags` (typically `FLAGS_USER_*`), splitting any covering 2 MiB
+/// block descriptor into an L3 table whose other entries stay EL1-only.
+///
+/// # Safety
+/// `root` must be a valid task table (phys) and `va`/`size` page-aligned.
+pub unsafe fn map_user_pages(root: PhysAddr, va: usize, size: usize, flags: u64) {
+    debug_assert_eq!(va & (PAGE_SIZE - 1), 0, "map_user_pages: va unaligned");
+    debug_assert_eq!(size & (PAGE_SIZE - 1), 0, "map_user_pages: size unaligned");
+
+    let l0 = root as *mut PageTable;
+    let l1 = ensure_table(l0, l0_idx(va));
+    let l2 = ensure_table(l1, l1_idx(va));
+
+    // Walk page-by-page so the split happens exactly once per block.
+    let mut offset = 0;
+    while offset < size {
+        let cur = va + offset;
+        let l2e = (*l2).entry(l2_idx(cur));
+        if l2e & DESC_VALID != 0 && l2e & DESC_TABLE == 0 {
+            // Covering block descriptor — split it into an L3 table.  The
+            // other pages keep the block's attributes (normal vs device,
+            // AP, shareability, XN) so we never silently change how the
+            // kernel sees the rest of the 2 MiB range.
+            let l3 = alloc_table_frame() as *mut PageTable;
+            let block_base = cur & !(2 * 1024 * 1024 - 1);
+            // Keep every descriptor bit the block carries (valid, AttrIndx,
+            // NS, AP, SH, AF, nG, UXN, PXN) and switch the type bit to PAGE.
+            let fill_flags = (l2e & (0xFFF | DESC_UXN | DESC_PXN)) | DESC_PAGE;
+            for i in 0..512 {
+                (*l3).set_entry(i, (block_base as u64 + (i as u64 * PAGE_SIZE as u64)) | fill_flags);
+            }
+            (*l2).set_entry(l2_idx(cur), (l3 as u64) | DESC_VALID | DESC_TABLE);
+        }
+        let l3 = ensure_table(l2, l2_idx(cur));
+        (*l3).set_entry(l3_idx(cur), (cur as u64) | flags);
+        offset += PAGE_SIZE;
+    }
+}
+
+/// Patch the flags of a 2 MiB block descriptor in the table rooted at
+/// `root` (used to grant an EL0 task a whole MMIO window in place, without
+/// splitting it into pages).
+///
+/// # Safety
+/// `root` must be a valid task table and `va` 2 MiB-aligned.
+pub unsafe fn set_user_block(root: PhysAddr, va: usize, flags: u64) {
+    debug_assert_eq!(va & (2 * 1024 * 1024 - 1), 0, "set_user_block: va unaligned");
+    let l0 = root as *mut PageTable;
+    let l1 = ensure_table(l0, l0_idx(va));
+    let l2 = ensure_table(l1, l1_idx(va));
+    let e = (*l2).entry(l2_idx(va));
+    assert!(e & DESC_VALID != 0 && e & DESC_TABLE == 0, "set_user_block: no block");
+    (*l2).set_entry(l2_idx(va), (e & 0x0000_FFFF_FFFF_F000) | flags);
+}
+
+/// Invalidate all stage-1 TLB entries (after any table/descriptor change).
+///
+/// # Safety
+/// Must not be called from EL0.
+pub fn flush_tlb() {
+    unsafe {
+        core::arch::asm!("tlbi vmalle1is", "dsb sy", "isb", options(nomem, nostack));
+    }
+}
+
+/// Free every page-table frame reachable from `root` (the task's tables,
+/// not the memory its descriptors point to), so the frames return to the
+/// allocator.
+///
+/// Must be called when a task is killed *and its tables are no longer
+/// active*.  The caller clears the task's `ttbr0` first.
+///
+/// # Safety
+/// `root` must be a task table allocated by `clone_kernel_table` /
+/// `alloc_table_frame`, not the kernel's own table.
+pub unsafe fn free_task_tables(root: PhysAddr) {
+    unsafe fn walk(tbl: PhysAddr, level: usize) {
+        let t = tbl as *const PageTable;
+        for i in 0..512 {
+            let e = (*t).entry(i);
+            if level < 3 && e & DESC_VALID != 0 && e & DESC_TABLE != 0 {
+                walk((e & 0x0000_FFFF_FFFF_F000) as usize, level + 1);
+            }
+        }
+        // Release the table frame itself (it was reserved by
+        // `alloc_table_frame` — a plain free restores its bit).
+        super::frame::free_frame(tbl);
+    }
+    debug_assert_ne!(root, kernel_l0_phys(), "free_task_tables: kernel table");
+    walk(root, 0);
+    log::debug!("page_table: freed task tables root={:#x}", root);
 }
 
 // ── MMU enable ────────────────────────────────────────────────────────────────

@@ -1,13 +1,53 @@
-//! Safe wrappers over the raw syscall table.
+//! Safe wrappers over the `svc #0` syscall interface (Phase 6).
+//!
+//! Syscall numbers match `kernel/src/ipc/syscall.rs`.  The kernel clobbers
+//! x1-x18 in the SVC handler, so the inline assembly must list them as
+//! clobbered; x30 is preserved by the handler, so it is *not* clobbered.
+//! The kernel returns the result in x0.
 //!
 //! Strings passed to the kernel are copied into a NUL-terminated stack
 //! buffer first — the kernel scans up to the NUL byte, so this keeps the
 //! boundary safe even for `&str` inputs.
 
 use core::sync::atomic::{AtomicU32, Ordering};
-use crate::abi::{BootInfo, Message, SyscallTable};
+use crate::abi::{BootInfo, Message};
 
-/// Read the current task's boot info (syscall table + own task id).
+// ── Syscall numbers (must match `kernel/src/ipc/syscall.rs`) ─────────────────
+
+pub const SYS_SEND: u64 = 0;
+pub const SYS_RECEIVE: u64 = 1;
+pub const SYS_SPAWN: u64 = 2;
+pub const SYS_WHO: u64 = 3;
+pub const SYS_EXIT_TASK: u64 = 4;
+pub const SYS_EXIT: u64 = 5;
+pub const SYS_ALLOC_FRAMES: u64 = 6;
+pub const SYS_FREE_FRAMES: u64 = 7;
+pub const SYS_LOG: u64 = 8;
+
+/// Invoke syscall `nr` with arguments `a0..a2`; returns the kernel's x0.
+///
+/// # Safety
+/// `a0..a2` must match the syscall's ABI (pointer arguments must be valid
+/// in this task's address space for the duration of the call).
+#[inline]
+unsafe fn raw_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    let r: u64;
+    core::arch::asm!(
+        "svc #0",
+        inlateout("x0") nr => r,
+        in("x1") a0,
+        in("x2") a1,
+        in("x3") a2,
+        lateout("x1") _,
+        lateout("x2") _,
+        lateout("x3") _,
+        clobber_abi("C"),
+        options(nostack),
+    );
+    r
+}
+
+/// Read the current task's boot info (own task id).
 ///
 /// # Safety
 /// Called once from the entry stub, which received the pointer in x19.
@@ -26,23 +66,18 @@ pub unsafe fn boot_info() -> &'static BootInfo {
     unsafe { &*CACHE }
 }
 
-/// The syscall table for this task (from boot info).
-pub fn table() -> &'static SyscallTable {
-    // Boot info is written once at spawn; reading it after the entry stub
-    // ran is sound.
-    unsafe { &*boot_info().syscalls }
-}
-
 /// `send(dst, msg)` — blocking rendezvous.  Returns `0` on success.
 pub fn send(dst: u32, msg: &Message) -> i32 {
-    unsafe { (table().send)(dst, msg as *const Message) }
+    unsafe { raw_syscall(SYS_SEND, dst as u64, msg as *const Message as u64, 0) as i32 }
 }
 
 /// `receive(filter)` — blocks until a message arrives; returns (src, msg).
 pub fn receive(filter: i32) -> (u32, Message) {
     let mut msg = Message::new(0);
-    let rc = unsafe { (table().receive)(filter, &mut msg) };
-    ((rc.max(0) as u32), msg)
+    let rc = unsafe {
+        raw_syscall(SYS_RECEIVE, filter as u64, &mut msg as *mut Message as u64, 0)
+    };
+    ((rc as i32).max(0) as u32, msg)
 }
 
 /// `spawn(name)` — start a registered server.  Returns its task id or -errno.
@@ -50,7 +85,7 @@ pub fn spawn(name: &str) -> i32 {
     let mut buf = [0u8; 16];
     let n = name.len().min(buf.len() - 1);
     buf[..n].copy_from_slice(&name.as_bytes()[..n]);
-    unsafe { (table().spawn)(buf.as_ptr()) }
+    unsafe { raw_syscall(SYS_SPAWN, buf.as_ptr() as u64, 0, 0) as i32 }
 }
 
 /// `who(name)` — resolve a server name to its task id (-1 if unknown).
@@ -58,27 +93,32 @@ pub fn who(name: &str) -> i32 {
     let mut buf = [0u8; 16];
     let n = name.len().min(buf.len() - 1);
     buf[..n].copy_from_slice(&name.as_bytes()[..n]);
-    unsafe { (table().who)(buf.as_ptr()) }
+    unsafe { raw_syscall(SYS_WHO, buf.as_ptr() as u64, 0, 0) as i32 }
 }
 
 /// `exit_task(pid)` — kill another task.  Returns `0` on success.
 pub fn exit_task(pid: u32) -> i32 {
-    unsafe { (table().exit_task)(pid) }
+    unsafe { raw_syscall(SYS_EXIT_TASK, pid as u64, 0, 0) as i32 }
 }
 
 /// `exit()` — terminate this task.
 pub fn exit() -> ! {
-    unsafe { (table().exit)() }
+    unsafe { raw_syscall(SYS_EXIT, 0, 0, 0) };
+    unreachable!()
 }
 
 /// `alloc_frames(n)` — physical base of n contiguous frames (0 = OOM).
+///
+/// The kernel maps the frames into this task's address space (identity
+/// VA == phys), so the returned base is directly dereferenceable — same
+/// contract as before the EL0 split.
 pub fn alloc_frames(n: u32) -> u64 {
-    unsafe { (table().alloc_frames)(n) }
+    unsafe { raw_syscall(SYS_ALLOC_FRAMES, n as u64, 0, 0) }
 }
 
 /// `free_frames(base, n)`.
 pub fn free_frames(base: u64, n: u32) -> i32 {
-    unsafe { (table().free_frames)(base, n) }
+    unsafe { raw_syscall(SYS_FREE_FRAMES, base, n as u64, 0) as i32 }
 }
 
 /// `log(level, msg)` — kernel log line, prefixed with this server's name.
@@ -86,7 +126,7 @@ pub fn log(level: u32, msg: &str) {
     let mut buf = [0u8; 128];
     let n = msg.len().min(buf.len() - 1);
     buf[..n].copy_from_slice(&msg.as_bytes()[..n]);
-    unsafe { (table().log)(level, buf.as_ptr()) };
+    unsafe { raw_syscall(SYS_LOG, level as u64, buf.as_ptr() as u64, 0) };
 }
 
 /// Own-task id, cached from boot info (cheap).

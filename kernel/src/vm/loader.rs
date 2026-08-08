@@ -53,16 +53,37 @@ struct Elf64Phdr {
 
 // ── Loader entry points ───────────────────────────────────────────────────────
 
+/// Loaded image: entry point plus the end of the LOAD footprint
+/// (highest `vaddr + memsz`, page-rounded) — Phase 6 uses the latter to
+/// decide which pages of a server region must be made EL0-visible.
+#[derive(Debug, Clone, Copy)]
+pub struct LoadedImage {
+    pub entry: PhysAddr,
+    /// First byte after the loaded image (text/data/bss), 4 KiB-aligned.
+    pub image_end: PhysAddr,
+}
+
 /// Detect the image format, load it, and return the guest entry point.
 ///
 /// `ram_base` — physical base address of the guest RAM region.
 /// `ram_size` — size in bytes of the guest RAM region.
 pub fn load_flat(image: &[u8], ram_base: PhysAddr, ram_size: usize) -> Result<PhysAddr, HvError> {
+    load_flat_full(image, ram_base, ram_size).map(|i| i.entry)
+}
+
+/// Like `load_flat` but also returns the image's LOAD footprint end.
+pub fn load_flat_full(
+    image: &[u8],
+    ram_base: PhysAddr,
+    ram_size: usize,
+) -> Result<LoadedImage, HvError> {
     // Try ELF first: an ELF's file size includes non-loadable sections
     // (debug info, symbol tables), so the RAM check is done against the
     // LOAD-segment footprint inside load_elf64, not the file size.
     if image.len() >= 64 && image[0..4] == ELFMAG {
-        load_elf64(image, ram_base, ram_size)
+        let (entry, footprint) = load_elf64(image, ram_base, ram_size)?;
+        let image_end = (footprint + 0xFFF) & !0xFFF;
+        Ok(LoadedImage { entry, image_end })
     } else {
         if image.len() > ram_size {
             log::error!(
@@ -71,7 +92,9 @@ pub fn load_flat(image: &[u8], ram_base: PhysAddr, ram_size: usize) -> Result<Ph
             );
             return Err(HvError::NoMemory);
         }
-        load_raw(image, ram_base)
+        load_raw(image, ram_base)?;
+        let image_end = (ram_base + image.len() + 0xFFF) & !0xFFF;
+        Ok(LoadedImage { entry: ram_base, image_end })
     }
 }
 
@@ -89,7 +112,14 @@ fn load_raw(image: &[u8], ram_base: PhysAddr) -> Result<PhysAddr, HvError> {
 }
 
 /// Parse an ELF64 AArch64 image and copy LOAD segments into guest RAM.
-fn load_elf64(image: &[u8], ram_base: PhysAddr, ram_size: usize) -> Result<PhysAddr, HvError> {
+///
+/// Returns `(entry, footprint)` where `footprint` is the highest
+/// `vaddr + memsz` across LOAD segments (already validated to fit).
+fn load_elf64(
+    image: &[u8],
+    ram_base: PhysAddr,
+    ram_size: usize,
+) -> Result<(PhysAddr, usize), HvError> {
     // SAFETY: we have already confirmed image.len() >= 64.
     let hdr: &Elf64Hdr = unsafe { &*(image.as_ptr() as *const Elf64Hdr) };
 
@@ -196,5 +226,5 @@ fn load_elf64(image: &[u8], ram_base: PhysAddr, ram_size: usize) -> Result<PhysA
         );
     }
 
-    Ok(entry)
+    Ok((entry, footprint))
 }

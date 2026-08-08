@@ -15,7 +15,16 @@ use super::{BootInfo, Message, PendingSend, TaskId, TaskState, M_ANY};
 
 // ── Saved register context ────────────────────────────────────────────────────
 
-/// Callee-saved general-purpose registers + SP + PC (ELR_EL1 equivalent).
+/// SPSR_EL1 value for kernel contexts: EL1h, all exceptions masked (matches
+/// the PSTATE the kernel actually runs with — the GIC and timer are set up
+/// but no interrupt source is ever enabled, so DAIF stays masked).
+pub const SPSR_KERNEL: u64 = 0x3C5;
+
+/// SPSR_EL1 value for EL0 tasks: EL0t, all exceptions masked (same DAIF
+/// policy as the kernel itself).
+pub const SPSR_USER: u64 = 0x3C0;
+
+/// Saved register context.
 ///
 /// Layout must match the `context_switch` assembly stub in `switch.s`.
 #[repr(C)]
@@ -24,10 +33,16 @@ pub struct Context {
     pub x19_to_x28: [u64; 10],
     /// Frame pointer (x29).
     pub fp: u64,
-    /// Link register (x30) — holds the return address / resume PC.
+    /// Link register (x30) — holds the resume PC (loaded into ELR_EL1).
     pub lr: u64,
-    /// Stack pointer.
+    /// Kernel stack pointer (SP_EL1).
     pub sp: u64,
+    /// User stack pointer (SP_EL0) — meaningful only for EL0 tasks.
+    pub sp_el0: u64,
+    /// SPSR_EL1 to restore: EL1h for kernel contexts, EL0t for user tasks.
+    pub spsr: u64,
+    /// TTBR0_EL1 — the task's page table (kernel table for kernel contexts).
+    pub ttbr0: u64,
 }
 
 impl Context {
@@ -37,15 +52,21 @@ impl Context {
             fp: 0,
             lr: 0,
             sp: 0,
+            sp_el0: 0,
+            spsr: 0,
+            ttbr0: 0,
         }
     }
 
-    /// Initialise a context that will start executing `entry_fn` with
-    /// a stack top at `stack_top`.
+    /// Initialise a context that will start executing `entry_fn` at EL1h
+    /// with a stack top at `stack_top` (used for kernel-side tasks and the
+    /// Phase-3 guest, which runs in the kernel's address space).
     pub fn new(entry_fn: usize, stack_top: usize) -> Self {
         let mut ctx = Self::zeroed();
-        ctx.lr = entry_fn as u64; // `ret` in context_switch jumps here
+        ctx.lr = entry_fn as u64; // `eret` in context_switch jumps here
         ctx.sp = stack_top as u64;
+        ctx.spsr = SPSR_KERNEL;
+        ctx.ttbr0 = crate::mem::page_table::kernel_l0_phys() as u64;
         ctx
     }
 
@@ -56,6 +77,27 @@ impl Context {
     /// argument (server binaries do exactly that in `_start`).
     pub fn with_boot(entry_fn: usize, stack_top: usize, boot_info: usize) -> Self {
         let mut ctx = Self::new(entry_fn, stack_top);
+        ctx.x19_to_x28[0] = boot_info as u64;
+        ctx
+    }
+
+    /// Initialise an **EL0** context: enters `entry_fn` at EL0t with the
+    /// user stack `sp_el0`, the task's own address space `ttbr0` (physical
+    /// address of its L0 page table), the kernel stack `kernel_stack_top`
+    /// for its EL1 side, and the boot-info pointer in x19.
+    pub fn new_user(
+        entry_fn: usize,
+        sp_el0: usize,
+        ttbr0: u64,
+        kernel_stack_top: usize,
+        boot_info: usize,
+    ) -> Self {
+        let mut ctx = Self::zeroed();
+        ctx.lr = entry_fn as u64;
+        ctx.sp = kernel_stack_top as u64;
+        ctx.sp_el0 = sp_el0 as u64;
+        ctx.spsr = SPSR_USER;
+        ctx.ttbr0 = ttbr0;
         ctx.x19_to_x28[0] = boot_info as u64;
         ctx
     }
@@ -74,6 +116,10 @@ pub struct Task {
     pub state: TaskState,
     pub ctx: Context,
     pub name: [u8; TASK_NAME_LEN],
+    /// Physical address of this task's L0 page table (0 = kernel table —
+    /// kernel contexts and the Phase-3 guest share the kernel's address
+    /// space).  Used to map alloc'd frames into EL0-accessible memory.
+    pub ttbr0: u64,
     // ── Phase 4 IPC state ────────────────────────────────────────────────────
     /// True while this task is blocked in `receive`.
     pub recv_blocked: bool,
@@ -94,14 +140,12 @@ impl Task {
             state: TaskState::Running,
             ctx: Context::zeroed(),
             name: *b"idle\0\0\0\0\0\0\0\0\0\0\0\0",
+            ttbr0: 0,
             recv_blocked: false,
             recv_filter: M_ANY,
             recv_buf: core::ptr::null_mut(),
             pending_senders: [None, None],
-            boot: BootInfo {
-                syscalls: core::ptr::null(),
-                task_id: 0,
-            },
+            boot: BootInfo { task_id: 0 },
         }
     }
 
@@ -115,14 +159,12 @@ impl Task {
             state: TaskState::Ready,
             ctx: Context::new(entry, stack_top),
             name: name_buf,
+            ttbr0: 0,
             recv_blocked: false,
             recv_filter: M_ANY,
             recv_buf: core::ptr::null_mut(),
             pending_senders: [None, None],
-            boot: BootInfo {
-                syscalls: core::ptr::null(),
-                task_id: 0,
-            },
+            boot: BootInfo { task_id: 0 },
         }
     }
 
@@ -186,6 +228,41 @@ impl Scheduler {
         log::debug!(
             "spawned task {:?} '{}' entry={:#x} boot={:#x}",
             id, name, entry, boot_ptr as usize
+        );
+        Some(id)
+    }
+
+    /// Spawn an **EL0** task with its own address space (Phase 6).
+    ///
+    /// `ttbr0` is the physical address of the task's L0 page table,
+    /// `sp_el0` the user stack pointer, `kernel_stack_top` the top of the
+    /// EL1-side kernel stack, and `boot` is copied into the memory at
+    /// `boot_info` (an EL0-readable page in the task's region, whose
+    /// address is preloaded into x19).
+    pub fn spawn_user(
+        &mut self,
+        name: &str,
+        entry: usize,
+        ttbr0: u64,
+        sp_el0: usize,
+        kernel_stack_top: usize,
+        boot_info: usize,
+        boot: BootInfo,
+    ) -> Option<TaskId> {
+        let slot = self.tasks.iter_mut().skip(1).find(|s| s.is_none())?;
+        let id = TaskId(self.next_id);
+        self.next_id += 1;
+        let t = slot.insert(Task::new(id, name, 0, 0));
+        t.boot = boot;
+        t.boot.task_id = id.0;
+        unsafe {
+            core::ptr::write_volatile(boot_info as *mut BootInfo, t.boot);
+        }
+        t.ttbr0 = ttbr0;
+        t.ctx = Context::new_user(entry, sp_el0, ttbr0, kernel_stack_top, boot_info);
+        log::debug!(
+            "spawned EL0 task {:?} '{}' entry={:#x} ttbr0={:#x} sp_el0={:#x} boot={:#x}",
+            id, name, entry, ttbr0, sp_el0, boot_info
         );
         Some(id)
     }
@@ -307,9 +384,40 @@ pub fn spawn_server(name: &str, entry: usize, stack_top: usize, boot: BootInfo) 
     }
 }
 
+/// Spawn an EL0 server task in its own address space (Phase 6).
+pub fn spawn_server_user(
+    name: &str,
+    entry: usize,
+    ttbr0: u64,
+    sp_el0: usize,
+    kernel_stack_top: usize,
+    boot_info: usize,
+    boot: BootInfo,
+) -> Option<TaskId> {
+    unsafe {
+        (*core::ptr::addr_of_mut!(SCHEDULER))
+            .spawn_user(name, entry, ttbr0, sp_el0, kernel_stack_top, boot_info, boot)
+    }
+}
+
 /// Id of the currently running task (0 = kernel boot context).
 pub fn current_id() -> TaskId {
     unsafe { (*core::ptr::addr_of_mut!(SCHEDULER)).current_id() }
+}
+
+/// Physical address of the current task's L0 page table (0 = kernel table).
+///
+/// EL0 tasks carry their own address space; kernel contexts and the guest
+/// share the kernel's identity map.  Used by the memory syscalls to map
+/// allocated frames into the caller's address space.
+pub fn current_ttbr0() -> u64 {
+    unsafe {
+        let sched = &*core::ptr::addr_of!(SCHEDULER);
+        sched.tasks[sched.current]
+            .as_ref()
+            .map(|t| t.ttbr0)
+            .unwrap_or(0)
+    }
 }
 
 /// Name of the currently running task.
@@ -339,15 +447,28 @@ pub fn task_name(id: TaskId) -> Option<&'static str> {
 }
 
 /// Mark a task (by id) as zombie.  Returns `false` if it does not exist.
+///
+/// Phase 6: if the task ran at EL0 with its own tables, they are freed so
+/// their frames return to the allocator.
 pub fn kill_task(id: TaskId) -> bool {
     unsafe {
         let sched = &mut *core::ptr::addr_of_mut!(SCHEDULER);
+        let current = sched.current_id();
         let t = match sched.task_by_id_mut(id) {
             Some(t) => t,
             None => return false,
         };
+        let victim_ttbr0 = t.ttbr0;
+        let victim_is_current = id == current;
         t.state = TaskState::Zombie;
         t.recv_blocked = false;
+        // Free the victim's address space unless it is ourselves (its
+        // tables stay active until the next switch; freeing them now would
+        // be unsafe — self-kill leaks them instead, like exit_current).
+        if victim_ttbr0 != 0 && !victim_is_current {
+            t.ttbr0 = 0;
+            crate::mem::page_table::free_task_tables(victim_ttbr0 as usize);
+        }
         true
     }
 }

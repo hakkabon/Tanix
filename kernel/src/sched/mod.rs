@@ -54,47 +54,26 @@ impl Message {
 /// Sentinel filter for `receive`: accept a message from any sender.
 pub const M_ANY: i32 = -1;
 
-/// The kernel's system-call table, passed to every server at boot.
-///
-/// All calls take/return value arguments (plus pointers into the caller's
-/// own memory).  A server calls these through the `SyscallTable` pointer it
-/// receives in its boot info; in a future EL0 split the same table becomes
-/// the SVC dispatch index.
-#[repr(C)]
-pub struct SyscallTable {
-    /// `send(dst, msg) -> 0 | -errno` — blocking rendezvous with `dst`.
-    pub send: unsafe extern "C" fn(u32, *const Message) -> i32,
-    /// `receive(filter, out) -> src | -errno` — blocks until a message from
-    /// a sender matching `filter` (M_ANY = any) is delivered into `out`.
-    pub receive: unsafe extern "C" fn(i32, *mut Message) -> i32,
-    /// `spawn(name) -> new task id | -errno` — start a registered server.
-    pub spawn: unsafe extern "C" fn(*const u8) -> i32,
-    /// `who(name) -> task id | -1` — resolve a server name to its task id.
-    pub who: unsafe extern "C" fn(*const u8) -> i32,
-    /// `exit_task(pid) -> 0 | -errno` — kill another task.
-    pub exit_task: unsafe extern "C" fn(u32) -> i32,
-    /// `exit() -> !` — terminate the calling task.
-    pub exit: unsafe extern "C" fn() -> !,
-    /// `alloc_frames(n) -> phys base | 0` — allocate n contiguous frames.
-    pub alloc_frames: unsafe extern "C" fn(u32) -> u64,
-    /// `free_frames(base, n) -> 0 | -errno` — release frames.
-    pub free_frames: unsafe extern "C" fn(u64, u32) -> i32,
-    /// `log(level, msg)` — kernel log line, prefixed with the caller's name.
-    pub log: unsafe extern "C" fn(u32, *const u8),
-}
-
 /// Boot info block handed to every server task (in its callee-saved x19).
+///
+/// Phase 6: servers run at EL0 and call the kernel via `svc #0` — there is
+/// no function-pointer table anymore, only the task id (and the address of
+/// this block, which the task can read through x19).
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct BootInfo {
-    /// Kernel syscall table.
-    pub syscalls: *const SyscallTable,
     /// This task's own id.
     pub task_id: u32,
 }
 
 /// A sender that is blocked waiting for a receiver to accept its message.
+///
+/// The message is copied by value at park time (while the sender's address
+/// space is still active): since Phase 6 each task has its own TTBR0, a
+/// pointer into the sender's memory would not be readable once the
+/// scheduler has switched to the receiver's table.
 #[derive(Clone, Copy)]
 pub struct PendingSend {
     pub src: u32,
-    pub buf: *const Message,
+    pub msg: Message,
 }
