@@ -18,6 +18,8 @@ members = [
     "servers/hog",
     "servers/ramfs",
     "servers/shell",
+    "servers/libtanix-drv",
+    "servers/net",
 ]
 
 [workspace.package]

@@ -1,0 +1,8 @@
+[package]
+name = "tanix-libdrv"
+version.workspace = true
+edition.workspace = true
+description = "Tanix Phase-10 device-driver library: PCIe ECAM, modern virtio-pci transport, virtio-net"
+
+[dependencies]
+tanix-libsys = { path = "../libtanix-sys" }

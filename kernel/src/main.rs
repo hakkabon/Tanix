@@ -316,7 +316,7 @@ fn kmain() -> ! {
         );
     }
 
-    // ── Phase 8/9: window manager, ramfs, shell + embedded app registry ─────
+    // ── Phase 8/9/10: window manager, ramfs, shell, net + app registry ──────
     //
     // `wm` (window manager / compositor, priority 48) owns the window
     // table: apps create windows (off-screen canvases they draw into),
@@ -333,15 +333,20 @@ fn kmain() -> ! {
     // first, because every app image links at one fixed address.  `hog`
     // (192) spins in the background; the preemptive tick (armed below)
     // keeps everything moving and wakes `clock`'s SYS_SLEEP deadlines.
+    //
+    // Phase 10: `net` (96) drives the virtio-net-pci NIC (modern virtio,
+    // INTx SPI 36) through the SYS_MAP_DEVICE / SYS_IRQ_PENDING syscalls
+    // and runs a tiny ARP/ICMP demo against slirp's 10.0.2.2 gateway.
 
     if server::available() {
         let wm = server::spawn_by_name("wm");
         let ramfs = server::spawn_by_name("ramfs");
         let shell = server::spawn_by_name("shell");
+        let net = server::spawn_by_name("net");
         let hog = server::spawn_by_name("hog");
         log::info!(
-            "phase 9: desktop stack spawned (wm={:?}, ramfs={:?}, shell={:?}, hog={:?})",
-            wm, ramfs, shell, hog
+            "phase 9/10: desktop stack spawned (wm={:?}, ramfs={:?}, shell={:?}, net={:?}, hog={:?})",
+            wm, ramfs, shell, net, hog
         );
 
         // Enable the EL1 physical-timer interrupt (PPI 30) and arm the
