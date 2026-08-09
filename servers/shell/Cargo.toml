@@ -1,0 +1,9 @@
+[package]
+name = "tanix-shell"
+version.workspace = true
+edition.workspace = true
+description = "Tanix Phase-9 terminal server — keyboard input, exec from the embedded app registry"
+
+[dependencies]
+tanix-libsys = { path = "../libtanix-sys" }
+tanix-libtanix-ui = { path = "../libtanix-ui" }

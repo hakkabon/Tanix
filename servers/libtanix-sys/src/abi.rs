@@ -69,6 +69,8 @@ pub const M_DISPLAY_TICK: u32 = 0x0505;
 pub const M_DISPLAY_TICK_REPLY: u32 = 0x0506; // data[0]=pointer x, data[1]=pointer y, data[2]=buttons
 pub const M_DISPLAY_BLIT: u32 = 0x0507; // data[0,1]=src base, data[2..4]=src x,y,w,h, data[5,6]=dst x,y
 pub const M_DISPLAY_DRAW_TEXT: u32 = 0x0508; // data[0]=x, data[1]=y, data[2]=rgb, data[3]=len, data[4..8]=chars
+pub const M_DISPLAY_GET_KEYS: u32 = 0x0509; // Phase 9: drain pending keyboard events
+pub const M_DISPLAY_KEYS_REPLY: u32 = 0x050A; // data[0]=count, data[1..]= (code<<16)|value pairs
 
 /// Window manager (`wm`) — Phase 8 compositor.  Apps create a window, get a
 /// winid + screen placement, draw into their own canvas (allocated and
@@ -82,6 +84,15 @@ pub const M_WM_FLUSH: u32 = 0x0604; // data[0]=winid — composite + present
 pub const M_WM_TICK: u32 = 0x0605; // data[0]=winid — sample pointer, route events
 pub const M_WM_TICK_REPLY: u32 = 0x0606; // data[0,1]=px,py (window-local, 0xFFFFFFFF=no event), data[2]=buttons, data[3]=focused
 pub const M_WM_NOTIFY: u32 = 0x0607; // wm → app (unsolicited, receive-time): data[0]=winid, data[1]=x, data[2]=y, data[3]=w, data[4]=h
+
+/// RAM filesystem (`ramfs`) — Phase 9.  A minimal in-memory filesystem:
+/// a static directory tree (the embedded app registry under `/bin`, text
+/// files under `/etc`) served over IPC.  Clients list directories and read
+/// files in 28-byte chunks; paths travel inline (≤ 24 chars + NUL).
+pub const M_RAMFS_READDIR: u32 = 0x0700; // data[0]=entry offset → entry or end
+pub const M_RAMFS_READDIR_REPLY: u32 = 0x0701; // data[0]=1|0, data[1,2]=name (8 chars), data[3]=is_dir, data[4]=size
+pub const M_RAMFS_READ: u32 = 0x0702; // data[0..6]=path (24 chars), data[6]=byte offset
+pub const M_RAMFS_READ_REPLY: u32 = 0x0703; // data[0]=len (0 = EOF), data[1..8]=bytes
 
 /// Maximum string payload carried inside a message (28 chars + NUL).
 pub const MAX_INLINE_STR: usize = 28;

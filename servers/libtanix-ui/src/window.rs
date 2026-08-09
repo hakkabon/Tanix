@@ -94,6 +94,12 @@ impl Window {
         }
         let rep = rpc(wm, &m);
         if rep.mtype != M_WM_CREATE_REPLY || rep.data[5] != 1 {
+            let mut s = tanix_libsys::fmt::StrBuf::new();
+            s.push_str("ui: create rejected mtype=");
+            s.push_hex32(rep.mtype);
+            s.push_str(" ok=");
+            s.push_dec32(rep.data[5]);
+            sys::log(1, s.as_str());
             sys::unshare_frames(canvas, pages as u32, display);
             sys::free_frames(canvas, pages as u32);
             return None;

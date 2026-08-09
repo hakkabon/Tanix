@@ -71,6 +71,8 @@ static SERVER_BINS: &[(&str, &[u8])] = &[
     ("counter", include_bytes!(env!("TANIX_COUNTER_BIN_PATH"))),
     ("clock", include_bytes!(env!("TANIX_CLOCK_BIN_PATH"))),
     ("hog", include_bytes!(env!("TANIX_HOG_BIN_PATH"))),
+    ("ramfs", include_bytes!(env!("TANIX_RAMFS_BIN_PATH"))),
+    ("shell", include_bytes!(env!("TANIX_SHELL_BIN_PATH"))),
 ];
 
 #[cfg(not(feature = "embed-servers"))]
@@ -83,7 +85,7 @@ static SERVER_BINS: &[(&str, &[u8])] = &[];
 /// the kernel image (which embeds the server binaries; in a debug build the
 /// ~0.9 MB-per-binary set pushes the image end to ~0x409B_0000) and the
 /// Phase-3 guest RAM / shmem and the display framebuffer (4 MiB) allocated
-/// just after it.  The 0x4100_0000 block (11 × 128 KiB slots = 1.375 MiB)
+/// just after it.  The 0x4100_0000 block (13 × 128 KiB slots = 1.625 MiB)
 /// leaves ~6 MiB of headroom above the Phase-3 + framebuffer allocations in
 /// a full debug build.
 ///
@@ -102,6 +104,8 @@ pub const SERVER_BASES: &[(&str, usize)] = &[
     ("wm",      0x4110_0000),
     ("counter", 0x4112_0000),
     ("clock",   0x4114_0000),
+    ("ramfs",   0x4116_0000),
+    ("shell",   0x4118_0000),
 ];
 
 /// Scheduling priority per server (Phase 7) — lower runs first.  The
@@ -116,9 +120,11 @@ pub const SERVER_PRIOS: &[(&str, u8)] = &[
     ("worker",  128),
     ("display",  32),
     ("wm",       48),
+    ("ramfs",    64),
     ("ui-demo",  96),
     ("counter",  96),
     ("clock",    96),
+    ("shell",    96),
     ("hog",     192),
 ];
 

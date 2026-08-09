@@ -36,12 +36,13 @@ const TITLE_H: u32 = 16;
 const BORDER: u32 = 1;
 /// Maximum number of windows.
 const MAX_WINDOWS: usize = 8;
-/// Max canvas size: 640×512×4 = 1.25 MiB ≈ 320 pages.
-const MAX_PAGES: u32 = 320;
+/// Max canvas size: 1024×640×4 = 2.5 MiB ≈ 640 pages (Phase 9: the shell
+/// terminal is 780×420 ≈ 320 pages).
+const MAX_PAGES: u32 = 640;
 /// Window content size limits.
 const MIN_DIM: u32 = 32;
-const MAX_W: u32 = 640;
-const MAX_H: u32 = 512;
+const MAX_W: u32 = 1024;
+const MAX_H: u32 = 640;
 
 // ── Palette ───────────────────────────────────────────────────────────────────
 

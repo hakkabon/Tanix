@@ -316,7 +316,7 @@ fn kmain() -> ! {
         );
     }
 
-    // ── Phase 8: window manager + multiple concurrent apps ───────────────────
+    // ── Phase 8/9: window manager, ramfs, shell + embedded app registry ─────
     //
     // `wm` (window manager / compositor, priority 48) owns the window
     // table: apps create windows (off-screen canvases they draw into),
@@ -325,35 +325,38 @@ fn kmain() -> ! {
     // (click-to-raise), dragging via the title bar, and composites the
     // desktop through the display server.
     //
-    // Three demo apps run concurrently (priority 96): `ui-demo` (paint),
-    // `counter` and `clock`.  `hog` (192) spins in the background; the
-    // preemptive tick (armed below) keeps everything moving and wakes
-    // `clock`'s SYS_SLEEP deadlines.
+    // Phase 9: `ramfs` (64) serves the embedded file tree (the app
+    // registry under /bin, text files under /etc) and `shell` (96) opens
+    // the terminal window — the user types `exec <app>` to start an app
+    // from the kernel's embedded-image registry (counter, clock, ui-demo,
+    // hog) with exec-replacement semantics: a running instance is retired
+    // first, because every app image links at one fixed address.  `hog`
+    // (192) spins in the background; the preemptive tick (armed below)
+    // keeps everything moving and wakes `clock`'s SYS_SLEEP deadlines.
 
     if server::available() {
         let wm = server::spawn_by_name("wm");
-        let ui_demo = server::spawn_by_name("ui-demo");
-        let counter = server::spawn_by_name("counter");
-        let clock = server::spawn_by_name("clock");
+        let ramfs = server::spawn_by_name("ramfs");
+        let shell = server::spawn_by_name("shell");
         let hog = server::spawn_by_name("hog");
         log::info!(
-            "phase 8: window stack spawned (wm={:?}, ui-demo={:?}, counter={:?}, clock={:?}, hog={:?})",
-            wm, ui_demo, counter, clock, hog
+            "phase 9: desktop stack spawned (wm={:?}, ramfs={:?}, shell={:?}, hog={:?})",
+            wm, ramfs, shell, hog
         );
 
         // Enable the EL1 physical-timer interrupt (PPI 30) and arm the
         // periodic 1 ms tick (preemption + SYS_SLEEP wake-ups).
         arch::aarch64::gic::enable_irq(30);
         arch::aarch64::timer::init_tick();
-        log::info!("phase 8: preemption tick armed (PPI 30)");
+        log::info!("phase 9: preemption tick armed (PPI 30)");
 
         unsafe {
             sched::enter();
         }
-        log::info!("phase 8: window stack idle (unreachable — hog never blocks)");
+        log::info!("phase 9: desktop stack idle (unreachable — hog never blocks)");
     } else {
         log::warn!(
-            "phase 8: server binaries not embedded \
+            "phase 9: server binaries not embedded \
              (build with --features embed-servers)"
         );
     }

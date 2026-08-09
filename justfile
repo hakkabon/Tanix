@@ -33,13 +33,17 @@ servers-ui: servers
 servers-phase7: servers
     cargo build --package tanix-hog --target {{TARGET}}
 
-# Build the Phase-8 window stack (all 11 server binaries)
+# Build the Phase-8 window stack (all server binaries up to and incl. hog)
 servers-phase8: servers-ui servers-phase7
     cargo build --package tanix-wm --package tanix-counter \
         --package tanix-clock --target {{TARGET}}
 
-# Build the kernel with all Phase-8 servers embedded
-kernel-phase8: servers-phase8
+# Build the Phase-9 desktop stack (adds ramfs + shell to the Phase-8 set)
+servers-phase9: servers-phase8
+    cargo build --package tanix-ramfs --package tanix-shell --target {{TARGET}}
+
+# Build the kernel with all Phase-9 servers embedded
+kernel-phase9: servers-phase9
     cargo build --package {{KERNEL_PKG}} --target {{TARGET}} \
         --features embed-servers
 
@@ -111,6 +115,19 @@ qemu-phase7: kernel-phase7
 # by the 1 kHz tick)
 qemu-phase8: kernel-phase8
     ./scripts/qemu.sh -device virtio-gpu-device -device virtio-tablet-device
+
+# Build with the Phase-9 desktop stack and run in QEMU — shell demo
+# (window manager + ramfs + shell + hog; apps are `exec`'d on demand from
+# the shell's keyboard input)
+qemu-phase9: kernel-phase9
+    ./scripts/qemu.sh -device virtio-gpu-device -device virtio-tablet-device \
+        -device virtio-keyboard-device
+
+# Phase-9 keyboard demo: boots the desktop, injects virtio-keyboard events
+# over the QEMU monitor and screendumps the shell answering commands
+# (screenshots in /tmp/tanix-shell-*.ppm)
+qemu-phase9-demo: kernel-phase9
+    ./scripts/keyboard-demo.sh
 
 # Phase-8 mouse demo: boots the desktop, injects virtio-tablet pointer
 # events over the QEMU monitor and screendumps the cursor following the
