@@ -29,6 +29,8 @@ pub const SYS_SHARE_FRAMES: u64 = 11; // Phase 8: map frames into another task's
 pub const SYS_UNSHARE_FRAMES: u64 = 12; // Phase 8: demote frames in another task's table
 pub const SYS_SLEEP: u64 = 13; // Phase 8: block for `ms` scheduler ticks
 pub const SYS_EXEC: u64 = 14; // Phase 9: exec an embedded app image (replaces a live instance)
+pub const SYS_MAP_DEVICE: u64 = 15; // Phase 10: identity-map a device-MMIO window (PCI ECAM/BARs)
+pub const SYS_IRQ_PENDING: u64 = 16; // Phase 10: non-blocking "device IRQ delivered?" poll
 
 /// Invoke syscall `nr` with arguments `a0..a2`; returns the kernel's x0.
 ///
@@ -158,6 +160,15 @@ pub fn exec(name: &str) -> i32 {
     unsafe { raw_syscall(SYS_EXEC, buf.as_ptr() as u64, 0, 0) as i32 }
 }
 
+/// `map_device(phys, pages)` — Phase 10.  Identity-maps the device-MMIO
+/// window `[phys .. phys + pages*4096)` into this task's address space as
+/// EL0-visible Device-nGnRnE memory (also into the kernel's table).  Use
+/// for PCI windows the kernel does not pre-map (ECAM, BARs).  Returns `0`
+/// on success, negative errno otherwise.
+pub fn map_device(phys: u64, pages: u32) -> i32 {
+    unsafe { raw_syscall(SYS_MAP_DEVICE, phys, pages as u64, 0) as i32 }
+}
+
 /// `log(level, msg)` — kernel log line, prefixed with this server's name.
 pub fn log(level: u32, msg: &str) {
     let mut buf = [0u8; 128];
@@ -174,6 +185,14 @@ pub fn log(level: u32, msg: &str) {
 /// server's virtio driver).
 pub fn wait_irq(irq: u32) -> i32 {
     unsafe { raw_syscall(SYS_WAIT_IRQ, irq as u64, 0, 0) as i32 }
+}
+
+/// `irq_pending(irq) -> 1|0` — Phase 10.  Non-blocking poll: arms the
+/// interrupt (like `wait_irq`) and returns whether it has been delivered
+/// since the last call, without sleeping.  For event-loop servers that
+/// keep their own timing (the net server's virtio-pci INTx line).
+pub fn irq_pending(irq: u32) -> i32 {
+    unsafe { raw_syscall(SYS_IRQ_PENDING, irq as u64, 0, 0) as i32 }
 }
 
 /// `yield_cpu()` — Phase 7.  Cooperative yield: hand the CPU to a strictly

@@ -1,0 +1,9 @@
+[package]
+name = "tanix-net"
+version.workspace = true
+edition.workspace = true
+description = "Tanix Phase-10 network server — virtio-net over PCIe, mini IPv4/ARP/ICMP stack"
+
+[dependencies]
+tanix-libsys = { path = "../libtanix-sys" }
+tanix-libdrv = { path = "../libtanix-drv" }

@@ -42,8 +42,17 @@ servers-phase8: servers-ui servers-phase7
 servers-phase9: servers-phase8
     cargo build --package tanix-ramfs --package tanix-shell --target {{TARGET}}
 
+# Build the Phase-10 network stack (driver library + net server)
+servers-phase10: servers-phase9
+    cargo build --package tanix-libdrv --package tanix-net --target {{TARGET}}
+
 # Build the kernel with all Phase-9 servers embedded
 kernel-phase9: servers-phase9
+    cargo build --package {{KERNEL_PKG}} --target {{TARGET}} \
+        --features embed-servers
+
+# Build the kernel with all Phase-10 servers embedded
+kernel-phase10: servers-phase10
     cargo build --package {{KERNEL_PKG}} --target {{TARGET}} \
         --features embed-servers
 
@@ -122,6 +131,15 @@ qemu-phase8: kernel-phase8
 qemu-phase9: kernel-phase9
     ./scripts/qemu.sh -device virtio-gpu-device -device virtio-tablet-device \
         -device virtio-keyboard-device
+
+# Build with the Phase-10 network server embedded and run in QEMU — the
+# virtio-net-pci NIC (modern virtio over PCIe, INTx) drives an ARP/ICMP
+# ping demo against slirp's 10.0.2.2 gateway
+qemu-phase10: kernel-phase10
+    ./scripts/qemu.sh -device virtio-gpu-device -device virtio-tablet-device \
+        -device virtio-keyboard-device \
+        -device virtio-net-pci,netdev=n0,disable-legacy=on \
+        -netdev user,id=n0
 
 # Phase-9 keyboard demo: boots the desktop, injects virtio-keyboard events
 # over the QEMU monitor and screendumps the shell answering commands

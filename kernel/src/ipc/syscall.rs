@@ -49,6 +49,8 @@ pub const SYS_SHARE_FRAMES: u64 = 11; // Phase 8: map frames into another task's
 pub const SYS_UNSHARE_FRAMES: u64 = 12; // Phase 8: demote frames in another task's table
 pub const SYS_SLEEP: u64 = 13; // Phase 8: block until the tick counter passes a deadline
 pub const SYS_EXEC: u64 = 14; // Phase 9: exec an embedded app image (replaces a running instance)
+pub const SYS_MAP_DEVICE: u64 = 15; // Phase 10: identity-map a device-MMIO window (PCI ECAM/BARs)
+pub const SYS_IRQ_PENDING: u64 = 16; // Phase 10: non-blocking "device IRQ delivered?" poll
 
 // ── Active TTBR0 helpers ──────────────────────────────────────────────────────
 
@@ -397,6 +399,45 @@ unsafe fn sys_free_frames(base: u64, pages: u32) -> i32 {
     0
 }
 
+/// `map_device(phys, pages)` — Phase 10.
+///
+/// Identity-maps the device-MMIO window `[phys .. phys + pages*4096)` into
+/// the calling task's address space as EL0-visible Device-nGnRnE memory
+/// (and into the kernel's own table so kernel-side access works too).
+///
+/// This is how a server reaches windows the kernel does not pre-map at
+/// boot — the PCIe ECAM space (0x3F00_0000) and the PCI memory BARs (in
+/// the 0x1000_0000..0x3EFE_FFFF window) on QEMU `virt,highmem=off`.
+///
+/// The physical addresses are those of MMIO, not of allocator frames — the
+/// caller must NOT pass a `SYS_ALLOC_FRAMES` result here (those are already
+/// mapped).  Returns 0 on success, -errno otherwise.
+unsafe fn sys_map_device(phys: u64, pages: u64) -> i32 {
+    let base = phys as usize;
+    if base & (PAGE_SIZE - 1) != 0 {
+        return -12; // not page-aligned
+    }
+    if pages == 0 || pages > 65536 {
+        return -12;
+    }
+    let size = pages as usize * PAGE_SIZE;
+
+    // Kernel view: Device-nGnRnE, non-executable (map_page is a no-op if a
+    // covering block already exists — nothing pre-maps these windows).
+    for i in 0..pages as usize {
+        page_table::map_page(base + i * PAGE_SIZE, base + i * PAGE_SIZE, page_table::FLAGS_DEVICE);
+    }
+
+    // Caller's view: EL0-visible device memory (identity VA == phys).
+    let ttbr0 = current_ttbr0();
+    if ttbr0 != 0 {
+        page_table::map_user_pages(ttbr0 as usize, base, size, page_table::FLAGS_USER_DEVICE);
+    }
+    page_table::flush_tlb();
+    log::trace!("map_device: {:#x}+{} KiB", base, size / 1024);
+    0
+}
+
 /// `share_frames(base, pages, task)` — Phase 8.
 ///
 /// Maps the physical run `base .. base + pages*PAGE_SIZE` into task
@@ -518,6 +559,23 @@ unsafe fn sys_wait_irq(irq: u32) -> i32 {
     0
 }
 
+/// `irq_pending(irq) -> 1|0` — Phase 10.  Non-blocking sibling of
+/// `wait_irq`: arms the interrupt and reports whether it has been
+/// delivered since the last call, without sleeping.  Lets a server run an
+/// event loop with its own timing (the net server polls the virtio-pci
+/// INTx line at its own cadence while SYS_SLEEP drives the ping timer).
+unsafe fn sys_irq_pending(irq: u32) -> i32 {
+    if !(16..=1019).contains(&irq) {
+        return -10; // invalid IRQ
+    }
+    crate::arch::aarch64::gic::enable_irq(irq);
+    if crate::irq::take_pending(irq) {
+        1
+    } else {
+        0
+    }
+}
+
 // ── Sleep syscall (Phase 8) ───────────────────────────────────────────────────
 
 /// `sleep(ms) -> 0`.  Blocks the calling task until `ms` scheduler ticks
@@ -595,6 +653,8 @@ pub unsafe extern "C" fn tanix_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> u6
         SYS_UNSHARE_FRAMES => sys_unshare_frames(a0, a1 as u32, a2 as u32) as u64,
         SYS_SLEEP => sys_sleep(a0 as u32) as u64,
         SYS_EXEC => sys_exec(a0 as *const u8) as u64,
+        SYS_MAP_DEVICE => sys_map_device(a0, a1) as u64,
+        SYS_IRQ_PENDING => sys_irq_pending(a0 as u32) as u64,
         SYS_LOG => {
             sys_log(a0 as u32, a1 as *const u8);
             0

@@ -61,6 +61,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tanix-libdrv"
+version = "0.1.0"
+dependencies = [
+ "tanix-libsys",
+]
+
+[[package]]
 name = "tanix-libsys"
 version = "0.1.0"
 
@@ -75,6 +82,14 @@ dependencies = [
 name = "tanix-mem"
 version = "0.1.0"
 dependencies = [
+ "tanix-libsys",
+]
+
+[[package]]
+name = "tanix-net"
+version = "0.1.0"
+dependencies = [
+ "tanix-libdrv",
  "tanix-libsys",
 ]
 

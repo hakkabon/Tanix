@@ -26,11 +26,11 @@ fn main() {
     println!("cargo:rerun-if-changed={}", stub_path);
     println!("cargo:rustc-env=TANIX_STUB_BIN_PATH={}", stub_path);
 
-    // Same for the Phase-4/5/7/8/9 server binaries (init, pm, mem, dev,
-    // worker, display, ui-demo, hog, wm, counter, clock, ramfs, shell).
+    // Same for the Phase-4/5/7/8/9/10 server binaries (init, pm, mem, dev,
+    // worker, display, ui-demo, hog, wm, counter, clock, ramfs, shell, net).
     for name in [
         "init", "pm", "mem", "dev", "worker", "display", "ui-demo", "hog",
-        "wm", "counter", "clock", "ramfs", "shell",
+        "wm", "counter", "clock", "ramfs", "shell", "net",
     ] {
         let path = format!(
             "../../target/aarch64-unknown-none/{}/tanix-{}",
