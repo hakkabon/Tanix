@@ -28,6 +28,7 @@ pub const SYS_YIELD: u64 = 10; // Phase 7: cooperative yield
 pub const SYS_SHARE_FRAMES: u64 = 11; // Phase 8: map frames into another task's table
 pub const SYS_UNSHARE_FRAMES: u64 = 12; // Phase 8: demote frames in another task's table
 pub const SYS_SLEEP: u64 = 13; // Phase 8: block for `ms` scheduler ticks
+pub const SYS_EXEC: u64 = 14; // Phase 9: exec an embedded app image (replaces a live instance)
 
 /// Invoke syscall `nr` with arguments `a0..a2`; returns the kernel's x0.
 ///
@@ -145,6 +146,16 @@ pub fn unshare_frames(base: u64, pages: u32, task: u32) -> i32 {
 /// (scheduler ticks are 1 ms).  Returns `0` on success.
 pub fn sleep(ms: u32) -> i32 {
     unsafe { raw_syscall(SYS_SLEEP, ms as u64, 0, 0) as i32 }
+}
+
+/// `exec(name)` — Phase 9.  Start an app from the kernel's embedded image
+/// registry, replacing any live instance of the same app.  Returns the new
+/// task id, or a negative error.
+pub fn exec(name: &str) -> i32 {
+    let mut buf = [0u8; 16];
+    let n = name.len().min(buf.len() - 1);
+    buf[..n].copy_from_slice(&name.as_bytes()[..n]);
+    unsafe { raw_syscall(SYS_EXEC, buf.as_ptr() as u64, 0, 0) as i32 }
 }
 
 /// `log(level, msg)` — kernel log line, prefixed with this server's name.

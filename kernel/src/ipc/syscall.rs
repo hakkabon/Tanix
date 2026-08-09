@@ -48,6 +48,7 @@ pub const SYS_YIELD: u64 = 10; // Phase 7: cooperative yield (RR rotation)
 pub const SYS_SHARE_FRAMES: u64 = 11; // Phase 8: map frames into another task's table
 pub const SYS_UNSHARE_FRAMES: u64 = 12; // Phase 8: demote frames in another task's table
 pub const SYS_SLEEP: u64 = 13; // Phase 8: block until the tick counter passes a deadline
+pub const SYS_EXEC: u64 = 14; // Phase 9: exec an embedded app image (replaces a running instance)
 
 // ── Active TTBR0 helpers ──────────────────────────────────────────────────────
 
@@ -294,6 +295,34 @@ unsafe fn sys_spawn(name: *const u8) -> i32 {
     };
     match crate::server::spawn_by_name(s) {
         Ok(id) => id.0 as i32,
+        Err(e) => e,
+    }
+}
+
+/// `exec(name)` — Phase 9.  Load an app from the kernel's embedded image
+/// registry and start it, *replacing* any live instance of the same image
+/// (the images link at fixed addresses, so at most one instance can run).
+/// Returns the new task id (or -errno).
+unsafe fn sys_exec(name: *const u8) -> i32 {
+    let mut buf = [0u8; 16];
+    let Some(s) = read_cstr(name, &mut buf) else {
+        return -5; // too long / not UTF-8
+    };
+    // Exec replaces: retire a live task of the same name first (its image
+    // region is reloaded below — it must not be running when we zero it).
+    let sched = crate::sched::task::scheduler();
+    for t in sched.task_slots().iter().flatten() {
+        if t.name_str() == s && t.state != TaskState::Zombie {
+            log::trace!("exec: killing previous '{}' instance {:?}", s, t.id);
+            let _ = kill_task(t.id);
+            break;
+        }
+    }
+    match crate::server::spawn_by_name(s) {
+        Ok(id) => {
+            log::info!("exec: '{}' started as {:?}", s, id);
+            id.0 as i32
+        }
         Err(e) => e,
     }
 }
@@ -565,6 +594,7 @@ pub unsafe extern "C" fn tanix_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> u6
         SYS_SHARE_FRAMES => sys_share_frames(a0, a1 as u32, a2 as u32) as u64,
         SYS_UNSHARE_FRAMES => sys_unshare_frames(a0, a1 as u32, a2 as u32) as u64,
         SYS_SLEEP => sys_sleep(a0 as u32) as u64,
+        SYS_EXEC => sys_exec(a0 as *const u8) as u64,
         SYS_LOG => {
             sys_log(a0 as u32, a1 as *const u8);
             0

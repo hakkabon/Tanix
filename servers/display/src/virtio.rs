@@ -157,7 +157,59 @@ pub fn find(device_id: u32) -> Option<Device> {
     None
 }
 
+/// Run `f` once per slot that hosts a device with the given id (the tablet
+/// and the keyboard are two separate input devices, so `find` alone cannot
+/// reach the keyboard).
+pub fn for_each<F: FnMut(Device)>(device_id: u32, mut f: F) {
+    for i in 0..SLOTS {
+        let base = MMIO_BASE + i * SLOT_SIZE;
+        if read32(base, REG_MAGIC) != MAGIC_VALUE {
+            continue;
+        }
+        let id = read32(base, REG_DEVICE_ID);
+        if id == device_id {
+            f(Device { base });
+        }
+    }
+}
+
+// virtio-input device configuration (virtio 1.2 §5.10.4): the driver picks
+// a config item via select/subsel and reads `size` bytes of `data` from the
+// transport's device-config region (virtio-mmio: VMMIO_CONFIG at +0x100).
+// virtio_input_config layout: select:2 subsel:2 size:2 data[128].
+const CFG_SELECT: usize = 0x100;
+const CFG_SUBSEL: usize = 0x102;
+const CFG_SIZE: usize = 0x104;
+const CFG_DATA: usize = 0x106;
+
+const VIRTIO_INPUT_CFG_EV_BITS: u16 = 0x20;
+
 impl Device {
+    /// Query a virtio-input config item (select/subsel, virtio 1.2 §5.10.4).
+    /// Returns `(size, data)` — `size` is how many bytes the device filled.
+    ///
+    /// The config region is a packed struct of 16-bit fields, so the MMIO
+    /// accesses are halfword-aligned (2-byte) reads — 32-bit accesses would
+    /// be unaligned at the CFG_SUBSEL offset and fault.
+    pub fn input_config(&self, select: u16, subsel: u16) -> (u16, [u8; 8]) {
+        write16(self.base, CFG_SELECT, select);
+        write16(self.base, CFG_SUBSEL, subsel);
+        let size = read16(self.base, CFG_SIZE);
+        let mut data = [0u8; 8];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = read8(self.base, CFG_DATA + i);
+        }
+        (size, data)
+    }
+
+    /// True if this device supports the given event type — i.e. the EV_BITS
+    /// bitmap for `ev_type` is non-empty (QEMU fills one bitmap word per
+    /// event type, so any nonzero byte means support).
+    pub fn supports_event(&self, ev_type: u16) -> bool {
+        let (size, data) = self.input_config(VIRTIO_INPUT_CFG_EV_BITS, ev_type);
+        size > 0 && data.iter().any(|&b| b != 0)
+    }
+
     /// The interrupt number (SPI) this transport uses on the kernel's GIC:
     /// `48 + slot` (QEMU `virt` machine).
     pub fn irq(&self) -> u32 {
@@ -350,4 +402,19 @@ fn read32(base: usize, reg: usize) -> u32 {
 #[inline]
 fn write32(base: usize, reg: usize, val: u32) {
     unsafe { ptr::write_volatile((base + reg) as *mut u32, val) }
+}
+
+#[inline]
+fn read16(base: usize, reg: usize) -> u16 {
+    unsafe { ptr::read_volatile((base + reg) as *const u16) }
+}
+
+#[inline]
+fn write16(base: usize, reg: usize, val: u16) {
+    unsafe { ptr::write_volatile((base + reg) as *mut u16, val) }
+}
+
+#[inline]
+fn read8(base: usize, reg: usize) -> u8 {
+    unsafe { ptr::read_volatile((base + reg) as *const u8) }
 }

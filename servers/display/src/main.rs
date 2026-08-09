@@ -20,8 +20,8 @@ mod virtio;
 
 use tanix_libsys::abi::{
     BootInfo, Message, M_ANY, M_DISPLAY_BLIT, M_DISPLAY_DONE, M_DISPLAY_DRAW_TEXT,
-    M_DISPLAY_FILL_RECT, M_DISPLAY_FLUSH, M_DISPLAY_GET_MODE, M_DISPLAY_MODE_REPLY,
-    M_DISPLAY_TICK, M_DISPLAY_TICK_REPLY,
+    M_DISPLAY_FILL_RECT, M_DISPLAY_FLUSH, M_DISPLAY_GET_KEYS, M_DISPLAY_GET_MODE,
+    M_DISPLAY_KEYS_REPLY, M_DISPLAY_MODE_REPLY, M_DISPLAY_TICK, M_DISPLAY_TICK_REPLY,
 };
 use tanix_libsys::sys;
 
@@ -83,6 +83,17 @@ pub extern "C" fn server_main(_info: *const BootInfo) -> ! {
         }
     };
 
+    let mut keyboard = match input::Keyboard::open() {
+        Some(k) => {
+            sys::log(0, "display: virtio-keyboard online");
+            Some(k)
+        }
+        None => {
+            sys::log(1, "display: no virtio-keyboard found — no text input");
+            None
+        }
+    };
+
     // Service loop.
     loop {
         let (src, msg) = sys::receive(M_ANY);
@@ -115,6 +126,22 @@ pub extern "C" fn server_main(_info: *const BootInfo) -> ! {
                 let px = p.x * mode.width / input::ABS_MAX;
                 let py = p.y * mode.height / input::ABS_MAX;
                 reply(src, M_DISPLAY_TICK_REPLY, &[px, py, p.buttons]);
+            }
+
+            M_DISPLAY_GET_KEYS => {
+                // Phase 9: drain the keyboard queue, deliver up to 7 key
+                // events as (code << 16) | value pairs.
+                let mut out = [(0u16, 0u16); 7];
+                let n = match keyboard.as_mut() {
+                    Some(k) => k.poll(&mut out),
+                    None => 0,
+                };
+                let mut data = [0u32; 8];
+                data[0] = n as u32;
+                for (i, &(code, value)) in out.iter().take(n).enumerate() {
+                    data[1 + i] = ((code as u32) << 16) | value as u32;
+                }
+                reply(src, M_DISPLAY_KEYS_REPLY, &data);
             }
 
             M_DISPLAY_BLIT => {

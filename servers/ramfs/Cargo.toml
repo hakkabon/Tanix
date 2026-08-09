@@ -1,0 +1,8 @@
+[package]
+name = "tanix-ramfs"
+version.workspace = true
+edition.workspace = true
+description = "Tanix Phase-9 RAM filesystem server — embedded file tree over IPC (ls/cat for the shell)"
+
+[dependencies]
+tanix-libsys = { path = "../libtanix-sys" }

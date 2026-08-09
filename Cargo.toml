@@ -16,6 +16,8 @@ members = [
     "servers/counter",
     "servers/clock",
     "servers/hog",
+    "servers/ramfs",
+    "servers/shell",
 ]
 
 [workspace.package]
