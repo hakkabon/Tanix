@@ -36,7 +36,7 @@
 //! realistic to exec.
 
 use crate::mem::{page_table, PAGE_SIZE};
-use crate::sched::task::spawn_server_user;
+use crate::sched::task::spawn_server_user_locked;
 use crate::sched::{BootInfo, TaskId};
 use crate::vm::loader;
 
@@ -135,9 +135,19 @@ pub const SERVER_PRIOS: &[(&str, u8)] = &[
 
 /// Spawn a server by its registered name.  Returns the new task id.
 ///
-/// This is what the `spawn` syscall invokes; the kernel's own Phase-4 boot
-/// calls it for `init` directly.
+/// This is what the kernel's own Phase-4/5/8/9/10 boot paths call (not
+/// under `SCHED_LOCK`); the `spawn` / `exec` syscalls use the locked
+/// variant below instead — the syscall dispatcher already holds the lock.
 pub fn spawn_by_name(name: &str) -> Result<TaskId, i32> {
+    let lock = crate::sched::task::sched_lock();
+    lock.lock();
+    let r = spawn_by_name_locked(name);
+    lock.unlock();
+    r
+}
+
+/// `spawn_by_name` with `SCHED_LOCK` already held (Phase 11).
+pub fn spawn_by_name_locked(name: &str) -> Result<TaskId, i32> {
     let bin = SERVER_BINS
         .iter()
         .find(|(n, _)| *n == name)
@@ -202,15 +212,17 @@ pub fn spawn_by_name(name: &str) -> Result<TaskId, i32> {
     let kernel_stack_top = base + ram_size;
     let sp_el0 = boot_page + PAGE_SIZE + USER_STACK_SIZE;
     let boot = BootInfo { task_id: 0 };
-    let id = spawn_server_user(
-        name,
-        entry,
-        ttbr0 as u64,
-        sp_el0,
-        kernel_stack_top,
-        boot_page,
-        boot,
-    )
+    let id = unsafe {
+        spawn_server_user_locked(
+            name,
+            entry,
+            ttbr0 as u64,
+            sp_el0,
+            kernel_stack_top,
+            boot_page,
+            boot,
+        )
+    }
     .ok_or(-8)?;
     // Phase 7: assign the server's scheduling priority.
     let prio = SERVER_PRIOS
@@ -218,7 +230,9 @@ pub fn spawn_by_name(name: &str) -> Result<TaskId, i32> {
         .find(|(n, _)| *n == name)
         .map(|(_, p)| *p)
         .unwrap_or(crate::sched::PRIO_NORMAL);
-    crate::sched::task::set_task_priority(id, prio);
+    unsafe {
+        crate::sched::task::set_task_priority_locked(id, prio);
+    }
 
     log::info!(
         "server: spawned '{}' {:?} EL0 region={:#x}+{} KB entry={:#x} image_end={:#x} ttbr0={:#x} sp_el0={:#x} prio={}",

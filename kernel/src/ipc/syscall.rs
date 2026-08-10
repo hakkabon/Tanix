@@ -27,9 +27,22 @@
 //!   • `alloc_frames` / `free_frames` map / demote the frames in the
 //!     *calling* task's table (identity VA == phys), so the returned
 //!     physical base stays directly dereferenceable by the server.
+//!
+//! Locking (Phase 11, SMP): the whole syscall dispatch runs under
+//! `SCHED_LOCK`.  Blocking syscalls switch away with
+//! `context_switch_unlock`, which releases the lock *between* saving the
+//! current context and restoring the next one; the dispatcher tracks that
+//! with the `switched` flag so its tail (wakeup-preemption + unlock) is
+//! skipped after a real switch.  `SYS_WAIT_IRQ` is special: its wait loop
+//! runs with IRQs unmasked, so it executes *without* the lock (a tick
+//! landing while the lock was held would spin forever on the same core),
+//! and `SYS_YIELD` / `SYS_EXIT` re-acquire the lock themselves.
 
 use crate::mem::{frame, page_table, PAGE_SIZE};
-use crate::sched::task::{context_switch, current_ttbr0, kill_task};
+use crate::sched::task::{
+    context_switch_unlock, current_ttbr0, kill_task_locked, poke_idle_secondaries, sched_lock,
+    Scheduler,
+};
 use crate::sched::{Message, PendingSend, StagedSend, TaskId, TaskState, M_ANY};
 
 // ── Syscall numbers (must match `servers/libtanix-sys/src/sys.rs`) ────────────
@@ -115,13 +128,33 @@ unsafe fn deliver(dst: &mut crate::sched::task::Task, src: u32, msg: *const Mess
     });
     dst.recv_blocked = false;
     dst.state = TaskState::Ready;
+    // Phase 11: the receiver may be picked up by a parked secondary —
+    // poke them so the wake does not wait for the next tick on this core.
+    poke_idle_secondaries();
+}
+
+/// Park the current task (its state must already be Blocked / Zombie) and
+/// switch to the best runnable task for this CPU.
+///
+/// # Safety / locking (Phase 11)
+/// Requires `SCHED_LOCK` held and interrupts masked — the caller is the
+/// syscall dispatcher, which runs the whole syscall under the lock.  The
+/// switch releases the lock between saving and restoring; `*switched` is
+/// set first so the dispatcher tail knows the lock is already free.
+unsafe fn switch_away(sched: &mut Scheduler, from_idx: usize, switched: &mut bool) {
+    let cpu = crate::smp::cpu_index();
+    let next = sched.pick_next(cpu);
+    sched.set_state(next, TaskState::Running);
+    crate::smp::set_current(next);
+    *switched = true;
+    context_switch_unlock(sched_lock(), sched.ctx_ptr(from_idx), sched.ctx_ptr(next));
 }
 
 /// `send(dst, msg)` syscall.
-unsafe fn sys_send(dst: u32, msg: *const Message) -> i32 {
+unsafe fn sys_send(dst: u32, msg: *const Message, switched: &mut bool) -> i32 {
     let sched = crate::sched::task::scheduler();
     let me = sched.current_id().0;
-    let my_idx = sched.current_idx();
+    let my_idx = crate::smp::current_idx();
 
     if dst == me {
         return -2; // self-send is an error
@@ -175,28 +208,20 @@ unsafe fn sys_send(dst: u32, msg: *const Message) -> i32 {
             t.send_full_wait = Some(StagedSend { dst, src: me, msg: *msg });
             t.state = TaskState::Blocked;
         }
-        let next = sched.pick_next();
-        sched.set_state(next, TaskState::Running);
-        sched.set_current(next);
-        context_switch(sched.ctx_ptr(my_idx), sched.ctx_ptr(next));
+        switch_away(sched, my_idx, switched);
         return 0; // delivered by the receiver's receive
     }
 
     log::trace!("ipc: {} → {} queued, sender blocks", me, dst);
-    let next = {
-        sched.set_state(my_idx, TaskState::Blocked);
-        sched.pick_next()
-    };
-    sched.set_state(next, TaskState::Running);
-    sched.set_current(next);
-    context_switch(sched.ctx_ptr(my_idx), sched.ctx_ptr(next));
+    sched.set_state(my_idx, TaskState::Blocked);
+    switch_away(sched, my_idx, switched);
     0
 }
 
 /// `receive(filter, out)` syscall.  Returns the sender's id (or -errno).
-unsafe fn sys_receive(filter: i32, out: *mut Message) -> i32 {
+unsafe fn sys_receive(filter: i32, out: *mut Message, switched: &mut bool) -> i32 {
     let sched = crate::sched::task::scheduler();
-    let my_idx = sched.current_idx();
+    let my_idx = crate::smp::current_idx();
     let my_id = sched.current_id().0;
 
     // Any pending sender already waiting for us?  The parked message is a
@@ -220,9 +245,15 @@ unsafe fn sys_receive(filter: i32, out: *mut Message) -> i32 {
         m.src = p.src;
         core::ptr::write_volatile(out, m);
         if let Some(src_idx) = sched.task_idx(TaskId(p.src)) {
-            sched.task_at_mut(src_idx).unwrap().state = TaskState::Ready;
-            sched.set_woken(src_idx);
-            log::trace!("ipc: {} wakes pending sender {}", my_idx, p.src);
+            let t = sched.task_at_mut(src_idx).unwrap();
+            if t.state != TaskState::Zombie {
+                // Skip a sender killed while parked — its message is
+                // dropped with it (never revive a zombie).
+                t.state = TaskState::Ready;
+                sched.set_woken(src_idx);
+                log::trace!("ipc: {} wakes pending sender {}", my_idx, p.src);
+                poke_idle_secondaries();
+            }
         }
         return p.src as i32;
     }
@@ -238,7 +269,7 @@ unsafe fn sys_receive(filter: i32, out: *mut Message) -> i32 {
         let hit = t.send_full_wait.is_some_and(|s| {
             s.dst == my_id && (filter == M_ANY || s.src == filter as u32)
         });
-        if hit {
+        if hit && t.state != TaskState::Zombie {
             let s = t.send_full_wait.take().unwrap();
             let mut m = s.msg;
             m.src = s.src;
@@ -246,6 +277,7 @@ unsafe fn sys_receive(filter: i32, out: *mut Message) -> i32 {
             t.state = TaskState::Ready;
             sched.set_woken(idx);
             log::trace!("ipc: {} delivers staged send from {}", my_idx, s.src);
+            poke_idle_secondaries();
             return s.src as i32;
         }
     }
@@ -260,10 +292,7 @@ unsafe fn sys_receive(filter: i32, out: *mut Message) -> i32 {
         t.recv_buf = out;
         t.state = TaskState::Blocked;
     }
-    let next = sched.pick_next();
-    sched.set_state(next, TaskState::Running);
-    sched.set_current(next);
-    context_switch(sched.ctx_ptr(my_idx), sched.ctx_ptr(next));
+    switch_away(sched, my_idx, switched);
 
     // Resumed: the sender already copied the message into our buffer.
     (*out).src as i32
@@ -295,7 +324,7 @@ unsafe fn sys_spawn(name: *const u8) -> i32 {
     let Some(s) = read_cstr(name, &mut buf) else {
         return -5; // too long / not UTF-8
     };
-    match crate::server::spawn_by_name(s) {
+    match crate::server::spawn_by_name_locked(s) {
         Ok(id) => id.0 as i32,
         Err(e) => e,
     }
@@ -316,11 +345,11 @@ unsafe fn sys_exec(name: *const u8) -> i32 {
     for t in sched.task_slots().iter().flatten() {
         if t.name_str() == s && t.state != TaskState::Zombie {
             log::trace!("exec: killing previous '{}' instance {:?}", s, t.id);
-            let _ = kill_task(t.id);
+            let _ = kill_task_locked(t.id);
             break;
         }
     }
-    match crate::server::spawn_by_name(s) {
+    match crate::server::spawn_by_name_locked(s) {
         Ok(id) => {
             log::info!("exec: '{}' started as {:?}", s, id);
             id.0 as i32
@@ -346,7 +375,7 @@ unsafe fn sys_who(name: *const u8) -> i32 {
 
 /// `exit_task(pid)` — kill another task.
 unsafe fn sys_exit_task(pid: u32) -> i32 {
-    if kill_task(TaskId(pid)) {
+    if kill_task_locked(TaskId(pid)) {
         0
     } else {
         -3 // no such task
@@ -518,9 +547,17 @@ unsafe fn sys_unshare_frames(base: u64, pages: u32, task: u32) -> i32 {
 ///     consistent.
 ///   • An IRQ that arrived *before* the wait is recorded by the handler and
 ///     returns immediately (test-and-clear first).
+///
+/// Phase 11 (SMP): this syscall runs *without* `SCHED_LOCK` — the wait
+/// loop needs IRQs unmasked, and holding the scheduler lock there would
+/// deadlock the tick on the same core.  The `irq_wait` field it writes is
+/// diagnostic only (single aligned word — safe for concurrent readers).
+/// A device IRQ lands on the core that enabled it (CPU 0), whose handler
+/// records the pending bit and SGIs every other online core so a waiter
+/// parked in `wfi` on another core re-checks the bit.
 unsafe fn sys_wait_irq(irq: u32) -> i32 {
     let sched = crate::sched::task::scheduler();
-    let my_idx = sched.current_idx();
+    let my_idx = crate::smp::current_idx();
 
     // PPIs 16..31, SPIs 32..1019 — anything the GIC can deliver.
     if !(16..=1019).contains(&irq) {
@@ -586,18 +623,15 @@ unsafe fn sys_irq_pending(irq: u32) -> i32 {
 /// purely a state change — the CPU is handed over here and picked up again
 /// by the regular scheduling points (next tick, next syscall tail), so a
 /// sleeping task never occupies the core.
-unsafe fn sys_sleep(ms: u32) -> i32 {
+unsafe fn sys_sleep(ms: u32, switched: &mut bool) -> i32 {
     let ms = ms.clamp(1, 60_000);
     let sched = crate::sched::task::scheduler();
-    let my_idx = sched.current_idx();
+    let my_idx = crate::smp::current_idx();
     let deadline = crate::arch::aarch64::timer::ticks().saturating_add(ms as u64);
 
     sched.task_at_mut(my_idx).unwrap().sleep_deadline = deadline;
     sched.set_state(my_idx, TaskState::Blocked);
-    let next = sched.pick_next();
-    sched.set_state(next, TaskState::Running);
-    sched.set_current(next);
-    context_switch(sched.ctx_ptr(my_idx), sched.ctx_ptr(next));
+    switch_away(sched, my_idx, switched);
 
     // Resumed once the deadline passed (tick_preempt woke us).
     sched.task_at_mut(my_idx).unwrap().sleep_deadline = 0;
@@ -635,33 +669,51 @@ unsafe fn sys_log(level: u32, msg: *const u8) {
 /// Must not clobber x30 (the stub preserves it for the caller) and must
 /// return the result in x0.  x4+ are freely clobberable — the server-side
 /// wrappers list them as clobbered.
+///
+/// Locking (Phase 11): everything runs under `SCHED_LOCK` (held for the
+/// whole syscall, so the task table mutations are serialized across
+/// cores).  Blocking syscalls switch away with `context_switch_unlock`
+/// and set `switched`; the tail — wakeup-preemption + unlock — runs only
+/// when no switch happened (after a switch the lock is already free).
+/// `SYS_WAIT_IRQ` (unmasked wait loop) and `SYS_YIELD` / `SYS_EXIT` (they
+/// lock themselves) are dispatched before the lock is taken.
 #[no_mangle]
 pub unsafe extern "C" fn tanix_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     let _ = a2; // reserved (Phase 6 ABI: x3 defined, unused so far)
+    match nr {
+        // Unmasked wait loop — never under the scheduler lock.
+        SYS_WAIT_IRQ => return sys_wait_irq(a0 as u32) as u64,
+        // These re-acquire the lock themselves.
+        SYS_YIELD => {
+            crate::sched::task::yield_cpu();
+            return 0;
+        }
+        _ => {}
+    }
+
+    let lock = sched_lock();
+    lock.lock();
+    let mut switched = false;
     let result = match nr {
-        SYS_SEND => sys_send(a0 as u32, a1 as *const Message) as u64,
-        SYS_RECEIVE => sys_receive(a0 as i32, a1 as *mut Message) as u64,
+        SYS_SEND => sys_send(a0 as u32, a1 as *const Message, &mut switched) as u64,
+        SYS_RECEIVE => sys_receive(a0 as i32, a1 as *mut Message, &mut switched) as u64,
         SYS_SPAWN => sys_spawn(a0 as *const u8) as u64,
         SYS_WHO => sys_who(a0 as *const u8) as u64,
         SYS_EXIT_TASK => sys_exit_task(a0 as u32) as u64,
         SYS_EXIT => {
+            lock.unlock();
             sys_exit();
         }
         SYS_ALLOC_FRAMES => sys_alloc_frames(a0 as u32),
         SYS_FREE_FRAMES => sys_free_frames(a0, a1 as u32) as u64,
         SYS_SHARE_FRAMES => sys_share_frames(a0, a1 as u32, a2 as u32) as u64,
         SYS_UNSHARE_FRAMES => sys_unshare_frames(a0, a1 as u32, a2 as u32) as u64,
-        SYS_SLEEP => sys_sleep(a0 as u32) as u64,
+        SYS_SLEEP => sys_sleep(a0 as u32, &mut switched) as u64,
         SYS_EXEC => sys_exec(a0 as *const u8) as u64,
         SYS_MAP_DEVICE => sys_map_device(a0, a1) as u64,
         SYS_IRQ_PENDING => sys_irq_pending(a0 as u32) as u64,
         SYS_LOG => {
             sys_log(a0 as u32, a1 as *const u8);
-            0
-        }
-        SYS_WAIT_IRQ => sys_wait_irq(a0 as u32) as u64,
-        SYS_YIELD => {
-            crate::sched::task::yield_cpu();
             0
         }
         other => {
@@ -677,6 +729,13 @@ pub unsafe extern "C" fn tanix_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> u6
     // woken by this syscall (higher priority, or next in the RR rotation)
     // runs before we return to EL0.  When we are resumed, the saved
     // syscall frame continues here and hands `result` to the caller.
-    crate::sched::task::reschedule();
+    //
+    // Phase 11: skipped after a blocking switch — the lock was released
+    // mid-switch, so there is nothing left to protect (or unlock).
+    if !switched {
+        if !crate::sched::task::reschedule() {
+            lock.unlock();
+        }
+    }
     result
 }

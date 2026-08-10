@@ -7,6 +7,11 @@
 //!
 //! This module also implements the `log::Log` trait so the kernel can use the
 //! standard `log::{info, warn, error, …}` macros.
+//!
+//! Phase 11 (SMP): `puts` / `putc` take a spinlock so lines from concurrent
+//! cores do not interleave.  Safe: every log call happens with IRQs masked
+//! (exception entry masks DAIF; the only unmasked kernel windows — the
+//! `SYS_WAIT_IRQ` wait loop and the secondary idle loop — never log).
 
 use core::fmt;
 use log::{Level, LevelFilter, Metadata, Record};
@@ -69,23 +74,72 @@ pub fn init() {
     mmio_write(CR, CR_UARTEN | CR_TXE | CR_RXE);
 }
 
+/// Serializes `puts` / `putc` across cores (Phase 11).
+static UART_LOCK: crate::sync::SpinLock = crate::sync::SpinLock::new();
+
 /// Write a single byte, blocking until the TX FIFO has space.
 #[inline]
-pub fn putc(byte: u8) {
+fn putc_locked(byte: u8) {
     while mmio_read(FR) & FR_TXFF != 0 {
         core::hint::spin_loop();
     }
     mmio_write(DR, byte as u32);
 }
 
+/// Mask IRQs and return the previous DAIF register (so the caller can
+/// restore it).  `puts` / `putc` hold the UART lock for the whole string,
+/// so an IRQ taken mid-print must not re-enter the lock on the same CPU
+/// (the tick handler logs — a re-entrant spinlock would self-deadlock).
+#[inline]
+fn irq_mask_save() -> u64 {
+    let daif: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {d}, daif",
+            "msr daifset, #2",
+            d = out(reg) daif,
+            options(nomem, nostack)
+        );
+    }
+    daif
+}
+
+#[inline]
+fn irq_restore(daif: u64) {
+    unsafe {
+        core::arch::asm!(
+            "msr daif, {d}",
+            d = in(reg) daif,
+            options(nomem, nostack)
+        );
+    }
+}
+
+/// Write a single byte, blocking until the TX FIFO has space.
+#[inline]
+pub fn putc(byte: u8) {
+    let daif = irq_mask_save();
+    let lock = &UART_LOCK;
+    lock.lock();
+    putc_locked(byte);
+    lock.unlock();
+    irq_restore(daif);
+}
+
 /// Write a string slice, converting `\n` to `\r\n` for serial terminals.
+/// The whole string is emitted under the UART lock (Phase 11).
 pub fn puts(s: &str) {
+    let daif = irq_mask_save();
+    let lock = &UART_LOCK;
+    lock.lock();
     for &b in s.as_bytes() {
         if b == b'\n' {
-            putc(b'\r');
+            putc_locked(b'\r');
         }
-        putc(b);
+        putc_locked(b);
     }
+    lock.unlock();
+    irq_restore(daif);
 }
 
 // ── fmt::Write impl ───────────────────────────────────────────────────────────

@@ -459,3 +459,31 @@ pub unsafe fn enable() {
 
     log::info!("MMU enabled — identity map active (DDR + MMIO pre-mapped)");
 }
+
+/// Enable the MMU on a *secondary* CPU (Phase 11 SMP): the identity map
+/// itself is global (already built by `enable()` on CPU 0), but TTBR0,
+/// the TLB and SCTLR_EL1.M are per-CPU and reset to 0 on a fresh core.
+///
+/// Must be called after `mmu::init()` (TCR/MAIR are also per-CPU).
+///
+/// # Safety
+/// Called from `kmain_secondary_entry` on the secondary CPU itself.
+pub unsafe fn enable_secondary() {
+    let ttbr0 = kernel_l0_phys() as u64;
+    core::arch::asm!(
+        "msr TTBR0_EL1, {t}",
+        "isb",
+        t = in(reg) ttbr0,
+        options(nomem, nostack)
+    );
+    core::arch::asm!("tlbi vmalle1", "dsb sy", "isb", options(nomem, nostack));
+    let mut sctlr: u64;
+    core::arch::asm!("mrs {s}, SCTLR_EL1", s = out(reg) sctlr, options(nomem, nostack));
+    sctlr |= 1 | (1 << 12); // M | I
+    core::arch::asm!(
+        "msr SCTLR_EL1, {s}",
+        "isb",
+        s = in(reg) sctlr,
+        options(nomem, nostack)
+    );
+}
