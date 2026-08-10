@@ -127,9 +127,10 @@ fn handle_frame(net: &mut VirtioNet, frame: &[u8]) {
 }
 
 fn handle_arp(net: &mut VirtioNet, frame: &[u8]) {
-    // 28 bytes of ARP payload, hwtype=ether, proto=IPv4, hlen=6 plen=4.
+    // 28 bytes of ARP payload, hwtype=ether (0x0001), proto=IPv4 (0x0800),
+    // hlen=6 plen=4, all big-endian.
     if frame.len() < 14 + 28 || frame[14 + 0] != 0 || frame[14 + 1] != 1
-        || frame[14 + 2] != 0 || frame[14 + 3] != 0x08
+        || frame[14 + 2] != 0x08 || frame[14 + 3] != 0
         || frame[14 + 4] != 6 || frame[14 + 5] != 4
     {
         return;
@@ -147,8 +148,8 @@ fn handle_arp(net: &mut VirtioNet, frame: &[u8]) {
         let n = eth_header(&mut reply, &sender_mac, &net.mac, ETHERTYPE_ARP);
         reply[n + 0] = 0;
         reply[n + 1] = 1;
-        reply[n + 2] = 0;
-        reply[n + 3] = 0x08;
+        reply[n + 2] = 0x08;
+        reply[n + 3] = 0;
         reply[n + 4] = 6;
         reply[n + 5] = 4;
         reply[n + 6] = 0;
@@ -259,8 +260,8 @@ fn arp_resolve(net: &mut VirtioNet) {
     let n = eth_header(&mut req, &broadcast, &net.mac, ETHERTYPE_ARP);
     req[n + 0] = 0;
     req[n + 1] = 1;
-    req[n + 2] = 0;
-    req[n + 3] = 0x08;
+    req[n + 2] = 0x08;
+    req[n + 3] = 0;
     req[n + 4] = 6;
     req[n + 5] = 4;
     req[n + 6] = 0;

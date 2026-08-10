@@ -31,6 +31,10 @@ pub const VIRTIO_NET_S: u16 = 1;
 // Feature bits we negotiate (QEMU supports both unconditionally).
 const F_MAC: u64 = 1 << 5;
 const F_STATUS: u64 = 1 << 16;
+// VIRTIO_F_VERSION_1: with it, the device uses the 12-byte mrg_rxbuf-style
+// vnet header on RX/TX (our NET_HDR_SIZE); without it, QEMU falls back to
+// the 10-byte legacy header and every frame is off by two bytes.
+const F_VERSION_1: u64 = 1 << 32;
 
 // Device-config offsets.
 const CFG_MAC: usize = 0;
@@ -67,7 +71,11 @@ impl VirtioNet {
         let dev = VirtioPci::open(VIRTIO_NET_S)?;
 
         dev.reset();
-        let feats = dev.negotiate(F_MAC | F_STATUS)?;
+        let feats = dev.negotiate(F_VERSION_1 | F_MAC | F_STATUS)?;
+        if feats & F_VERSION_1 == 0 {
+            dev.fail("virtio-net: device has no VERSION_1 feature");
+            return None;
+        }
         if feats & F_MAC == 0 {
             dev.fail("virtio-net: device has no MAC feature");
             return None;
