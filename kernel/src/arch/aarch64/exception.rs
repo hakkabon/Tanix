@@ -84,6 +84,15 @@ pub extern "C" fn irq_handler(from_el0: u64) {
             gic::eoi(intid);
         }
 
+        // SGI 3 — run-queue poke (Phase 11): sent by the device-IRQ handler
+        // and by wake sites when a parked secondary / `SYS_WAIT_IRQ` waiter
+        // sleeps in `wfi` on another core.  Waking it is the whole job —
+        // the core re-checks the runqueue / pending bit on its own.
+        3 => {
+            log::trace!("irq: SGI 3 (run-queue poke)");
+            gic::eoi(intid);
+        }
+
         // Any other wired interrupt (device IRQs: virtio-mmio SPIs
         // 48..79): record it for SYS_WAIT_IRQ and signal EOI.  The waiter
         // may be inside its wait loop (current-EL IRQ) or about to call
@@ -100,6 +109,11 @@ pub extern "C" fn irq_handler(from_el0: u64) {
             // consumes the bit and the next wait_irq re-enables the IRQ.
             gic::disable_irq(other);
             gic::eoi(intid);
+            // Phase 11: a waiter may be parked in `wfi` on another core —
+            // the pending bit is useless to it unless it is woken.
+            unsafe {
+                crate::sched::task::poke_other_cpus();
+            }
         }
 
         1023 => {
@@ -126,12 +140,18 @@ fn from_el0(frame: *const u64) -> bool {
 /// Abort from an EL0 task: log, mark it zombie and switch away.  Never
 /// returns.  The kernel itself (and the EL1 guest) are unaffected — this
 /// is the Phase-6 isolation guarantee.
+///
+/// Phase 11: takes `SCHED_LOCK`; the switch releases it between saving
+/// this context and restoring the next one.  The zombie is never re-picked.
 unsafe fn kill_faulting_task(esr: u64, elr: u64, far: u64) -> ! {
-    use crate::sched::task::{context_switch, scheduler};
+    use crate::sched::task::{context_switch_unlock, scheduler};
     use crate::sched::TaskState;
 
+    let lock = crate::sched::task::sched_lock();
+    lock.lock();
     let sched = scheduler();
-    let idx = sched.current_idx();
+    let cpu = crate::smp::cpu_index();
+    let idx = crate::smp::current_idx();
     let name = sched.current_name();
     let id = sched.current_id();
     log::error!(
@@ -144,23 +164,15 @@ unsafe fn kill_faulting_task(esr: u64, elr: u64, far: u64) -> ! {
         t.recv_buf = core::ptr::null_mut();
     }
 
-    // Switch to the next runnable task; the zombie never runs again.
-    loop {
-        let next = sched.pick_next();
-        if next == idx {
-            // Nothing else runnable — fall back to the boot context.
-            let from = sched.ctx_ptr(idx);
-            let to = sched.ctx_ptr(0);
-            sched.set_current(0);
-            context_switch(from, to);
-        } else {
-            let from = sched.ctx_ptr(idx);
-            let to = sched.ctx_ptr(next);
-            sched.set_state(next, TaskState::Running);
-            sched.set_current(next);
-            context_switch(from, to);
-        }
-    }
+    // Switch to the next runnable task (this core's idle slot when nothing
+    // else is runnable); the zombie never runs again.
+    let next = sched.pick_next(cpu);
+    let from = sched.ctx_ptr(idx);
+    let to = sched.ctx_ptr(next);
+    sched.set_state(next, TaskState::Running);
+    crate::smp::set_current(next);
+    context_switch_unlock(lock, from, to);
+    unreachable!("kill_faulting_task resumed a zombie")
 }
 
 /// Called from `vectors.s` slot 8 (lower EL AArch64 synchronous exception).

@@ -1,8 +1,9 @@
 // AArch64 context switch stub — Phase 6 (EL0 servers + per-task address
-// spaces).
+// spaces), Phase 11 (SMP: lock-releasing variant).
 //
-// Signature (C ABI):
+// Signatures (C ABI):
 //   void context_switch(Context *from, const Context *to);
+//   void context_switch_unlock(SpinLock *lock, Context *from, const Context *to);
 //
 // Context layout (must match sched::task::Context in task.rs):
 //   Offset  Field
@@ -36,8 +37,16 @@
 //   • TTBR0_EL1 is switched per task and the TLB fully invalidated, since
 //     we use no ASIDs.  This is safe here: between the `msr` and the `isb`
 //     the stub executes only kernel code, which every table maps EL1-only.
-//   • Interrupts never fire during a switch (no interrupt source is
-//     enabled and DAIF stays masked), so there is no need to mask IRQs.
+//   • Interrupts must be masked while the scheduler lock is held — the
+//     callers guarantee this (exception entry masks DAIF; the SYS_WAIT_IRQ
+//     wait loop and the secondary idle loop run unmasked only while
+//     *not* holding the lock), so no IRQ can fire inside the stub.
+//   • `context_switch_unlock` releases the lock (a single byte store, the
+//     SpinLock's held flag — sync.rs pins the layout with `#[repr(C)]`)
+//     *between* saving the current context and restoring the next one:
+//     the critical section spans exactly [lock → pick → save], and the
+//     resumed task never unlocks.  Release semantics (stlrb) pair with the
+//     Acquire swap in SpinLock::lock.
 
 .section .text, "ax"
 .global context_switch
@@ -74,6 +83,53 @@ context_switch:
     ldr  x9,       [x1, #112]  // SPSR_EL1
     msr  SPSR_EL1, x9
     ldr  x9,       [x1, #120]  // page table
+    msr  TTBR0_EL1, x9
+    isb
+    tlbi vmalle1is
+    dsb  sy
+    isb
+    msr  ELR_EL1, x30
+    eret
+
+// ── Lock-releasing variant (Phase 11) ───────────────────────────────────────
+//   x0 = *lock, x1 = *from, x2 = *to
+.global context_switch_unlock
+.type context_switch_unlock, %function
+
+context_switch_unlock:
+    // Save current task (x1 = *from).
+    stp  x19, x20, [x1, #0]
+    stp  x21, x22, [x1, #16]
+    stp  x23, x24, [x1, #32]
+    stp  x25, x26, [x1, #48]
+    stp  x27, x28, [x1, #64]
+    stp  x29, x30, [x1, #80]
+    mov  x9,  sp
+    str  x9,       [x1, #96]
+    mrs  x9,  SP_EL0
+    str  x9,       [x1, #104]
+    mov  x9,  #0x3c5
+    str  x9,       [x1, #112]
+    mrs  x9,  TTBR0_EL1
+    str  x9,       [x1, #120]
+
+    // Release the scheduler lock (SpinLock.held at offset 0, repr(C)).
+    stlrb wzr, [x0]
+
+    // Restore next task (x2 = *to).
+    ldp  x19, x20, [x2, #0]
+    ldp  x21, x22, [x2, #16]
+    ldp  x23, x24, [x2, #32]
+    ldp  x25, x26, [x2, #48]
+    ldp  x27, x28, [x2, #64]
+    ldp  x29, x30, [x2, #80]
+    ldr  x9,       [x2, #96]
+    mov  sp,  x9
+    ldr  x9,       [x2, #104]
+    msr  SP_EL0,   x9
+    ldr  x9,       [x2, #112]
+    msr  SPSR_EL1, x9
+    ldr  x9,       [x2, #120]
     msr  TTBR0_EL1, x9
     isb
     tlbi vmalle1is

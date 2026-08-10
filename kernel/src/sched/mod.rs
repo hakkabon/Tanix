@@ -9,10 +9,20 @@
 //! preempts EL0 tasks (highest priority first, round-robin within a
 //! priority), and every syscall return re-evaluates the run queue so a
 //! woken higher-priority task runs immediately.
+//!
+//! Phase 11 (SMP): there is ONE global runqueue guarded by `SCHED_LOCK`.
+//! Every scheduling entry point acquires the lock, mutates task states,
+//! picks the next task and calls `context_switch_unlock`, whose assembly
+//! releases the lock *between* saving the current context and restoring
+//! the next one.  Tasks migrate freely between cores; the lock guarantees
+//! at most one core executes a given task.  Secondary cores park in their
+//! own idle slots (`sched::task::secondary_enter`) and are woken from WFI
+//! with an SGI when the runqueue changes.
 
 pub mod task;
 
 pub use task::enter;
+pub use task::secondary_enter;
 
 use core::arch::global_asm;
 

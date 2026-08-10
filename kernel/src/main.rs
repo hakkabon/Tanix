@@ -9,6 +9,8 @@ mod mem;
 mod panic;
 mod sched;
 mod server;
+mod smp;
+mod sync;
 mod virtio;
 mod vm;
 
@@ -107,6 +109,95 @@ _start:
     add  x0, x0, :lo12:__stack_top
     mov  sp, x0
     b    kmain_entry
+
+// ── Secondary-CPU entry (Phase 11 SMP) ─────────────────────────────────────────
+//
+// QEMU's PSCI CPU_ON starts secondaries at EL2 with PC = this symbol.
+// They drop EL2 -> EL1 (the same sequence as `_start`'s `2:` path), select
+// their own boot stack from `SECONDARY_STACKS` (indexed by MPIDR Aff0),
+// and continue in `kmain_secondary_entry`.  BSS is already zeroed by the
+// primary — secondaries must NOT re-zero it.
+
+.section .text._start_secondary, "ax"
+.global secondary_entry
+.type secondary_entry, %function
+secondary_entry:
+    // The EL1 MMU state left by PSCI CPU_ON is not guaranteed to match the
+    // kernel's boot config: the secondary can start with SCTLR_EL1.M=1 and a
+    // stale TTBR0_EL1 (QEMU hands over the caller's EL1 sysregs), so the
+    // kernel image / UART stay mapped but the per-CPU boot stack is not —
+    // which faults the very first `stp`.  Disable the EL1 MMU before touching
+    // any memory (register-only, no memory access): the whole EL1 boot then
+    // runs on physical identity addresses and kmain_secondary_entry re-enables
+    // the MMU with the kernel table via mmu::init() + enable_secondary().
+    msr  SCTLR_EL1, xzr
+    isb
+    // DEBUG markers (control bytes — cannot collide with log text):
+    //  0x01 = entry, 0x02 = EL1 reached, 0x03 = pre-jump, 0x04 = Rust entry
+    movz x0, #0x900, lsl #16
+    movz w1, #0x01
+    strb w1, [x0]
+    mrs  x0, CurrentEL
+    and  x0, x0, #0xc
+    cmp  x0, #0xc
+    b.eq 3f
+    cmp  x0, #0x8
+    b.eq 2f
+    b    1f
+
+3: // EL3 -> EL2 (defensive — QEMU already starts secondaries at EL2).
+    mov  x1, #0x501
+    msr  SCR_EL3, x1
+    isb
+    adr  x1, 2f
+    msr  ELR_EL3, x1
+    mov  x1, #0x3c9
+    msr  SPSR_EL3, x1
+    eret
+
+2: // EL2 -> EL1: HCR_EL2.RW=1 forces AArch64 at EL1.
+    mov  x1, #1
+    lsl  x1, x1, #31
+    msr  HCR_EL2, x1
+    msr  SCTLR_EL2, xzr
+    isb
+    adr  x1, 1f
+    msr  ELR_EL2, x1
+    mov  x1, #0x3c5      // SPSR: EL1h, DAIF masked
+    msr  SPSR_EL2, x1
+    eret
+
+1: // EL1h: SIMD/FP at EL1.
+    mov  x1, #3
+    lsl  x1, x1, #20
+    msr  CPACR_EL1, x1
+    isb
+
+    // DEBUG: 0x02 = dropped to EL1h.
+    movz x0, #0x900, lsl #16
+    movz w1, #0x02
+    strb w1, [x0]
+
+    // Per-CPU stack: SECONDARY_STACKS + (cpu-1) * 0x10000, top.
+    mrs  x2, MPIDR_EL1
+    and  x2, x2, #0xff     // cpu index (Aff0)
+    sub  x2, x2, #1
+    adrp x0, SECONDARY_STACKS
+    add  x0, x0, :lo12:SECONDARY_STACKS
+    movz x1, #1, lsl #16   // stack size = 0x10000
+    madd x0, x2, x1, x0
+    add  sp, x0, x1
+    // DEBUG: install the vector table (VBAR_EL1) here so an early fault
+    // panics with ESR/ELR instead of looping on the zeroed vectors at 0x0.
+    adrp x0, __vectors
+    add  x0, x0, :lo12:__vectors
+    msr  VBAR_EL1, x0
+    isb
+    // DEBUG: 0x03 = stack set, jumping to Rust.
+    movz x0, #0x900, lsl #16
+    movz w1, #0x03
+    strb w1, [x0]
+    b    kmain_secondary_entry
     "#
 );
 
@@ -131,6 +222,52 @@ pub extern "C" fn kmain_entry() -> ! {
         );
     }
     kmain();
+}
+
+/// Rust-side continuation for secondary CPUs, reached from `secondary_entry`
+/// at EL1h with SP on the CPU's own `SECONDARY_STACKS` region.  BSS is
+/// already zeroed by the primary, so no re-zeroing here.
+///
+/// Each secondary re-arms the per-CPU hardware (MMU, vectors, GIC
+/// redistributor, timer tick) and then idles in its own scheduler slot,
+/// competing for tasks on the global runqueue.
+#[no_mangle]
+pub extern "C" fn kmain_secondary_entry() -> ! {
+    unsafe {
+        core::arch::asm!(
+            "movz x0, #0x900, lsl #16",
+            "movz w1, #0x04",
+            "strb w1, [x0]",
+            options(nomem, nostack)
+        );
+    }
+    // DEBUG: install vectors first so an early fault panics with ESR/ELR
+    // instead of looping on the zeroed vector table at VBAR=0.
+    arch::aarch64::exception::init();
+
+    let cpu = smp::cpu_index();
+    log::info!(
+        "smp: CPU {} up at EL1 (mpidr={:#x})",
+        cpu,
+        arch::aarch64::boot::mpidr()
+    );
+
+    // Per-CPU MMU state: TCR/MAIR (reset to 0 on a fresh CPU), TTBR0
+    // (kernel identity map) and SCTLR_EL1.M — the identity map means all
+    // kernel addresses equal physical addresses, exactly like CPU 0.
+    arch::aarch64::mmu::init();
+    unsafe { mem::page_table::enable_secondary(); }
+
+    arch::aarch64::exception::init(); // VBAR_EL1 (reset value is 0)
+    arch::aarch64::gic::init();       // this CPU's redistributor + ICC
+    arch::aarch64::timer::init();     // disarm until the tick is armed
+
+    // Preemption tick on this CPU: PPI 30 is per-CPU by definition.
+    arch::aarch64::gic::enable_irq(30);
+    arch::aarch64::timer::init_tick();
+    log::info!("smp: CPU {} tick armed", cpu);
+
+    unsafe { sched::secondary_enter(cpu) }
 }
 
 // ── Kernel main ───────────────────────────────────────────────────────────────
@@ -354,6 +491,13 @@ fn kmain() -> ! {
         arch::aarch64::gic::enable_irq(30);
         arch::aarch64::timer::init_tick();
         log::info!("phase 9: preemption tick armed (PPI 30)");
+
+        // ── Phase 11: SMP bring-up ──────────────────────────────────────────
+        // Release the secondary cores via PSCI CPU_ON (they drop EL2→EL1,
+        // arm their own ticks and idle on the global runqueue).  Boot with
+        // `-smp 4` to activate them; a smaller `-smp` degrades gracefully
+        // (CPU_ON returns INVALID_PARAMS).
+        smp::bring_up();
 
         unsafe {
             sched::enter();
