@@ -23,9 +23,17 @@ pub const SECONDARY_STACK_SIZE: usize = 0x1_0000; // 64 KiB
 /// (main.rs) picks its stack from `mpidr()`:  base + (cpu-1) * size.
 ///
 /// Lives in BSS (zeroed by the primary before any secondary starts).
+///
+/// The wrapper must be `align(0x10000)`: a plain `[u8; N]` has alignment 1,
+/// so the linker could place it at an odd address, and the secondary's
+/// first `stp` (16-byte paired store) then raises an alignment fault
+/// (DFSC 0x21) before Rust even runs.
+#[repr(C, align(0x10000))]
+struct SecondaryStacks([u8; SECONDARY_STACK_SIZE * (MAX_CPUS - 1)]);
+
 #[no_mangle]
-pub static mut SECONDARY_STACKS: [u8; SECONDARY_STACK_SIZE * (MAX_CPUS - 1)] =
-    [0u8; SECONDARY_STACK_SIZE * (MAX_CPUS - 1)];
+pub static mut SECONDARY_STACKS: SecondaryStacks =
+    SecondaryStacks([0u8; SECONDARY_STACK_SIZE * (MAX_CPUS - 1)]);
 
 /// Per-CPU runtime state.
 pub struct PerCpu {
