@@ -26,7 +26,7 @@ input injected through QEMU's QMP monitor.
 | 3 | VirtIO transport between kernel and guest VM (shmem + virtqueue) | ✅ done |
 | 4 | Minix-style server processes (init, pm, mem, dev, worker) | ✅ done |
 | 5 | Display/UI stack: virtio-gpu framebuffer + virtio-tablet pointer, driven by a Minix-style display server | ✅ done |
-| 6 | Hypervisor assist (Gunyah-style) | ✅ done |
+| 6 | Hypervisor assist (Gunyah-style): message queues, doorbell-wakeup blocking, SGI delivery tracking | ✅ done |
 | 7 | Preemptive priority scheduler + device IRQs (timer tick, GIC PPIs/SPIs, `SYS_WAIT_IRQ` for virtio devices) | ✅ done |
 
 ---
@@ -50,7 +50,7 @@ kernel/                  the microkernel itself (no_std, freestanding binary)
   src/hypervisor/
     mod.rs               backend selection (BareMetal vs Gunyah)
     backend.rs           Hypervisor trait (vm_create/start/resume, shmem, doorbell)
-    doorbell.rs          SGI doorbell register/dispatch
+    doorbell.rs          SGI doorbell register/dispatch; ring-vs-delivery tracking
     gunyah.rs            Gunyah backend: real `hvc #0` hypercall ABI (capabilities,
                          msgq_create/send/recv, vcpu_run)
     message_queue.rs     Gunyah-style message-queue object (primary VM side)
@@ -70,7 +70,7 @@ kernel/                  the microkernel itself (no_std, freestanding binary)
   build.rs               linker args; emits embedded-binary paths
 servers/zephyr-stub/     the Phase-3 guest: a tiny Zephyr-like RTOS PoC
   src/main.rs            cooperative device loop, VirtIO device side,
-                         Phase-13 message-queue ping (vmm_service entry)
+                         Phase-14 doorbell-blocked message-queue consumer
 servers/libtanix-sys/    shared no_std crate: syscall table, Message/ABI (BootInfo)
 servers/init/            root server: spawns pm/mem/dev, drives the demo
 servers/pm/              process manager (spawn/exec via syscall)

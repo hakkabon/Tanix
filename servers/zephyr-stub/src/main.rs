@@ -248,35 +248,63 @@ pub extern "C" fn _start() -> ! {
     }
 
     if unsafe { vmm_info_ready(base) } {
-        // ── Phase 13: Gunyah-style message-queue ping ──────────────────────────
-        // The kernel (primary VM) created a message queue and published the
-        // handle + the `vmm_service` entry (the EL1 stand-in for an HVC
-        // trap; same function ABI as the real Gunyah hypercall path) in the
-        // info block.  Each round: receive the kernel's ping (the kernel
-        // sends before resuming us), verify, reply, yield.
+        // ── Phase 14: doorbell-driven message queue ──────────────────────────
+        // Info block v2: u32 magic, u32 msgq handle, u64 `vmm_service`
+        // entry (EL1 stand-in for an HVC trap), u32 doorbell handle,
+        // u32 guest_state, u32 doorbell_flags — all published by the
+        // kernel in the shared region.
+        //
+        // Protocol: we are a *blocking* consumer.  On an empty receive we
+        // mark ourselves WAITING in the info block and yield; the kernel
+        // rings the doorbell (GIC SGI on bare metal, GH_BELL_SEND on
+        // Gunyah) when it sends and later resumes us — the yield returns
+        // and we re-check the queue.  The doorbell decouples send from
+        // wakeup: the kernel can produce several messages before we run.
+        //
+        // The queue is shared, so we reply to exactly the three pings and
+        // then hand control back — if we kept receiving we would pick up
+        // our own pongs.
+        const GUEST_RUNNING: u32 = 0;
+        const GUEST_WAITING: u32 = 1;
+        const DOORBELL_FLAG_MSG: u32 = 1;
+
         unsafe {
         let info = base.add(VMM_INFO_OFF);
         let mq_handle: u32 =
             core::ptr::read_volatile(info.add(4) as *const u32);
         let service_addr: u64 =
             core::ptr::read_volatile(info.add(8) as *const u64);
+        let state_ptr = info.add(0x14) as *mut u32;
+        let flags_ptr = info.add(0x18) as *mut u32;
         let service: unsafe extern "C" fn(u64, u64, u64, u64) -> u64 =
             core::mem::transmute(service_addr);
 
-        puts("[Zephyr-stub] Phase 13: message-queue ping\n");
+        puts("[Zephyr-stub] Phase 14: doorbell message-queue\n");
 
-        let mut buf = [0u8; 96];
-        for round in 0u32..3 {
-            // Receive the kernel's ping.  Wait (yield) while the queue is
-            // empty — the kernel refills it between resumes.
-            let n = loop {
+        // Blocking receive: on an empty queue write WAITING, yield (the
+        // kernel resumes us after ringing the doorbell), then re-check.
+        // Returns the received size in `buf`.
+        let recv_or_block = |buf: &mut [u8; 96]| -> usize {
+            loop {
                 let r = service(TANIX_MSGQ_RECV, mq_handle as u64,
                                 buf.as_mut_ptr() as u64, 96);
                 if r != TANIX_HVC_ERR {
-                    break r as usize;
+                    return r as usize;
                 }
+                core::ptr::write_volatile(state_ptr, GUEST_WAITING);
                 yield_fn(guest_ctx as usize);
-            };
+                core::ptr::write_volatile(state_ptr, GUEST_RUNNING);
+                if core::ptr::read_volatile(flags_ptr) & DOORBELL_FLAG_MSG != 0 {
+                    puts("[Zephyr-stub] woken by doorbell\n");
+                    core::ptr::write_volatile(flags_ptr, 0);
+                }
+            }
+        };
+
+        let mut buf = [0u8; 96];
+        let mut index = 0u32;
+        for _ in 0u32..3 {
+            let n = recv_or_block(&mut buf);
 
             puts("[Zephyr-stub] msgq: received ");
             for &b in &buf[..n.min(buf.len())] {
@@ -284,23 +312,42 @@ pub extern "C" fn _start() -> ! {
             }
             puts("\n");
 
-            // Reply with the matching pong.
-            let reply: &[u8] = match round {
+            // Reply with the matching pong (index = receive order).
+            let reply: &[u8] = match index {
                 0 => b"pong-0",
                 1 => b"pong-1",
                 _ => b"pong-2",
             };
+            index += 1;
             let _ = service(TANIX_MSGQ_SEND, mq_handle as u64,
                             reply.as_ptr() as u64, reply.len() as u64);
-
-            // Hand control back so the kernel can collect the reply.
-            yield_fn(guest_ctx as usize);
         }
 
-        puts("[Zephyr-stub] Phase 13: msgq ping complete — halting\n");
+        // Hand the three pongs back — the kernel drains the queue before
+        // sending the finale message.
+        yield_fn(guest_ctx as usize);
+
+        // Finale: expect "done", acknowledge and park.  The kernel sends
+        // it with the doorbell ringing before resuming us, so this receive
+        // usually succeeds immediately.
+        let n = recv_or_block(&mut buf);
+        puts("[Zephyr-stub] msgq: received ");
+        for &b in &buf[..n.min(buf.len())] {
+            putc(b);
+        }
+        puts("\n");
+
+        if n == 4 && buf[..4] == *b"done" {
+            puts("[Zephyr-stub] Phase 14 complete — parked\n");
+            let _ = service(TANIX_MSGQ_SEND, mq_handle as u64,
+                            b"ack".as_ptr() as u64, 3);
+            yield_fn(guest_ctx as usize);
+        } else {
+            puts("[Zephyr-stub] Phase 14: unexpected finale\n");
         }
         loop {
             core::hint::spin_loop();
+        }
         }
     }
 

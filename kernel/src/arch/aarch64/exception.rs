@@ -72,9 +72,13 @@ pub extern "C" fn irq_handler(from_el0: u64) {
             }
         }
 
-        // SGI 1 — inter-VM doorbell (guest → kernel reply notification).
-        1 => {
-            log::debug!("irq: SGI 1 received (VM doorbell)");
+        // SGIs 1/2 — inter-VM doorbells (Phase 14).  `doorbell_send` rings
+        // these SGIs; every *delivery* lands here, so bursts of rings
+        // coalesce into one IRQ — recorded by `note_delivery` (rings vs.
+        // deliveries is observable in the doorbell stats).  Mirrors the
+        // doorbell vIRQ a Gunyah guest would receive on its vCPU.
+        1 | 2 => {
+            crate::hypervisor::doorbell::note_delivery(intid);
             gic::eoi(intid);
         }
 

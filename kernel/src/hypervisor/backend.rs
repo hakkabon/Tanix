@@ -316,21 +316,11 @@ impl Hypervisor for BareMetalBackend {
     }
 
     fn doorbell_send(&mut self, handle: DoorbellHandle) -> Result<(), HvError> {
-        // Deliver SGI 1 to CPU 0 (ourselves) — in a real multi-core setup
-        // this would target the vCPU of the guest VM.
-        // ICC_SGI1R_EL1 format: TargetList[15:0]=1, Aff1[23:16]=0, INTID[27:24]=1
-        let sgi1r: u64 = (1u64 << 24) | 0b1; // SGI ID=1, target CPU0
-
-        unsafe {
-            core::arch::asm!(
-                "msr S3_0_C12_C11_5, {v}", // ICC_SGI1R_EL1
-                "isb",
-                v = in(reg) sgi1r,
-                options(nomem, nostack)
-            );
-        }
-
-        log::debug!("doorbell_send: handle={:?} SGI1 dispatched", handle);
+        // Bare-metal delivery: a GIC SGI on the doorbell's registered IRQ,
+        // dispatched to CPU 0 (the vCPU that owns the doorbell).  Rings
+        // are counted here; the actual delivery is recorded by the IRQ
+        // handler through `note_delivery`.  Mirrors Gunyah `GH_BELL_SEND`.
+        crate::hypervisor::doorbell::ring_sgi(handle)?;
         Ok(())
     }
 

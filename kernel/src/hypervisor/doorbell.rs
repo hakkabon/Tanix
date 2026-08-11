@@ -31,6 +31,11 @@ pub(crate) struct DoorbellEntry {
     /// Gunyah `BELL_SET_MASK` flags (bare-metal delivery ignores them).
     pub enable_mask: u64,
     pub ack_mask: u64,
+    /// Phase 14: how many times `doorbell_send` rang this doorbell.
+    pub rings: u64,
+    /// Phase 14: how many times the GIC actually delivered it (rings
+    /// coalesce while a delivery is pending, so deliveries ≤ rings).
+    pub deliveries: u64,
 }
 
 const MAX_DOORBELLS: usize = 8;
@@ -60,6 +65,8 @@ impl DoorbellTable {
             irq,
             enable_mask: 0,
             ack_mask: 0,
+            rings: 0,
+            deliveries: 0,
         });
         log::debug!(
             "doorbell: registered handle={:?} vm={} irq={}",
@@ -110,6 +117,53 @@ pub fn send(handle: super::DoorbellHandle, hv: &mut dyn Hypervisor) -> Result<()
     let _entry = unsafe { (*core::ptr::addr_of!(DOORBELL_TABLE)).find(handle) }
         .ok_or(HvError::InvalidHandle)?;
     hv.doorbell_send(handle)
+}
+
+/// Ring a doorbell on the bare-metal backend (Phase 14): dispatch the
+/// registered GIC SGI to CPU 0 and count the ring.  The SGI handler
+/// records the actual delivery via `note_delivery` — rings that happen
+/// while a delivery is still pending coalesce in the GIC, which is the
+/// whole point of a doorbell (a burst of rings is one wakeup).
+pub fn ring_sgi(handle: super::DoorbellHandle) -> Result<(), HvError> {
+    unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(DOORBELL_TABLE);
+        let e = table.entries.iter_mut().flatten().find(|e| e.handle == handle)
+            .ok_or(HvError::InvalidHandle)?;
+        e.rings += 1;
+        crate::arch::aarch64::gic::send_sgi(0, e.irq);
+        log::debug!(
+            "doorbell: rang {:?} (SGI {} rings={} deliveries={})",
+            handle, e.irq, e.rings, e.deliveries
+        );
+    }
+    Ok(())
+}
+
+/// Record that SGI `intid` was actually delivered by the GIC.  Called from
+/// the kernel's IRQ handler (Phase 14), which sits on the vCPU that owns
+/// the doorbell — exactly where the doorbell IRQ would land on a real
+/// hypervisor.
+pub fn note_delivery(intid: u32) {
+    unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(DOORBELL_TABLE);
+        let Some(e) = table.entries.iter_mut().flatten().find(|e| e.irq == intid) else {
+            log::debug!("irq: SGI {} received (no registered doorbell)", intid);
+            return;
+        };
+        e.deliveries += 1;
+        log::debug!(
+            "doorbell: SGI {} delivered ({:?} deliveries={})",
+            intid, e.handle, e.deliveries
+        );
+    }
+}
+
+/// (rings, deliveries) observed for a doorbell — the demo logs this to
+/// show real GIC delivery vs. coalesced rings.
+pub fn stats(handle: super::DoorbellHandle) -> Result<(u64, u64), HvError> {
+    let e = unsafe { (*core::ptr::addr_of!(DOORBELL_TABLE)).find(handle) }
+        .ok_or(HvError::InvalidHandle)?;
+    Ok((e.rings, e.deliveries))
 }
 // ── Guest → VMM service ABI ───────────────────────────────────────────────────
 

@@ -378,23 +378,40 @@ fn kmain() -> ! {
 
     log::info!("phase 3: VirtIO transport demo complete");
 
-    // ── Phase 13: hypervisor assist — message-queue ping ─────────────────────
+    // ── Phase 14: hypervisor assist — doorbell wakeups ───────────────────────
     //
-    // The `Hypervisor` trait now models Gunyah's object set (VM + vCPU
-    // objects, message queues, doorbells, memory extents).  Drive the
-    // message-queue object end-to-end: the primary VM creates a queue for
-    // the guest, publishes a VMM info block (magic + queue handle +
-    // `vmm_service` entry — the EL1 stand-in for an HVC trap) in the
-    // shared shmem region, then plays ping-pong with the guest through the
-    // trait: send ping → run the guest vCPU (it receives via the service
-    // entry and replies) → receive the pong.
+    // Phase 13 exchanged messages but fused send and resume: the kernel
+    // woke the guest by resuming it.  Phase 14 decouples the two with a
+    // real doorbell (a zero-payload IRQ):
+    //
+    //   • the guest *blocks* on an empty receive: it writes guest_state =
+    //     WAITING into the shared VMM info block and yields;
+    //   • the kernel keeps producing — three sends, ringing the doorbell
+    //     after each (GIC SGI 1 on bare metal, GH_BELL_SEND on Gunyah) —
+    //     without resuming the guest.  Rings coalesce in the GIC into one
+    //     delivery, which the kernel's IRQ handler records;
+    //   • the kernel then resumes the guest once: it wakes, drains all
+    //     three messages and replies.
+    //
+    // The guest is also where Phase 13 leaked: it halted inside the final
+    // vcpu_run (an infinite spin), so the kernel never reached the Phase-4
+    // demo.  Phase 14 finishes with a "done" message the guest
+    // acknowledges and then *parks* — handing control back — so the boot
+    // sequence continues.
     const VMM_INFO_MAGIC: u32 = 0x564D_4D49; // "IVMM"
     const VMM_INFO_OFF: usize = 0x2000;
+    const GUEST_RUNNING: u32 = 0;
+    const GUEST_WAITING: u32 = 1;
 
     let mq = hv
         .msgq_create(guest_handle, 8)
-        .expect("phase 13: msgq_create failed");
+        .expect("phase 14: msgq_create failed");
+    let bell = hv
+        .doorbell_create(guest_handle, 2) // SGI 2 = phase-14 doorbell
+        .expect("phase 14: doorbell_create failed");
     unsafe {
+        // VMM info block: u32 magic, u32 msgq, u64 vmm_service,
+        // u32 doorbell, u32 guest_state, u32 doorbell_flags.
         let info = (shmem_phys as usize + VMM_INFO_OFF) as *mut u32;
         core::ptr::write_volatile(info, VMM_INFO_MAGIC);
         core::ptr::write_volatile(info.add(1), mq.0);
@@ -402,13 +419,40 @@ fn kmain() -> ! {
             info.add(2) as *mut u64,
             hypervisor::doorbell::vmm_service as *const () as u64,
         );
+        core::ptr::write_volatile(info.add(4), bell.0);
+        core::ptr::write_volatile(info.add(5), GUEST_RUNNING);
+        core::ptr::write_volatile(info.add(6), 0u32);
     }
     log::info!(
-        "phase 13: VMM info block published (msgq={:?}, service={:#x})",
-        mq,
+        "phase 14: info block published (msgq={:?} doorbell={:?} service={:#x})",
+        mq, bell,
         hypervisor::doorbell::vmm_service as *const () as usize
     );
 
+    // The doorbell is delivered as a real GIC SGI IRQ, so this demo needs
+    // IRQs unmasked — everything up to here runs masked (the scheduler
+    // tick that unmasks them at phase 9 isn't armed yet).
+    unsafe {
+        core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); // clear I
+    }
+
+    // 1. Run the guest once so it reads the info block and blocks on the
+    //    empty queue (guest_state → WAITING, then yield).
+    unsafe {
+        vm::resume_vm(guest_handle, hv)
+            .expect("phase 14: first resume failed");
+    }
+    if guest_info_state(shmem_phys) == GUEST_WAITING {
+        log::info!("phase 14: guest asleep on the queue — ringing doorbells");
+    } else {
+        log::warn!("phase 14: guest unexpectedly not blocked");
+    }
+
+    // 2. Produce three messages without resuming the guest, ringing the
+    //    doorbell after each send.  The doorbell's whole purpose: the
+    //    producer signals without knowing (or caring) whether the
+    //    consumer is blocked.  The info-block flags field is the
+    //    guest-visible doorbell state (the guest clears it when it wakes).
     for round in 0u32..3 {
         let text: &[u8] = match round {
             0 => b"ping-0",
@@ -416,31 +460,100 @@ fn kmain() -> ! {
             _ => b"ping-2",
         };
         hv.msgq_send(mq, text)
-            .expect("phase 13: msgq_send failed");
-
+            .expect("phase 14: msgq_send failed");
+        hv.doorbell_send(bell)
+            .expect("phase 14: doorbell_send failed");
         unsafe {
-            vm::resume_vm(guest_handle, hv)
-                .expect("phase 13: resume failed");
+            core::ptr::write_volatile(
+                (shmem_phys as usize + VMM_INFO_OFF + 24) as *mut u32,
+                1u32, // DOORBELL_FLAG_MSG
+            );
         }
+    }
 
+    // 3. The rings coalesce in the GIC into one pending SGI (the guest's
+    //    vCPU is asleep; the cooperative switch runs it masked, so rings
+    //    stay pending — on Gunyah the vCPU would sit in WFI).  Clearing
+    //    the I bit is the wakeup: the single pending SGI delivers once and
+    //    the handler records it.  Wait for that delivery — the kernel
+    //    observes the doorbell event before deciding to run the vCPU.
+    unsafe {
+        core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); // clear I
+    }
+    while hypervisor::doorbell::stats(bell)
+        .map(|(_, d)| d == 0)
+        .unwrap_or(true)
+    {
+        core::hint::spin_loop();
+    }
+    let (rings, deliveries) = hypervisor::doorbell::stats(bell)
+        .expect("phase 14: doorbell stats");
+    log::info!(
+        "phase 14: doorbell delivered (rings={} deliveries={}, coalesced={})",
+        rings, deliveries, rings - deliveries
+    );
+
+    // 4. Resume the woken guest once: it drains all three pings and
+    //    replies, then blocks on the (now empty) queue again.
+    unsafe {
+        vm::resume_vm(guest_handle, hv)
+            .expect("phase 14: drain resume failed");
+    }
+    log::info!("phase 14: guest ran and drained the queue");
+
+    // 5. Collect the three pongs.
+    for round in 0u32..3 {
         let mut reply = [0u8; hypervisor::MSGQ_MAX_MSG_SIZE];
         match hv.msgq_recv(mq, &mut reply) {
             Ok((n, _)) => {
                 let got = core::str::from_utf8(&reply[..n]).unwrap_or("?");
-                log::info!("phase 13: round {} — '{}' received", round, got);
+                log::info!("phase 14: round {} — '{}' received", round, got);
             }
             Err(e) => {
-                log::warn!("phase 13: round {} — no reply ({:?})", round, e);
+                log::warn!("phase 14: round {} — no reply ({:?})", round, e);
             }
         }
     }
 
-    // One final resume so the guest can print its completion banner.
+    // 6. Finale: one more message wakes the guest, which acknowledges and
+    //    parks (this time it hands control back instead of halting inside
+    //    the vCPU run, so the Phase-4 demo below still runs).
+    hv.msgq_send(mq, b"done")
+        .expect("phase 14: finale send failed");
+    hv.doorbell_send(bell)
+        .expect("phase 14: finale ring failed");
+    unsafe {
+        core::ptr::write_volatile(
+            (shmem_phys as usize + VMM_INFO_OFF + 24) as *mut u32,
+            1u32, // DOORBELL_FLAG_MSG
+        );
+        core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); // clear I
+    }
     unsafe {
         vm::resume_vm(guest_handle, hv)
-            .expect("phase 13: final resume failed");
+            .expect("phase 14: finale resume failed");
     }
-    log::info!("phase 13: message-queue ping complete");
+    {
+        let mut ack = [0u8; hypervisor::MSGQ_MAX_MSG_SIZE];
+        match hv.msgq_recv(mq, &mut ack) {
+            Ok((n, _)) => {
+                let got = core::str::from_utf8(&ack[..n]).unwrap_or("?");
+                log::info!("phase 14: finale ack — '{}'", got);
+            }
+            Err(e) => log::warn!("phase 14: no finale ack ({:?})", e),
+        }
+    }
+    log::info!(
+        "phase 14: guest parked (state={}) — demo complete",
+        guest_info_state(shmem_phys)
+    );
+    let (tot_rings, tot_deliveries) = hypervisor::doorbell::stats(bell)
+        .expect("phase 14: doorbell stats");
+    log::info!(
+        "phase 14: doorbell totals — rings={} deliveries={} (coalesced={})",
+        tot_rings, tot_deliveries, tot_rings - tot_deliveries
+    );
+    log::info!("phase 14: doorbell message-queue demo complete");
 
     // ── Phase 4: Minix-style server processes ─────────────────────────────────
     //
@@ -562,4 +675,18 @@ fn kmain() -> ! {
 
     // ── Idle ─────────────────────────────────────────────────────────────────
     arch::aarch64::halt();
+}
+
+/// Phase 14: read the guest's block state from the shared VMM info block
+/// (offset 0x14: u32 magic, u32 msgq, u64 service, u32 doorbell, u32 state,
+/// u32 flags).  The guest writes WAITING before yielding on an empty
+/// receive; the kernel polls this between resumes.
+fn guest_info_state(shmem_phys: usize) -> u32 {
+    const VMM_INFO_OFF: usize = 0x2000;
+    const STATE_OFF: usize = 20;
+    unsafe {
+        core::ptr::read_volatile(
+            (shmem_phys as usize + VMM_INFO_OFF + STATE_OFF) as *const u32,
+        )
+    }
 }
