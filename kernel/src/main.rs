@@ -132,11 +132,6 @@ secondary_entry:
     // the MMU with the kernel table via mmu::init() + enable_secondary().
     msr  SCTLR_EL1, xzr
     isb
-    // DEBUG markers (control bytes — cannot collide with log text):
-    //  0x01 = entry, 0x02 = EL1 reached, 0x03 = pre-jump, 0x04 = Rust entry
-    movz x0, #0x900, lsl #16
-    movz w1, #0x01
-    strb w1, [x0]
     mrs  x0, CurrentEL
     and  x0, x0, #0xc
     cmp  x0, #0xc
@@ -173,11 +168,6 @@ secondary_entry:
     msr  CPACR_EL1, x1
     isb
 
-    // DEBUG: 0x02 = dropped to EL1h.
-    movz x0, #0x900, lsl #16
-    movz w1, #0x02
-    strb w1, [x0]
-
     // Per-CPU stack: SECONDARY_STACKS + (cpu-1) * 0x10000, top.
     mrs  x2, MPIDR_EL1
     and  x2, x2, #0xff     // cpu index (Aff0)
@@ -187,16 +177,12 @@ secondary_entry:
     movz x1, #1, lsl #16   // stack size = 0x10000
     madd x0, x2, x1, x0
     add  sp, x0, x1
-    // DEBUG: install the vector table (VBAR_EL1) here so an early fault
-    // panics with ESR/ELR instead of looping on the zeroed vectors at 0x0.
+    // Install the vector table (VBAR_EL1) here so an early fault panics
+    // with ESR/ELR instead of looping on the zeroed vectors at 0x0.
     adrp x0, __vectors
     add  x0, x0, :lo12:__vectors
     msr  VBAR_EL1, x0
     isb
-    // DEBUG: 0x03 = stack set, jumping to Rust.
-    movz x0, #0x900, lsl #16
-    movz w1, #0x03
-    strb w1, [x0]
     b    kmain_secondary_entry
     "#
 );
@@ -233,16 +219,8 @@ pub extern "C" fn kmain_entry() -> ! {
 /// competing for tasks on the global runqueue.
 #[no_mangle]
 pub extern "C" fn kmain_secondary_entry() -> ! {
-    unsafe {
-        core::arch::asm!(
-            "movz x0, #0x900, lsl #16",
-            "movz w1, #0x04",
-            "strb w1, [x0]",
-            options(nomem, nostack)
-        );
-    }
-    // DEBUG: install vectors first so an early fault panics with ESR/ELR
-    // instead of looping on the zeroed vector table at VBAR=0.
+    // Install vectors first so an early fault panics with ESR/ELR instead
+    // of looping on the zeroed vector table at VBAR=0.
     arch::aarch64::exception::init();
 
     let cpu = smp::cpu_index();
@@ -474,6 +452,12 @@ fn kmain() -> ! {
     // Phase 10: `net` (96) drives the virtio-net-pci NIC (modern virtio,
     // INTx SPI 36) through the SYS_MAP_DEVICE / SYS_IRQ_PENDING syscalls
     // and runs a tiny ARP/ICMP demo against slirp's 10.0.2.2 gateway.
+    //
+    // Phase 12: `ping` / `pong` (both 96) run a tight cross-CPU IPC
+    // ping/pong stress loop (blocking send/receive rendezvous + payload
+    // checksums) — on an SMP boot they migrate across cores, exercising
+    // the scheduler lock, the wakeup pokes and the atomic IRQ-pending
+    // bits every round.
 
     if server::available() {
         let wm = server::spawn_by_name("wm");
@@ -481,9 +465,11 @@ fn kmain() -> ! {
         let shell = server::spawn_by_name("shell");
         let net = server::spawn_by_name("net");
         let hog = server::spawn_by_name("hog");
+        let ping = server::spawn_by_name("ping");
+        let pong = server::spawn_by_name("pong");
         log::info!(
-            "phase 9/10: desktop stack spawned (wm={:?}, ramfs={:?}, shell={:?}, net={:?}, hog={:?})",
-            wm, ramfs, shell, net, hog
+            "phase 9/10: desktop stack spawned (wm={:?}, ramfs={:?}, shell={:?}, net={:?}, hog={:?}, ping={:?}, pong={:?})",
+            wm, ramfs, shell, net, hog, ping, pong
         );
 
         // Enable the EL1 physical-timer interrupt (PPI 30) and arm the

@@ -94,7 +94,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tanix-ping"
+version = "0.1.0"
+dependencies = [
+ "tanix-libsys",
+]
+
+[[package]]
 name = "tanix-pm"
+version = "0.1.0"
+dependencies = [
+ "tanix-libsys",
+]
+
+[[package]]
+name = "tanix-pong"
 version = "0.1.0"
 dependencies = [
  "tanix-libsys",

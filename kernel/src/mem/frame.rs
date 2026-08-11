@@ -179,10 +179,17 @@ impl FrameAllocator {
 
 // ── Global instance ───────────────────────────────────────────────────────────
 
-/// The single global frame allocator.
+/// Serializes allocator access across cores (Phase 12).
 ///
-/// Access is intentionally not locked behind a `Mutex` — Phase 1 and 2 are
-/// single-core; a spinlock will be added in Phase 4 when SMP is considered.
+/// Lock ordering: `FRAME_LOCK` is always taken *inside* `SCHED_LOCK`
+/// (syscalls run under the scheduler lock and may allocate frames); nothing
+/// ever takes `SCHED_LOCK` while holding `FRAME_LOCK`.  IRQs are masked in
+/// every window where the lock can be held (the only unmasked windows — the
+/// `SYS_WAIT_IRQ` wait loop and the secondary idle loop — never allocate),
+/// so a holder is never preempted by a re-entrant allocation.
+static FRAME_LOCK: crate::sync::SpinLock = crate::sync::SpinLock::new();
+
+/// The single global frame allocator.
 static mut FRAME_ALLOC: FrameAllocator = FrameAllocator::new_zeroed();
 
 /// Initialise the global frame allocator.  Call once from `kmain`.
@@ -204,7 +211,10 @@ pub unsafe fn init(kernel_end: PhysAddr) {
 /// # Safety
 /// `init` must have been called.
 pub unsafe fn alloc_frame() -> Option<PhysAddr> {
-    (*core::ptr::addr_of_mut!(FRAME_ALLOC)).alloc()
+    FRAME_LOCK.lock();
+    let r = (*core::ptr::addr_of_mut!(FRAME_ALLOC)).alloc();
+    FRAME_LOCK.unlock();
+    r
 }
 
 /// Allocate `n` contiguous physical frames.  Returns `None` on OOM.
@@ -212,7 +222,10 @@ pub unsafe fn alloc_frame() -> Option<PhysAddr> {
 /// # Safety
 /// `init` must have been called.
 pub unsafe fn alloc_frames(n: usize) -> Option<PhysAddr> {
-    (*core::ptr::addr_of_mut!(FRAME_ALLOC)).alloc_contiguous(n)
+    FRAME_LOCK.lock();
+    let r = (*core::ptr::addr_of_mut!(FRAME_ALLOC)).alloc_contiguous(n);
+    FRAME_LOCK.unlock();
+    r
 }
 
 /// Reserve a range of physical memory so it is never handed out.
@@ -220,7 +233,9 @@ pub unsafe fn alloc_frames(n: usize) -> Option<PhysAddr> {
 /// # Safety
 /// `init` must have been called; the range must not already be in use.
 pub unsafe fn reserve_region(start: PhysAddr, size: usize) {
+    FRAME_LOCK.lock();
     (*core::ptr::addr_of_mut!(FRAME_ALLOC)).reserve_region(start, size);
+    FRAME_LOCK.unlock();
 }
 
 /// Free a physical frame.
@@ -229,5 +244,7 @@ pub unsafe fn reserve_region(start: PhysAddr, size: usize) {
 /// `addr` must have been returned by `alloc_frame` / `alloc_frames` and
 /// must not be freed more than once.
 pub unsafe fn free_frame(addr: PhysAddr) {
+    FRAME_LOCK.lock();
     (*core::ptr::addr_of_mut!(FRAME_ALLOC)).free(addr);
+    FRAME_LOCK.unlock();
 }

@@ -20,6 +20,8 @@ members = [
     "servers/shell",
     "servers/libtanix-drv",
     "servers/net",
+    "servers/ping",
+    "servers/pong",
 ]
 
 [workspace.package]

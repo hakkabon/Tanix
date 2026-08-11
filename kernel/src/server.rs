@@ -74,6 +74,8 @@ static SERVER_BINS: &[(&str, &[u8])] = &[
     ("ramfs", include_bytes!(env!("TANIX_RAMFS_BIN_PATH"))),
     ("shell", include_bytes!(env!("TANIX_SHELL_BIN_PATH"))),
     ("net", include_bytes!(env!("TANIX_NET_BIN_PATH"))),
+    ("ping", include_bytes!(env!("TANIX_PING_BIN_PATH"))),
+    ("pong", include_bytes!(env!("TANIX_PONG_BIN_PATH"))),
 ];
 
 #[cfg(not(feature = "embed-servers"))]
@@ -108,6 +110,8 @@ pub const SERVER_BASES: &[(&str, usize)] = &[
     ("ramfs",   0x4116_0000),
     ("shell",   0x4118_0000),
     ("net",     0x411A_0000),
+    ("ping",    0x411C_0000),
+    ("pong",    0x411E_0000),
 ];
 
 /// Scheduling priority per server (Phase 7) — lower runs first.  The
@@ -128,6 +132,8 @@ pub const SERVER_PRIOS: &[(&str, u8)] = &[
     ("clock",    96),
     ("shell",    96),
     ("net",      96),
+    ("ping",     96),
+    ("pong",     96),
     ("hog",     192),
 ];
 

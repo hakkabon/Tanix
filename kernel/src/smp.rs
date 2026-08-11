@@ -29,7 +29,7 @@ pub const SECONDARY_STACK_SIZE: usize = 0x1_0000; // 64 KiB
 /// first `stp` (16-byte paired store) then raises an alignment fault
 /// (DFSC 0x21) before Rust even runs.
 #[repr(C, align(0x10000))]
-struct SecondaryStacks([u8; SECONDARY_STACK_SIZE * (MAX_CPUS - 1)]);
+pub struct SecondaryStacks([u8; SECONDARY_STACK_SIZE * (MAX_CPUS - 1)]);
 
 #[no_mangle]
 pub static mut SECONDARY_STACKS: SecondaryStacks =
@@ -39,17 +39,23 @@ pub static mut SECONDARY_STACKS: SecondaryStacks =
 pub struct PerCpu {
     /// Scheduler slot this CPU is currently executing (0 = boot context
     /// on CPU 0; the CPU's own idle slot on secondaries).
+    ///
+    /// Written only by the owning CPU (Phase 12: plain, not atomic —
+    /// other cores never read it).
     pub current: usize,
     /// Brought up via PSCI CPU_ON.
-    pub online: bool,
+    ///
+    /// Phase 12: atomic — `set_online` runs on CPU 0 while the poke paths
+    /// (`poke_idle_secondaries` / `poke_other_cpus`) read it from any core.
+    pub online: core::sync::atomic::AtomicBool,
 }
 
 /// Indexed by `cpu_index()`.
 pub static mut CPUS: [PerCpu; MAX_CPUS] = [
-    PerCpu { current: 0, online: false },
-    PerCpu { current: 0, online: false },
-    PerCpu { current: 0, online: false },
-    PerCpu { current: 0, online: false },
+    PerCpu { current: 0, online: core::sync::atomic::AtomicBool::new(false) },
+    PerCpu { current: 0, online: core::sync::atomic::AtomicBool::new(false) },
+    PerCpu { current: 0, online: core::sync::atomic::AtomicBool::new(false) },
+    PerCpu { current: 0, online: core::sync::atomic::AtomicBool::new(false) },
 ];
 
 /// Index of the CPU currently executing this code (MPIDR Aff0).
@@ -79,12 +85,20 @@ pub fn set_current(idx: usize) {
 
 pub fn set_online(cpu: usize) {
     unsafe {
-        core::ptr::write_volatile(&raw mut CPUS[cpu].online, true);
+        core::ptr::addr_of!(CPUS[cpu].online)
+            .as_ref()
+            .unwrap()
+            .store(true, core::sync::atomic::Ordering::Release);
     }
 }
 
 pub fn is_online(cpu: usize) -> bool {
-    unsafe { core::ptr::read_volatile(&raw const CPUS[cpu].online) }
+    unsafe {
+        core::ptr::addr_of!(CPUS[cpu].online)
+            .as_ref()
+            .unwrap()
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
 }
 
 /// The scheduler slot that serves as CPU `cpu`'s idle fallback:
