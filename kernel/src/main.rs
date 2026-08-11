@@ -378,6 +378,70 @@ fn kmain() -> ! {
 
     log::info!("phase 3: VirtIO transport demo complete");
 
+    // ── Phase 13: hypervisor assist — message-queue ping ─────────────────────
+    //
+    // The `Hypervisor` trait now models Gunyah's object set (VM + vCPU
+    // objects, message queues, doorbells, memory extents).  Drive the
+    // message-queue object end-to-end: the primary VM creates a queue for
+    // the guest, publishes a VMM info block (magic + queue handle +
+    // `vmm_service` entry — the EL1 stand-in for an HVC trap) in the
+    // shared shmem region, then plays ping-pong with the guest through the
+    // trait: send ping → run the guest vCPU (it receives via the service
+    // entry and replies) → receive the pong.
+    const VMM_INFO_MAGIC: u32 = 0x564D_4D49; // "IVMM"
+    const VMM_INFO_OFF: usize = 0x2000;
+
+    let mq = hv
+        .msgq_create(guest_handle, 8)
+        .expect("phase 13: msgq_create failed");
+    unsafe {
+        let info = (shmem_phys as usize + VMM_INFO_OFF) as *mut u32;
+        core::ptr::write_volatile(info, VMM_INFO_MAGIC);
+        core::ptr::write_volatile(info.add(1), mq.0);
+        core::ptr::write_volatile(
+            info.add(2) as *mut u64,
+            hypervisor::doorbell::vmm_service as *const () as u64,
+        );
+    }
+    log::info!(
+        "phase 13: VMM info block published (msgq={:?}, service={:#x})",
+        mq,
+        hypervisor::doorbell::vmm_service as *const () as usize
+    );
+
+    for round in 0u32..3 {
+        let text: &[u8] = match round {
+            0 => b"ping-0",
+            1 => b"ping-1",
+            _ => b"ping-2",
+        };
+        hv.msgq_send(mq, text)
+            .expect("phase 13: msgq_send failed");
+
+        unsafe {
+            vm::resume_vm(guest_handle, hv)
+                .expect("phase 13: resume failed");
+        }
+
+        let mut reply = [0u8; hypervisor::MSGQ_MAX_MSG_SIZE];
+        match hv.msgq_recv(mq, &mut reply) {
+            Ok((n, _)) => {
+                let got = core::str::from_utf8(&reply[..n]).unwrap_or("?");
+                log::info!("phase 13: round {} — '{}' received", round, got);
+            }
+            Err(e) => {
+                log::warn!("phase 13: round {} — no reply ({:?})", round, e);
+            }
+        }
+    }
+
+    // One final resume so the guest can print its completion banner.
+    unsafe {
+        vm::resume_vm(guest_handle, hv)
+            .expect("phase 13: final resume failed");
+    }
+    log::info!("phase 13: message-queue ping complete");
+
     // ── Phase 4: Minix-style server processes ─────────────────────────────────
     //
     // The kernel now boots a set of independent server binaries (init, pm,

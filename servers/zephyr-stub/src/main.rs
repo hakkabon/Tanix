@@ -76,6 +76,23 @@ const OFF_USED:   usize = 0x1000;
 const OP_PRINT: u8 = 0x01;
 const OP_ECHO:  u8 = 0x02;
 
+// ── Phase 13: VMM info block (kernel publishes into the shmem region) ────────
+
+/// Info block offset in the shared-memory region: u32 magic, u32 msgq
+/// handle, u64 `vmm_service` address.
+const VMM_INFO_OFF: usize = 0x2000;
+const VMM_INFO_MAGIC: u32 = 0x564D_4D49; // "IVMM"
+
+/// Guest -> VMM service function ids (mirror `tanix_hvc` in the kernel).
+const TANIX_MSGQ_SEND: u64 = 0x8600_0003;
+const TANIX_MSGQ_RECV: u64 = 0x8600_0004;
+const TANIX_HVC_ERR:   u64 = u64::MAX;
+
+unsafe fn vmm_info_ready(base: *mut u8) -> bool {
+    let magic = core::ptr::read_volatile(base.add(VMM_INFO_OFF) as *const u32);
+    magic == VMM_INFO_MAGIC
+}
+
 // ── VirtIO ring accessors (volatile reads/writes only) ────────────────────────
 
 /// Read the avail-ring index (offset 2: flags is a u16 before it).
@@ -222,6 +239,69 @@ pub extern "C" fn _start() -> ! {
         // No more work — hand control back to the kernel.  Returns when the
         // kernel posts the next Print and resumes us.
         unsafe { yield_fn(guest_ctx as usize) };
+
+        // Phase 13: the kernel may have published the VMM info block
+        // (message-queue demo); if so, leave the VirtIO loop.
+        if unsafe { vmm_info_ready(base) } {
+            break;
+        }
+    }
+
+    if unsafe { vmm_info_ready(base) } {
+        // ── Phase 13: Gunyah-style message-queue ping ──────────────────────────
+        // The kernel (primary VM) created a message queue and published the
+        // handle + the `vmm_service` entry (the EL1 stand-in for an HVC
+        // trap; same function ABI as the real Gunyah hypercall path) in the
+        // info block.  Each round: receive the kernel's ping (the kernel
+        // sends before resuming us), verify, reply, yield.
+        unsafe {
+        let info = base.add(VMM_INFO_OFF);
+        let mq_handle: u32 =
+            core::ptr::read_volatile(info.add(4) as *const u32);
+        let service_addr: u64 =
+            core::ptr::read_volatile(info.add(8) as *const u64);
+        let service: unsafe extern "C" fn(u64, u64, u64, u64) -> u64 =
+            core::mem::transmute(service_addr);
+
+        puts("[Zephyr-stub] Phase 13: message-queue ping\n");
+
+        let mut buf = [0u8; 96];
+        for round in 0u32..3 {
+            // Receive the kernel's ping.  Wait (yield) while the queue is
+            // empty — the kernel refills it between resumes.
+            let n = loop {
+                let r = service(TANIX_MSGQ_RECV, mq_handle as u64,
+                                buf.as_mut_ptr() as u64, 96);
+                if r != TANIX_HVC_ERR {
+                    break r as usize;
+                }
+                yield_fn(guest_ctx as usize);
+            };
+
+            puts("[Zephyr-stub] msgq: received ");
+            for &b in &buf[..n.min(buf.len())] {
+                putc(b);
+            }
+            puts("\n");
+
+            // Reply with the matching pong.
+            let reply: &[u8] = match round {
+                0 => b"pong-0",
+                1 => b"pong-1",
+                _ => b"pong-2",
+            };
+            let _ = service(TANIX_MSGQ_SEND, mq_handle as u64,
+                            reply.as_ptr() as u64, reply.len() as u64);
+
+            // Hand control back so the kernel can collect the reply.
+            yield_fn(guest_ctx as usize);
+        }
+
+        puts("[Zephyr-stub] Phase 13: msgq ping complete — halting\n");
+        }
+        loop {
+            core::hint::spin_loop();
+        }
     }
 
     puts("[Zephyr-stub] VirtIO loop complete — halting\n");

@@ -26,7 +26,7 @@ input injected through QEMU's QMP monitor.
 | 3 | VirtIO transport between kernel and guest VM (shmem + virtqueue) | ✅ done |
 | 4 | Minix-style server processes (init, pm, mem, dev, worker) | ✅ done |
 | 5 | Display/UI stack: virtio-gpu framebuffer + virtio-tablet pointer, driven by a Minix-style display server | ✅ done |
-| 6 | Hypervisor assist (Gunyah-style) | 🔭 planned |
+| 6 | Hypervisor assist (Gunyah-style) | ✅ done |
 | 7 | Preemptive priority scheduler + device IRQs (timer tick, GIC PPIs/SPIs, `SYS_WAIT_IRQ` for virtio devices) | ✅ done |
 
 ---
@@ -51,6 +51,10 @@ kernel/                  the microkernel itself (no_std, freestanding binary)
     mod.rs               backend selection (BareMetal vs Gunyah)
     backend.rs           Hypervisor trait (vm_create/start/resume, shmem, doorbell)
     doorbell.rs          SGI doorbell register/dispatch
+    gunyah.rs            Gunyah backend: real `hvc #0` hypercall ABI (capabilities,
+                         msgq_create/send/recv, vcpu_run)
+    message_queue.rs     Gunyah-style message-queue object (primary VM side)
+    msgq_abi.rs          queue in-memory layout shared with the guest
   src/virtio/            shared-memory transport
     channel.rs           Print/Echo message format (opcodes, framing)
     transport.rs         kernel-side virtqueue driver (send/poll)
@@ -65,7 +69,8 @@ kernel/                  the microkernel itself (no_std, freestanding binary)
   link.ld                kernel image layout (load at 0x4008_0000)
   build.rs               linker args; emits embedded-binary paths
 servers/zephyr-stub/     the Phase-3 guest: a tiny Zephyr-like RTOS PoC
-  src/main.rs            cooperative device loop, VirtIO device side
+  src/main.rs            cooperative device loop, VirtIO device side,
+                         Phase-13 message-queue ping (vmm_service entry)
 servers/libtanix-sys/    shared no_std crate: syscall table, Message/ABI (BootInfo)
 servers/init/            root server: spawns pm/mem/dev, drives the demo
 servers/pm/              process manager (spawn/exec via syscall)
