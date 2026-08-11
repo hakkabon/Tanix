@@ -201,19 +201,23 @@ pub extern "C" fn sync_handler(esr: u64, elr: u64, _far: u64, sp: u64) {
 
     match ec {
         EC_HVC64 => {
-            // The guest's x0 (function ID) and x1 (argument) are in the
-            // saved frame — the stub has already clobbered the live
-            // registers with ESR/ELR/etc.
+            // The guest's x0-x3 (function ID + arguments) are in the saved
+            // frame — the stub has already clobbered the live registers
+            // with ESR/ELR/etc.
             let frame = sp as *const u64;
-            let func = unsafe { core::ptr::read_volatile(frame) };
-            let arg1 = unsafe { core::ptr::read_volatile(frame.add(1)) };
+            let args = [
+                unsafe { core::ptr::read_volatile(frame) },
+                unsafe { core::ptr::read_volatile(frame.add(1)) },
+                unsafe { core::ptr::read_volatile(frame.add(2)) },
+                unsafe { core::ptr::read_volatile(frame.add(3)) },
+            ];
 
-            // Dispatch through the doorbell handler.
+            // Dispatch through the VMM service handler.
             // get_backend() returns the same singleton instance as
             // detect_backend().
             let ret = {
                 let hv = crate::hypervisor::get_backend();
-                crate::hypervisor::doorbell::handle_hvc(func, arg1, hv)
+                crate::hypervisor::doorbell::handle_hvc(args, hv)
             };
 
             // Write the return value into the guest's x0 slot.
