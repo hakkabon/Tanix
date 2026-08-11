@@ -1,0 +1,7 @@
+[package]
+name = "tanix-libnet"
+version.workspace = true
+edition.workspace = true
+description = "Tanix Phase-11 socket layer: IPv4/IP/ARP/ICMP + TCP + UDP, no_std, host-testable"
+
+[dependencies]

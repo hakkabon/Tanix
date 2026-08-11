@@ -182,3 +182,26 @@ check:
 # Remove build artefacts
 clean:
     cargo clean
+
+# Build the Phase-11 socket layer (libtanix-net + net server)
+servers-phase11: servers-phase10
+    cargo build --package tanix-libnet --package tanix-net --target {{TARGET}}
+
+# Build the kernel with the Phase-11 socket stack embedded
+kernel-phase11: servers-phase11
+    cargo build --package {{KERNEL_PKG}} --target {{TARGET}} \
+        --features embed-servers
+
+# Build with the Phase-11 socket stack embedded and run in QEMU — ARP/ping
+# probes plus the wire paths: UDP hostfwd in on 5555, UDP markers out on
+# 5557, TCP echo listener on 7777, outbound TCP markers to 7778
+qemu-phase11: kernel-phase11
+    ./scripts/qemu.sh -device virtio-gpu-device -device virtio-tablet-device \
+        -device virtio-keyboard-device \
+        -device virtio-net-pci,netdev=n0,disable-legacy=on \
+        -netdev user,id=n0,hostfwd=udp::5555-:5555,hostfwd=udp::5557-:5557,hostfwd=tcp::7777-:7777,hostfwd=tcp::7778-:7778
+
+# Phase-11 e2e: boots the socket-stack kernel, then drives each wire path
+# from the host (UDP in/out, TCP echo, TCP out) and asserts the results
+net-test: kernel-phase11
+    ./scripts/net-test.sh

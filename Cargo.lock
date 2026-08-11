@@ -68,6 +68,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tanix-libnet"
+version = "0.1.0"
+
+[[package]]
 name = "tanix-libsys"
 version = "0.1.0"
 
@@ -90,6 +94,7 @@ name = "tanix-net"
 version = "0.1.0"
 dependencies = [
  "tanix-libdrv",
+ "tanix-libnet",
  "tanix-libsys",
 ]
 
