@@ -31,6 +31,7 @@ pub const SYS_SLEEP: u64 = 13; // Phase 8: block for `ms` scheduler ticks
 pub const SYS_EXEC: u64 = 14; // Phase 9: exec an embedded app image (replaces a live instance)
 pub const SYS_MAP_DEVICE: u64 = 15; // Phase 10: identity-map a device-MMIO window (PCI ECAM/BARs)
 pub const SYS_IRQ_PENDING: u64 = 16; // Phase 10: non-blocking "device IRQ delivered?" poll
+pub const SYS_CACHE_SYNC: u64 = 17; // Phase 16: clean/invalidate caches after DMA ownership transfer
 
 /// Invoke syscall `nr` with arguments `a0..a2`; returns the kernel's x0.
 ///
@@ -167,6 +168,16 @@ pub fn exec(name: &str) -> i32 {
 /// on success, negative errno otherwise.
 pub fn map_device(phys: u64, pages: u32) -> i32 {
     unsafe { raw_syscall(SYS_MAP_DEVICE, phys, pages as u64, 0) as i32 }
+}
+
+/// `cache_sync()` — Phase 16.  Cache-coherency barrier: clears the
+/// instruction caches and issues data/pipeline barriers.  A driver calls
+/// this after the CPU writes a DMA ring/descriptor owned by a device (and
+/// after the device's DMA lands before the CPU reads it).  QEMU's devices
+/// are coherent, so this is a no-op in practice there — but real SoCs
+/// (the sbsa-ref / SBSA story this syscall exists for) are not.
+pub fn cache_sync() -> i32 {
+    unsafe { raw_syscall(SYS_CACHE_SYNC, 0, 0, 0) as i32 }
 }
 
 /// `log(level, msg)` — kernel log line, prefixed with this server's name.

@@ -1,10 +1,18 @@
 pub mod boot;
+pub mod cache;
 pub mod exception;
+pub mod fdt;
 pub mod gic;
+pub mod machine;
 pub mod mmu;
+pub mod monitor;
 pub mod psci;
 pub mod timer;
 pub mod uart;
+
+/// The platform this kernel was built for (`virt` by default, `sbsa-ref`
+/// with `--features sbsa-ref`).
+pub use machine::machine;
 
 /// Initialise all aarch64 subsystems in dependency order.
 ///

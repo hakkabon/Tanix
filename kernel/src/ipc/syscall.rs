@@ -64,6 +64,7 @@ pub const SYS_SLEEP: u64 = 13; // Phase 8: block until the tick counter passes a
 pub const SYS_EXEC: u64 = 14; // Phase 9: exec an embedded app image (replaces a running instance)
 pub const SYS_MAP_DEVICE: u64 = 15; // Phase 10: identity-map a device-MMIO window (PCI ECAM/BARs)
 pub const SYS_IRQ_PENDING: u64 = 16; // Phase 10: non-blocking "device IRQ delivered?" poll
+pub const SYS_CACHE_SYNC: u64 = 17; // Phase 16: clean/invalidate caches after DMA ownership transfer
 
 // ── Active TTBR0 helpers ──────────────────────────────────────────────────────
 
@@ -596,6 +597,27 @@ unsafe fn sys_wait_irq(irq: u32) -> i32 {
     0
 }
 
+/// Phase 16: cache-coherency barrier for DMA transfers — the kernel side
+/// of SYS_CACHE_SYNC.  A device that DMA'd into memory must be handed the
+/// CPU through a clean/invalidate; a buffer handed to a device needs the
+/// CPU writes cleaned first.  QEMU's emulated devices are coherent, but a
+/// real SoC is not, so the kernel flushes the instruction caches and
+/// full pipeline + data barriers (the calling task's data range lives in
+/// its own address space; a global barrier is the safe one-size-fits-all
+/// for a microkernel syscall that takes no address).
+fn sys_cache_sync() -> u64 {
+    unsafe {
+        core::arch::asm!(
+            "dsb ish",
+            "ic iallu",
+            "dsb ish",
+            "isb",
+            options(nostack)
+        );
+    }
+    0
+}
+
 /// `irq_pending(irq) -> 1|0` — Phase 10.  Non-blocking sibling of
 /// `wait_irq`: arms the interrupt and reports whether it has been
 /// delivered since the last call, without sleeping.  Lets a server run an
@@ -712,6 +734,7 @@ pub unsafe extern "C" fn tanix_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> u6
         SYS_EXEC => sys_exec(a0 as *const u8) as u64,
         SYS_MAP_DEVICE => sys_map_device(a0, a1) as u64,
         SYS_IRQ_PENDING => sys_irq_pending(a0 as u32) as u64,
+        SYS_CACHE_SYNC => sys_cache_sync(),
         SYS_LOG => {
             sys_log(a0 as u32, a1 as *const u8);
             0

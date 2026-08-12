@@ -1,9 +1,10 @@
 //! PL011 UART driver — minimal polling output for kernel logging.
 //!
-//! QEMU `virt` exposes a PL011 at physical address 0x0900_0000.
-//! QEMU pre-initialises the UART, so we can write bytes immediately without
-//! programming the baud-rate divisors.  A full init sequence is included
-//! anyway so the driver works on real hardware.
+//! QEMU `virt` exposes a PL011 at physical address 0x0900_0000; the
+//! `sbsa-ref` machine places its PL011 at 0x6000_0000 (Phase 16 — see
+//! `machine.rs`).  QEMU pre-initialises the UART, so we can write bytes
+//! immediately without programming the baud-rate divisors.  A full init
+//! sequence is included anyway so the driver works on real hardware.
 //!
 //! This module also implements the `log::Log` trait so the kernel can use the
 //! standard `log::{info, warn, error, …}` macros.
@@ -16,16 +17,26 @@
 use core::fmt;
 use log::{Level, LevelFilter, Metadata, Record};
 
+use super::machine;
+
 // ── Register map ─────────────────────────────────────────────────────────────
 
-const UART0_BASE: usize = 0x0900_0000;
+fn uart0_base() -> usize {
+    machine::machine().uart_base
+}
 
-const DR: usize = UART0_BASE; // Data Register
-const FR: usize = UART0_BASE + 0x18; // Flag Register
-const IBRD: usize = UART0_BASE + 0x24; // Integer Baud Rate Divisor
-const FBRD: usize = UART0_BASE + 0x28; // Fractional Baud Rate Divisor
-const LCR_H: usize = UART0_BASE + 0x2C; // Line Control Register
-const CR: usize = UART0_BASE + 0x30; // Control Register
+const DR: usize = 0; // Data Register
+const FR: usize = 0x18; // Flag Register
+const IBRD: usize = 0x24; // Integer Baud Rate Divisor
+const FBRD: usize = 0x28; // Fractional Baud Rate Divisor
+const LCR_H: usize = 0x2C; // Line Control Register
+const CR: usize = 0x30; // Control Register
+
+/// Absolute address of a PL011 register on the current machine.
+#[inline]
+fn uart_reg(off: usize) -> usize {
+    uart0_base() + off
+}
 
 // FR bits
 const FR_TXFF: u32 = 1 << 5; // TX FIFO full
@@ -41,6 +52,7 @@ const LCR_H_FEN: u32 = 1 << 4; // FIFO enable
 const LCR_H_WLEN_8: u32 = 0b11 << 5; // 8-bit word length
 
 #[inline]
+#[inline]
 fn mmio_write(addr: usize, val: u32) {
     unsafe { core::ptr::write_volatile(addr as *mut u32, val) }
 }
@@ -50,28 +62,40 @@ fn mmio_read(addr: usize) -> u32 {
     unsafe { core::ptr::read_volatile(addr as *const u32) }
 }
 
+/// Read a PL011 register (offset from the machine's UART base).
+#[inline]
+fn rd_reg(off: usize) -> u32 {
+    mmio_read(uart_reg(off))
+}
+
+/// Write a PL011 register (offset from the machine's UART base).
+#[inline]
+fn wr_reg(off: usize, val: u32) {
+    mmio_write(uart_reg(off), val);
+}
+
 // ── Low-level byte output ─────────────────────────────────────────────────────
 
 /// Initialise the PL011.  Safe to call multiple times (idempotent).
 pub fn init() {
     // Disable the UART before reconfiguring.
-    mmio_write(CR, 0);
+    wr_reg(CR, 0);
 
     // Wait for any in-progress transmission to finish.
-    while mmio_read(FR) & FR_BUSY != 0 {
+    while rd_reg(FR) & FR_BUSY != 0 {
         core::hint::spin_loop();
     }
 
     // Baud rate: 115200 at 24 MHz UART clock (QEMU default for virt).
     //   IBRD = 13, FBRD = 1  →  115384 baud (close enough)
-    mmio_write(IBRD, 13);
-    mmio_write(FBRD, 1);
+    wr_reg(IBRD, 13);
+    wr_reg(FBRD, 1);
 
     // 8-N-1, FIFO enabled.
-    mmio_write(LCR_H, LCR_H_WLEN_8 | LCR_H_FEN);
+    wr_reg(LCR_H, LCR_H_WLEN_8 | LCR_H_FEN);
 
     // Enable UART, TX, RX.
-    mmio_write(CR, CR_UARTEN | CR_TXE | CR_RXE);
+    wr_reg(CR, CR_UARTEN | CR_TXE | CR_RXE);
 }
 
 /// Serializes `puts` / `putc` across cores (Phase 11).
@@ -80,10 +104,10 @@ static UART_LOCK: crate::sync::SpinLock = crate::sync::SpinLock::new();
 /// Write a single byte, blocking until the TX FIFO has space.
 #[inline]
 fn putc_locked(byte: u8) {
-    while mmio_read(FR) & FR_TXFF != 0 {
+    while rd_reg(FR) & FR_TXFF != 0 {
         core::hint::spin_loop();
     }
-    mmio_write(DR, byte as u32);
+    wr_reg(DR, byte as u32);
 }
 
 /// Mask IRQs and return the previous DAIF register (so the caller can

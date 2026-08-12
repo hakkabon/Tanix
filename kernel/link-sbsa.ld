@@ -2,18 +2,19 @@ OUTPUT_ARCH(aarch64)
 ENTRY(_start)
 
 /*
- * QEMU virt machine memory map (aarch64):
- *   0x40000000  DDR start
- *   0x40080000  Kernel load address (matches QEMU -kernel default for virt)
+ * QEMU sbsa-ref machine memory map (aarch64) — Phase 16:
+ *   0x10000000000  DDR start (1 TiB-aligned; -m 1G default)
+ *   0x10000080000  Kernel load address (ELF is loaded at its link address)
  *
  * Stack: grows downward from __stack_top = load_addr + 64K.
  * The stack sits in the 64 KiB window *before* the kernel .text, which is
- * always available on a freshly booted virt machine.
+ * always available on a freshly booted sbsa-ref machine (RAM starts at
+ * 0x10000000000).
  */
 
 SECTIONS
 {
-    . = 0x40080000;
+    . = 0x10000080000;
     __kernel_start = .;
 
     .text : {
@@ -55,9 +56,9 @@ SECTIONS
 
     /*
      * Phase 16: secure-world payload (vectors + code + data), copied by the
-     * EL3 monitor into secure RAM on `sbsa-ref` (runs in place on `virt`).
-     * Must be position-independent and self-contained: the whole section is
-     * relocated as one blob.
+     * EL3 monitor into secure RAM at 0x20000000 (trust boundary: NS code
+     * cannot reach it).  Must be position-independent and self-contained:
+     * the whole section is relocated as one blob.
      */
     . = ALIGN(0x8000);
     .sec_payload : {
@@ -80,4 +81,4 @@ SECTIONS
  * Stack lives in the 64 KiB below the kernel load address.
  * __stack_top is the initial SP value: the stack grows downward from here.
  */
-__stack_top = 0x40080000;
+__stack_top = 0x10000080000;

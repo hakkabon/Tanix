@@ -58,9 +58,16 @@ static ZEPHYR_STUB_BIN: &[u8] = &[
 // while the whole kernel targets EL1.  We therefore drop EL3 -> EL2 -> EL1
 // and only then set SP (the reset value is 0, so any stack use before this
 // point faults) and jump into Rust.
+//
+// Phase 16: the `sbsa-ref` machine resets every CPU at EL3 with QEMU's
+// PSCI disabled — the kernel's EL3 monitor is the firmware.  Its `_start`
+// saves the DTB pointer (x0) into x24, runs the monitor (`monitor_el3_init`)
+// from the EL3 stack, and the primary continues at EL1 here with the DTB
+// still in x24, passed to `kmain_entry`.
 
 use core::arch::global_asm;
 
+#[cfg(not(feature = "sbsa-ref"))]
 global_asm!(
     r#"
     .section .text._start, "ax"
@@ -109,15 +116,53 @@ _start:
     add  x0, x0, :lo12:__stack_top
     mov  sp, x0
     b    kmain_entry
+    "#
+);
+
+#[cfg(feature = "sbsa-ref")]
+global_asm!(
+    r#"
+    .section .text._start, "ax"
+    .global _start
+_start:
+    // Save the DTB pointer (x0 from QEMU) before touching any register.
+    mov  x24, x0
+    // At EL3 with SPsel=0: switch to SP_EL3 and set up the monitor stack.
+    msr  SPSel, #1
+    adrp x0, __el3_stack_top
+    add  x0, x0, :lo12:__el3_stack_top
+    mov  sp, x0
+    // Call the EL3 monitor: (dtb, is_secondary, el1_entry).  It erets to
+    // `1:` below (primary) or to the EL3 park loop (secondary).
+    adr  x2, 1f
+    mov  x0, x24
+    mov  x1, #0
+    bl   monitor_el3_init
+
+1:  // NS EL1h continuation (primary only): SIMD/FP + kernel stack.
+    mov  x1, #3
+    lsl  x1, x1, #20
+    msr  CPACR_EL1, x1
+    isb
+    adrp x0, __stack_top
+    add  x0, x0, :lo12:__stack_top
+    mov  sp, x0
+    mov  x0, x24         // DTB still valid — hand it to kmain_entry
+    b    kmain_entry
+    "#
+);
 
 // ── Secondary-CPU entry (Phase 11 SMP) ─────────────────────────────────────────
 //
-// QEMU's PSCI CPU_ON starts secondaries at EL2 with PC = this symbol.
-// They drop EL2 -> EL1 (the same sequence as `_start`'s `2:` path), select
-// their own boot stack from `SECONDARY_STACKS` (indexed by MPIDR Aff0),
-// and continue in `kmain_secondary_entry`.  BSS is already zeroed by the
-// primary — secondaries must NOT re-zero it.
+// QEMU's PSCI CPU_ON starts secondaries at EL2 with PC = this symbol (our
+// EL3 monitor starts them at EL1 directly).  They drop EL2 -> EL1 (the
+// same sequence as `_start`'s `2:` path), select their own boot stack from
+// `SECONDARY_STACKS` (indexed by MPIDR Aff0), and continue in
+// `kmain_secondary_entry`.  BSS is already zeroed by the primary —
+// secondaries must NOT re-zero it.
 
+global_asm!(
+    r#"
 .section .text._start_secondary, "ax"
 .global secondary_entry
 .type secondary_entry, %function
@@ -189,8 +234,12 @@ secondary_entry:
 
 /// Rust-side boot continuation, reached from the `_start` stub with a valid
 /// stack and SP pointing at `__stack_top`.  Zeroes BSS and enters `kmain`.
+///
+/// Phase 16: `dtb` is the flattened device-tree pointer passed by QEMU in
+/// x0 (both machines); on `virt` it is 0 when QEMU was started without a
+/// DT (the machine table supplies the defaults).
 #[no_mangle]
-pub extern "C" fn kmain_entry() -> ! {
+pub extern "C" fn kmain_entry(dtb: usize) -> ! {
     unsafe {
         extern "C" {
             static __bss_start: u8;
@@ -207,7 +256,7 @@ pub extern "C" fn kmain_entry() -> ! {
             options(nomem, nostack)
         );
     }
-    kmain();
+    kmain(dtb);
 }
 
 /// Rust-side continuation for secondary CPUs, reached from `secondary_entry`
@@ -250,7 +299,7 @@ pub extern "C" fn kmain_secondary_entry() -> ! {
 
 // ── Kernel main ───────────────────────────────────────────────────────────────
 
-fn kmain() -> ! {
+fn kmain(dtb: usize) -> ! {
     // ── Phase 1: hardware ────────────────────────────────────────────────────
     arch::aarch64::init();
 
@@ -261,8 +310,25 @@ fn kmain() -> ! {
     };
     log::info!("kernel image ends at {:#x}", kernel_end);
 
-    unsafe { mem::frame::init(kernel_end); }
-    unsafe { mem::page_table::enable(); }
+    // Phase 16: RAM bounds come from the DT where present (`virt` publishes
+    // /memory; `sbsa-ref`'s minimal DT has none, so the machine table wins)
+    // and feed the frame allocator + page tables — the whole point of the
+    // DT parse: a physical board hands the kernel its memory layout at boot.
+    let machine = arch::aarch64::machine();
+    let (ram_base, ram_size) = arch::aarch64::fdt::dram_region(dtb)
+        .map(|r| (r.base, r.size))
+        .unwrap_or((machine.dram_base, machine.dram_size));
+    log::info!(
+        "machine {}: DDR {:#x}..{:#x} ({} MiB, dtb={:#x})",
+        machine.id,
+        ram_base,
+        ram_base + ram_size,
+        ram_size / (1024 * 1024),
+        dtb
+    );
+
+    unsafe { mem::frame::init(kernel_end, ram_base, ram_size); }
+    unsafe { mem::page_table::enable(ram_base, ram_size); }
 
     // Reserve the server regions in the frame allocator *before* any
     // dynamic allocation (shmem, guest RAM, framebuffers): the regions are
@@ -590,6 +656,43 @@ fn kmain() -> ! {
         );
     }
 
+    // ── Phase 16: EL3 monitor / TrustZone demo ────────────────────────────────
+    //
+    // On `sbsa-ref` this exercises the real hardware story: the kernel's
+    // PSCI and every secure service below cross the EL3 monitor through
+    // `smc #0`, the secure payload runs at S-EL1 in TrustZone secure RAM
+    // (its own console is QEMU's second `-serial`), and the tick counts
+    // are produced by the secure EL1 physical timer (PPI 29, Group 0).
+    // On `virt` the same code path runs (the payload executes in place —
+    // QEMU's `virt` has no EL3 monitor of our own, so the calls trap to
+    // QEMU's emulated PSCI for the PSCI ids and to our monitor-less
+    // fallback for the rest; the demo therefore only runs on sbsa-ref).
+    if arch::aarch64::machine().id == arch::aarch64::machine::MACHINE_SBSA_REF {
+        let kernel_start = {
+            extern "C" { static __kernel_start: u8; }
+            core::ptr::addr_of!(__kernel_start) as usize
+        };
+        let local = fnv1a(kernel_start, kernel_end);
+        let measured = arch::aarch64::monitor::secure_measure_smc(kernel_start, kernel_end - kernel_start);
+        log::info!(
+            "phase 16: TCB measurement of kernel image \
+             ({:#x}..{:#x}): monitor={:#x} local={:#x} {}",
+            kernel_start, kernel_end, measured, local,
+            if measured == local { "match" } else { "MISMATCH" }
+        );
+        log::info!("phase 16: PSCI version via monitor: {:#x}", arch::aarch64::monitor::psci_version_smc());
+        log::info!("phase 16: secure monotonic counter: {}", arch::aarch64::monitor::secure_counter_incr());
+        arch::aarch64::monitor::secure_banner();
+        // Two secure-world sessions: the payload counts secure timer ticks
+        // (~50 ms each) for 2500 loop iterations, then hands back.
+        let ticks = arch::aarch64::monitor::world_switch(2_500, 1);
+        log::info!("phase 16: secure world ran and counted {} ticks", ticks);
+        log::info!(
+            "phase 16: secure tick counter now {}",
+            arch::aarch64::monitor::secure_tick_get()
+        );
+    }
+
     // ── Phase 5: display stack ────────────────────────────────────────────────
     //
     // The kernel boots the display server (owns the QEMU virtio-gpu
@@ -599,8 +702,12 @@ fn kmain() -> ! {
     // course.  The Phase-8 window manager and the apps are spawned after
     // this block; `display` is highest-priority (32) so it initialises the
     // GPU before wm or any app runs.
+    //
+    // Phase 16: the whole display family is `virt`-only — `sbsa-ref` has
+    // no virtio-mmio transports, and the `display`/`wm`/`shell` images
+    // probe the QEMU-virt MMIO window they are built for.
 
-    if server::available() {
+    if server::available() && !arch::aarch64::machine::is_sbsa_ref() {
         let display = server::spawn_by_name("display");
         log::info!(
             "phase 5: display server spawned (display={:?})",
@@ -637,16 +744,25 @@ fn kmain() -> ! {
     // bits every round.
 
     if server::available() {
-        let wm = server::spawn_by_name("wm");
-        let ramfs = server::spawn_by_name("ramfs");
-        let shell = server::spawn_by_name("shell");
+        // Phase 16: on `sbsa-ref` skip the display-family servers (no
+        // virtio-mmio, no GPU) — net/hog/ping/pong are machine-agnostic.
+        let is_virt = !arch::aarch64::machine::is_sbsa_ref();
+        if is_virt {
+            let wm = server::spawn_by_name("wm");
+            let ramfs = server::spawn_by_name("ramfs");
+            let shell = server::spawn_by_name("shell");
+            log::info!(
+                "phase 9: desktop servers spawned (wm={:?}, ramfs={:?}, shell={:?})",
+                wm, ramfs, shell
+            );
+        }
         let net = server::spawn_by_name("net");
         let hog = server::spawn_by_name("hog");
         let ping = server::spawn_by_name("ping");
         let pong = server::spawn_by_name("pong");
         log::info!(
-            "phase 9/10: desktop stack spawned (wm={:?}, ramfs={:?}, shell={:?}, net={:?}, hog={:?}, ping={:?}, pong={:?})",
-            wm, ramfs, shell, net, hog, ping, pong
+            "phase 9/10: core servers spawned (net={:?}, hog={:?}, ping={:?}, pong={:?})",
+            net, hog, ping, pong
         );
 
         // Enable the EL1 physical-timer interrupt (PPI 30) and arm the
@@ -689,4 +805,18 @@ fn guest_info_state(shmem_phys: usize) -> u32 {
             (shmem_phys as usize + VMM_INFO_OFF + STATE_OFF) as *const u32,
         )
     }
+}
+
+/// Phase 16: FNV-1a 64 over a memory region — the *local* reference hash
+/// the kernel computes to verify the EL3 monitor's TCB measurement.
+fn fnv1a(base: usize, len: usize) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+    const FNV_PRIME: u64 = 0x100_0000_01B3;
+    let mut hash = FNV_OFFSET;
+    for i in 0..len {
+        let b = unsafe { core::ptr::read_volatile((base + i) as *const u8) };
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }

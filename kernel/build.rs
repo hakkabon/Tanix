@@ -11,7 +11,12 @@ fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
 
     // Link with the kernel linker script (entry point, sections, stack).
-    let linker_script = manifest_dir.join("link.ld");
+    // Phase 16: the `sbsa-ref` machine links at its own DDR base.
+    let linker_script = if std::env::var_os("CARGO_FEATURE_SBSA_REF").is_some() {
+        manifest_dir.join("link-sbsa.ld")
+    } else {
+        manifest_dir.join("link.ld")
+    };
     println!("cargo:rerun-if-changed={}", linker_script.display());
     println!("cargo:rustc-link-arg=-T{}", linker_script.display());
     println!("cargo:rustc-link-arg=--entry=_start");

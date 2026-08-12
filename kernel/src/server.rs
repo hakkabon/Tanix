@@ -49,12 +49,15 @@ pub const USER_STACK_SIZE: usize = 16 * 1024;
 
 /// virtio-mmio window granted to the display server: 32 transports × 0x200
 /// bytes, all within 16 KiB (see `servers/display/src/virtio.rs`).
+/// `virt` only — `sbsa-ref` has no virtio-mmio (Phase 16).
 const DISPLAY_MMIO_BASE: usize = 0x0A00_0000;
 const DISPLAY_MMIO_SIZE: usize = 32 * 0x200;
 
 /// PL011 UART0 page granted to the `dev` server (its `M_DEV_WRITE` service
-/// writes the console directly).
-const UART0_BASE: usize = 0x0900_0000;
+/// writes the console directly).  Machine-aware (Phase 16).
+fn dev_uart_base() -> usize {
+    crate::arch::aarch64::machine().uart_base
+}
 
 // ── Embedded binaries ─────────────────────────────────────────────────────────
 
@@ -203,21 +206,30 @@ pub fn spawn_by_name_locked(name: &str) -> Result<TaskId, i32> {
             page_table::FLAGS_USER_RWX,
         );
         if name == "display" {
-            page_table::map_user_pages(
-                ttbr0,
-                DISPLAY_MMIO_BASE,
-                DISPLAY_MMIO_SIZE,
-                page_table::FLAGS_USER_DEVICE,
-            );
+            // `sbsa-ref` has no virtio-mmio transports; the display
+            // server simply finds no GPU there (Phase 16).
+            if DISPLAY_MMIO_BASE != 0 {
+                page_table::map_user_pages(
+                    ttbr0,
+                    DISPLAY_MMIO_BASE,
+                    DISPLAY_MMIO_SIZE,
+                    page_table::FLAGS_USER_DEVICE,
+                );
+            }
         }
         if name == "dev" {
-            page_table::map_user_pages(ttbr0, UART0_BASE, PAGE_SIZE, page_table::FLAGS_USER_DEVICE);
+            page_table::map_user_pages(
+                ttbr0,
+                dev_uart_base(),
+                PAGE_SIZE,
+                page_table::FLAGS_USER_DEVICE,
+            );
         }
     }
 
     let kernel_stack_top = base + ram_size;
     let sp_el0 = boot_page + PAGE_SIZE + USER_STACK_SIZE;
-    let boot = BootInfo { task_id: 0 };
+    let boot = BootInfo { task_id: 0, machine: crate::arch::aarch64::machine::machine().id };
     let id = unsafe {
         spawn_server_user_locked(
             name,

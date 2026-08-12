@@ -341,6 +341,9 @@ pub unsafe fn map_user_pages(root: PhysAddr, va: usize, size: usize, flags: u64)
         (*l3).set_entry(l3_idx(cur), (cur as u64) | flags);
         offset += PAGE_SIZE;
     }
+    // Real hardware (Phase 16): the table writes above are plain stores;
+    // make them globally visible, then drop stale TLB entries.
+    super::super::arch::aarch64::cache::tlb_flush_all();
 }
 
 /// Patch the flags of a 2 MiB block descriptor in the table rooted at
@@ -357,6 +360,8 @@ pub unsafe fn set_user_block(root: PhysAddr, va: usize, flags: u64) {
     let e = (*l2).entry(l2_idx(va));
     assert!(e & DESC_VALID != 0 && e & DESC_TABLE == 0, "set_user_block: no block");
     (*l2).set_entry(l2_idx(va), (e & 0x0000_FFFF_FFFF_F000) | flags);
+    // Real hardware (Phase 16): flush the TLB after the descriptor change.
+    super::super::arch::aarch64::cache::tlb_flush_all();
 }
 
 /// Invalidate all stage-1 TLB entries (after any table/descriptor change).
@@ -404,37 +409,57 @@ pub unsafe fn free_task_tables(root: PhysAddr) {
 /// After this call all physical addresses equal their virtual addresses.
 ///
 /// Mapping strategy: every range is pre-mapped *before* the MMU is enabled,
-/// using 2 MiB block descriptors:
+/// using 2 MiB block descriptors.  The ranges come from `machine` (Phase
+/// 16), so the same code serves `virt` and `sbsa-ref`:
 ///
-///   • 0x4000_0000 .. 0x5000_0000  — all 256 MiB of DDR (normal WB/WA, RWX)
-///   • 0x0800_0000 .. 0x0A00_0000  — GICv3 distributor + redistributors
-///   • 0x0900_0000 .. 0x0B00_0000  — PL011 UARTs
-///   • 0x0A00_0000 .. 0x0C00_0000  — QEMU virtio-mmio transports
-///       (32 slots × 0x20000, Phase 5: virtio-gpu + virtio-tablet)
+///   • the machine's DRAM window (normal WB/WA, RWX) — base + size from
+///     the device tree, fallback to the machine default;
+///   • GICv3 distributor + redistributors (device-nGnRnE);
+///   • PL011 UART (device-nGnRnE);
+///   • `virt` only: the virtio-mmio transport window.
 ///
 /// Mapping the *entire* DDR means any frame later handed out by the frame
 /// allocator (shared memory, guest RAM, page tables) is already mapped —
 /// no table allocation is required after the MMU is live, which avoids the
 /// classic "who maps the page-table pages?" chicken-and-egg problem.
 ///
+/// Phase 16 (real hardware): the handover follows the ARM DDI 0487
+/// sequence — DSB ISH (table writes visible), TLB flush + I-cache
+/// invalidation while the MMU is still off, `isb`, set SCTLR_EL1.M, then
+/// re-flush the TLB.  QEMU ignores caches; real CPUs do not.
+///
 /// # Safety
 /// Must be called exactly once, after the frame allocator is initialised.
-pub unsafe fn enable() {
-    // 1. Entire 256 MiB DDR as 2 MiB blocks (identity, RWX for now).
-    map_block(0x4000_0000, 0x4000_0000, 256 * 1024 * 1024, FLAGS_BLOCK_NORMAL);
+pub unsafe fn enable(ram_base: usize, ram_size: usize) {
+    let m = crate::arch::aarch64::machine();
+    use super::super::arch::aarch64::cache;
 
-    // 2. GICv3 distributor + redistributor (device-nGnRnE).
-    map_block(0x0800_0000, 0x0800_0000, 2 * 1024 * 1024, FLAGS_BLOCK_DEVICE);
+    // 1. Entire DRAM window as 2 MiB blocks (identity, RWX for now).
+    map_block(ram_base, ram_base, ram_size, FLAGS_BLOCK_NORMAL);
 
-    // 3. PL011 UART (device-nGnRnE).
-    map_block(0x0900_0000, 0x0900_0000, 2 * 1024 * 1024, FLAGS_BLOCK_DEVICE);
+    // 2. GICv3 distributor + redistributors (device-nGnRnE).
+    map_block(m.gic_dist_base, m.gic_dist_base, 2 * 1024 * 1024, FLAGS_BLOCK_DEVICE);
+    map_block(m.gic_redist_base, m.gic_redist_base, 2 * 1024 * 1024, FLAGS_BLOCK_DEVICE);
 
-    // 4. QEMU virtio-mmio transports (32 slots, device-nGnRnE) — the
-    //    Phase-5 display server drives virtio-gpu/virtio-tablet directly.
-    map_block(0x0A00_0000, 0x0A00_0000, 2 * 1024 * 1024, FLAGS_BLOCK_DEVICE);
+    // 3. PL011 UART (device-nGnRnE), rounded to a 2 MiB block.
+    map_block(
+        m.uart_base & !(2 * 1024 * 1024 - 1),
+        m.uart_base & !(2 * 1024 * 1024 - 1),
+        2 * 1024 * 1024,
+        FLAGS_BLOCK_DEVICE,
+    );
+
+    // 4. `virt` only: QEMU virtio-mmio transports (32 slots).
+    //    `sbsa-ref` has no virtio-mmio (everything is on the PCI bus).
+    if m.virtio_mmio_base != 0 {
+        map_block(m.virtio_mmio_base, m.virtio_mmio_base, 2 * 1024 * 1024, FLAGS_BLOCK_DEVICE);
+    }
 
     // 5. Install TTBR0_EL1 (user/low address space) — we use TTBR0 for
     //    the identity map since our kernel VAs are below 0x0001_0000_0000.
+    //    Real hardware: DSB ISH makes the table writes above globally
+    //    visible before the MMU reads them.
+    cache::dsb_ish();
     let ttbr0 = kernel_l0_phys() as u64;
     core::arch::asm!(
         "msr TTBR0_EL1, {t}",
@@ -443,32 +468,42 @@ pub unsafe fn enable() {
         options(nomem, nostack)
     );
 
-    // 6. Flush TLB (all entries, all ASID).
-    core::arch::asm!("tlbi vmalle1", "dsb sy", "isb", options(nomem, nostack));
+    // 6. TLB + I-cache maintenance while the MMU is still off.
+    cache::before_mmu_enable();
 
-    // 7. Enable MMU: set SCTLR_EL1.M (bit 0) and I-cache (bit 12).
+    // 7. Enable MMU: set SCTLR_EL1.M (bit 0), I-cache (bit 12) and the
+    //    cacheability bits (C bit 2, D-cache) — the identity map is
+    //    Normal WB/WA, so the D-cache must be on to use it as intended.
     let mut sctlr: u64;
     core::arch::asm!("mrs {s}, SCTLR_EL1", s = out(reg) sctlr, options(nomem, nostack));
-    sctlr |= 1 | (1 << 12); // M | I
+    sctlr |= 1 | (1 << 2) | (1 << 12); // M | C | I
     core::arch::asm!(
         "msr SCTLR_EL1, {s}",
         "isb",
         s = in(reg) sctlr,
         options(nomem, nostack)
     );
+
+    // 8. Re-flush the TLB and synchronize after the enable.
+    cache::after_mmu_enable();
 
     log::info!("MMU enabled — identity map active (DDR + MMIO pre-mapped)");
 }
 
 /// Enable the MMU on a *secondary* CPU (Phase 11 SMP): the identity map
 /// itself is global (already built by `enable()` on CPU 0), but TTBR0,
-/// the TLB and SCTLR_EL1.M are per-CPU and reset to 0 on a fresh core.
+/// the TLB, the I-cache and SCTLR_EL1.M are per-CPU and reset to 0 on a
+/// fresh core.
 ///
 /// Must be called after `mmu::init()` (TCR/MAIR are also per-CPU).
 ///
 /// # Safety
 /// Called from `kmain_secondary_entry` on the secondary CPU itself.
 pub unsafe fn enable_secondary() {
+    use super::super::arch::aarch64::cache;
+
+    // Make any prior writes globally visible, then install TTBR0.
+    cache::dsb_ish();
     let ttbr0 = kernel_l0_phys() as u64;
     core::arch::asm!(
         "msr TTBR0_EL1, {t}",
@@ -476,14 +511,15 @@ pub unsafe fn enable_secondary() {
         t = in(reg) ttbr0,
         options(nomem, nostack)
     );
-    core::arch::asm!("tlbi vmalle1", "dsb sy", "isb", options(nomem, nostack));
+    cache::before_mmu_enable();
     let mut sctlr: u64;
     core::arch::asm!("mrs {s}, SCTLR_EL1", s = out(reg) sctlr, options(nomem, nostack));
-    sctlr |= 1 | (1 << 12); // M | I
+    sctlr |= 1 | (1 << 2) | (1 << 12); // M | C | I
     core::arch::asm!(
         "msr SCTLR_EL1, {s}",
         "isb",
         s = in(reg) sctlr,
         options(nomem, nostack)
     );
+    cache::after_mmu_enable();
 }

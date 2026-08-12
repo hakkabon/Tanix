@@ -1,26 +1,25 @@
 #![allow(dead_code)]
-//! Physical frame allocator — bitmap over QEMU `virt` DDR.
+//! Physical frame allocator — bitmap over the machine's DDR.
 //!
-//! Memory map for QEMU `virt` (aarch64, 256 MiB):
-//!   0x4000_0000 .. 0x5000_0000  — 256 MiB DDR
+//! The DRAM window (base + size) is discovered at boot from the device
+//! tree (Phase 16); the fallback is the machine's compiled-in default
+//! (`virt`: 256 MiB at 0x4000_0000, `sbsa-ref`: 1 GiB at 0x100_0000_0000).
 //!
-//! The kernel image sits at 0x4008_0000.  We reserve everything below
+//! The kernel image sits at the DRAM base.  We reserve everything below
 //! `__kernel_end` (rounded up to the next page) and hand the rest out as
 //! 4 KiB frames.
 //!
 //! The bitmap itself is stored in a static array so we need no allocator
-//! to initialise the allocator.  One bit = one 4 KiB page.
-//! 256 MiB / 4 KiB = 65 536 pages → 8 KiB bitmap.
+//! to initialise the allocator.  One bit = one 4 KiB page.  The bitmap is
+//! sized for the largest supported window (1 GiB / 4 KiB = 262 144 pages
+//! → 4096 u64s = 32 KiB); smaller windows simply never touch the tail.
 
 use super::{PhysAddr, PAGE_SIZE};
 
-/// Total managed DDR size (256 MiB).
-const RAM_START: PhysAddr = 0x4000_0000;
-const RAM_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
-const RAM_END: PhysAddr = RAM_START + RAM_SIZE;
-
-const TOTAL_FRAMES: usize = RAM_SIZE / PAGE_SIZE; // 65 536
-const BITMAP_WORDS: usize = TOTAL_FRAMES / 64; // 1 024 u64s = 8 KiB
+/// Maximum managed DDR size the bitmap can represent (1 GiB).
+const MAX_RAM_SIZE: usize = 1024 * 1024 * 1024;
+const MAX_FRAMES: usize = MAX_RAM_SIZE / PAGE_SIZE; // 262 144
+const BITMAP_WORDS: usize = MAX_FRAMES / 64; // 4096 u64s = 32 KiB
 
 /// Global frame allocator state.
 ///
@@ -28,6 +27,10 @@ const BITMAP_WORDS: usize = TOTAL_FRAMES / 64; // 1 024 u64s = 8 KiB
 /// Using free=1 lets us use `leading_zeros` / `trailing_zeros` to find the
 /// first free frame quickly.
 pub struct FrameAllocator {
+    /// DRAM window this allocator manages (set by `init`).
+    ram_start: PhysAddr,
+    ram_size: usize,
+    total_frames: usize,
     bitmap: [u64; BITMAP_WORDS],
     free_frames: usize,
 }
@@ -35,30 +38,39 @@ pub struct FrameAllocator {
 impl FrameAllocator {
     const fn new_zeroed() -> Self {
         Self {
+            ram_start: 0,
+            ram_size: 0,
+            total_frames: 0,
             bitmap: [0u64; BITMAP_WORDS],
             free_frames: 0,
         }
     }
 
-    /// Initialise the allocator.
+    /// Initialise the allocator over `[ram_start, ram_start + ram_size)`.
     ///
-    /// Marks all frames free, then reserves:
-    ///   1. The first 2 MiB (MMIO, firmware, stack below kernel).
-    ///   2. Everything from `RAM_START` to `kernel_end` inclusive.
+    /// Marks all frames free, then reserves everything from `ram_start`
+    /// to `kernel_end` inclusive.
     ///
     /// `kernel_end` is the physical address of the first byte *after* the
     /// kernel image (read from the linker-script symbol `__kernel_end`).
-    pub fn init(&mut self, kernel_end: PhysAddr) {
+    pub fn init(&mut self, kernel_end: PhysAddr, ram_start: PhysAddr, ram_size: usize) {
+        assert!(ram_size <= MAX_RAM_SIZE, "frame: RAM too large for bitmap");
+        assert_eq!(ram_start & (PAGE_SIZE - 1), 0, "frame: RAM start unaligned");
+
+        self.ram_start = ram_start;
+        self.ram_size = ram_size;
+        self.total_frames = ram_size / PAGE_SIZE;
+
         // Mark everything free.
         for word in self.bitmap.iter_mut() {
             *word = !0u64;
         }
-        self.free_frames = TOTAL_FRAMES;
+        self.free_frames = self.total_frames;
 
         // Reserve frames [0 .. kernel_end] (rounded up to page boundary).
         let reserved_end = (kernel_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let reserved_frames = (reserved_end - RAM_START) / PAGE_SIZE;
-        let reserved_frames = reserved_frames.min(TOTAL_FRAMES);
+        let reserved_frames = (reserved_end.saturating_sub(ram_start)) / PAGE_SIZE;
+        let reserved_frames = reserved_frames.min(self.total_frames);
 
         for i in 0..reserved_frames {
             self.set_used(i);
@@ -93,18 +105,20 @@ impl FrameAllocator {
         if end <= begin {
             return;
         }
-        let begin_idx = Self::phys_to_idx(begin).unwrap_or(0);
-        let end_idx = Self::phys_to_idx(end).unwrap_or(TOTAL_FRAMES);
-        for i in begin_idx..end_idx {
+        let begin_idx = Self::phys_to_idx(begin, self.ram_start, self.ram_size)
+            .unwrap_or(0);
+        let end_idx = Self::phys_to_idx(end, self.ram_start, self.ram_size)
+            .unwrap_or(self.total_frames);
+        for i in begin_idx..end_idx.min(self.total_frames) {
             self.set_used(i);
         }
     }
 
-    fn phys_to_idx(addr: PhysAddr) -> Option<usize> {
-        if !(RAM_START..RAM_END).contains(&addr) {
+    fn phys_to_idx(addr: PhysAddr, ram_start: PhysAddr, ram_size: usize) -> Option<usize> {
+        if !(ram_start..ram_start + ram_size).contains(&addr) {
             return None;
         }
-        Some((addr - RAM_START) / PAGE_SIZE)
+        Some((addr - ram_start) / PAGE_SIZE)
     }
 
     /// Allocate one physical 4 KiB frame.
@@ -119,8 +133,11 @@ impl FrameAllocator {
             }
             let bit = word.trailing_zeros() as usize;
             let frame_idx = word_idx * 64 + bit;
+            if frame_idx >= self.total_frames {
+                return None;
+            }
             self.set_used(frame_idx);
-            return Some(RAM_START + frame_idx * PAGE_SIZE);
+            return Some(self.ram_start + frame_idx * PAGE_SIZE);
         }
         None
     }
@@ -135,7 +152,7 @@ impl FrameAllocator {
         }
         let mut run_start = 0usize;
         let mut run_len = 0usize;
-        for i in 0..TOTAL_FRAMES {
+        for i in 0..self.total_frames {
             let word = i / 64;
             let bit = i % 64;
             if self.bitmap[word] & (1u64 << bit) != 0 {
@@ -148,7 +165,7 @@ impl FrameAllocator {
                     for j in run_start..run_start + n {
                         self.set_used(j);
                     }
-                    return Some(RAM_START + run_start * PAGE_SIZE);
+                    return Some(self.ram_start + run_start * PAGE_SIZE);
                 }
             } else {
                 run_len = 0;
@@ -163,7 +180,7 @@ impl FrameAllocator {
     /// Panics if `addr` is not page-aligned or not in the managed range.
     pub fn free(&mut self, addr: PhysAddr) {
         assert_eq!(addr & (PAGE_SIZE - 1), 0, "free: address not page-aligned");
-        let idx = Self::phys_to_idx(addr)
+        let idx = Self::phys_to_idx(addr, self.ram_start, self.ram_size)
             .unwrap_or_else(|| panic!("free: address {:#x} out of range", addr));
         self.set_free(idx);
     }
@@ -173,7 +190,7 @@ impl FrameAllocator {
     }
 
     pub fn total_frames(&self) -> usize {
-        TOTAL_FRAMES
+        self.total_frames
     }
 }
 
@@ -192,16 +209,19 @@ static FRAME_LOCK: crate::sync::SpinLock = crate::sync::SpinLock::new();
 /// The single global frame allocator.
 static mut FRAME_ALLOC: FrameAllocator = FrameAllocator::new_zeroed();
 
-/// Initialise the global frame allocator.  Call once from `kmain`.
+/// Initialise the global frame allocator over the machine's DRAM window.
+/// Call once from `kmain`.
 ///
 /// # Safety
 /// Must be called before any call to `alloc_frame` / `free_frame`.
 /// Must be called from a single thread (no concurrent callers).
-pub unsafe fn init(kernel_end: PhysAddr) {
-    (*core::ptr::addr_of_mut!(FRAME_ALLOC)).init(kernel_end);
+pub unsafe fn init(kernel_end: PhysAddr, ram_start: PhysAddr, ram_size: usize) {
+    (*core::ptr::addr_of_mut!(FRAME_ALLOC)).init(kernel_end, ram_start, ram_size);
     log::info!(
-        "frame allocator: {} MiB free ({} frames)",
+        "frame allocator: {} MiB free of {:#x}..{:#x} ({} frames)",
         (*core::ptr::addr_of!(FRAME_ALLOC)).free_frames() * PAGE_SIZE / (1024 * 1024),
+        ram_start,
+        ram_start + ram_size,
         (*core::ptr::addr_of!(FRAME_ALLOC)).free_frames()
     );
 }
@@ -247,4 +267,14 @@ pub unsafe fn free_frame(addr: PhysAddr) {
     FRAME_LOCK.lock();
     (*core::ptr::addr_of_mut!(FRAME_ALLOC)).free(addr);
     FRAME_LOCK.unlock();
+}
+
+/// The managed DRAM window (after `init`).
+pub fn ram_bounds() -> (PhysAddr, usize) {
+    unsafe {
+        (
+            (*core::ptr::addr_of!(FRAME_ALLOC)).ram_start,
+            (*core::ptr::addr_of!(FRAME_ALLOC)).ram_size,
+        )
+    }
 }

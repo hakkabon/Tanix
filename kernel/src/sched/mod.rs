@@ -85,11 +85,16 @@ pub const M_ANY: i32 = -1;
 /// Phase 6: servers run at EL0 and call the kernel via `svc #0` — there is
 /// no function-pointer table anymore, only the task id (and the address of
 /// this block, which the task can read through x19).
+///
+/// Phase 16: `machine` tells servers which machine the kernel booted on
+/// (see `arch::aarch64::machine`); drivers pick MMIO windows / IRQs from it.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct BootInfo {
     /// This task's own id.
     pub task_id: u32,
+    /// Machine id (0 = QEMU virt, 1 = QEMU sbsa-ref).
+    pub machine: u32,
 }
 
 /// A sender that is blocked waiting for a receiver to accept its message.

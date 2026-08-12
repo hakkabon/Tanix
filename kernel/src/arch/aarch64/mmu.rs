@@ -1,12 +1,12 @@
 #![allow(dead_code)]
-//! aarch64 MMU initialisation — Phase 1 stub.
+//! aarch64 MMU initialisation — Phase 1 stub + Phase 16 hardening.
 //!
-//! For Phase 1 the MMU is left *disabled* and the kernel runs with a flat
-//! physical address space.  QEMU's `virt` machine starts at EL1 with the MMU
-//! off, which is exactly what we need for an early bootstrap.
-//!
-//! Phase 2 will replace this with a real page-table setup once the frame
-//! allocator exists.
+//! TCR/MAIR are programmed at boot with the MMU left off; `page_table::enable`
+//! builds the identity map and turns the MMU on.  Phase 16 adds the cache
+//! and barrier discipline real hardware requires around the handover
+//! (see `cache.rs`).
+
+use super::cache;
 
 /// Reads SCTLR_EL1 and returns true if the MMU (M bit, bit 0) is enabled.
 #[inline]
@@ -51,12 +51,15 @@ pub fn init() {
         core::arch::asm!(
             "msr TCR_EL1,  {tcr}",
             "msr MAIR_EL1, {mair}",
-            "isb",
             tcr  = in(reg) TCR,
             mair = in(reg) MAIR,
             options(nomem, nostack)
         );
     }
+    // Real hardware: make the system-register writes take effect before
+    // anything (including the MMU enable) observes them.
+    cache::dsb_ish();
+    cache::isb();
 
     // MMU stays off — Phase 2 will call mmu::enable() after building tables.
 }

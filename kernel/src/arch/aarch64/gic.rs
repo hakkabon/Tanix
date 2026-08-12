@@ -5,6 +5,9 @@
 //!   Distributor (GICD):  0x0800_0000  (64 KiB)
 //!   Redistributors (GICR): 0x080A_0000  (one 256 KiB frame per CPU)
 //!
+//! Phase 16: the base addresses come from `machine` — `sbsa-ref` places
+//! the distributor at 0x4006_0000 and the redistributors at 0x4008_0000.
+//!
 //! Phase 1 performed the minimum setup to unmask IRQs at the CPU interface
 //! so the timer interrupt could fire.  Phase 7 adds the per-interrupt
 //! enablement: the kernel runs non-secure EL1 (SCR_EL3.NS=1), so all
@@ -22,23 +25,21 @@
 //! `SYS_WAIT_IRQ` syscall; the EL1 physical timer (PPI 30) is enabled at
 //! boot by the scheduler tick setup.
 
-// ── GICD register offsets ────────────────────────────────────────────────────
+use super::machine;
 
-const GICD_BASE: usize = 0x0800_0000;
-const GICD_CTLR: usize = GICD_BASE;    // Distributor Control Register
-const GICD_TYPER: usize = GICD_BASE + 0x004;   // Interrupt Controller Type
-const GICD_IGROUPR: usize = GICD_BASE + 0x080; // Group 1 enable (bit per INTID)
-const GICD_ISENABLER: usize = GICD_BASE + 0x100; // Set-enable (bit per INTID)
-const GICD_ICENABLER: usize = GICD_BASE + 0x180; // Clear-enable (bit per INTID)
-const GICD_IPRIORITYR: usize = GICD_BASE + 0x400; // Priority (byte per INTID)
+// ── GICD register offsets (relative to the machine's distributor) ─────────────
+
+const GICD_CTLR: usize = 0x000; // Distributor Control Register
+const GICD_TYPER: usize = 0x004; // Interrupt Controller Type
+const GICD_IGROUPR: usize = 0x080; // Group 1 enable (bit per INTID)
+const GICD_ISENABLER: usize = 0x100; // Set-enable (bit per INTID)
+const GICD_ICENABLER: usize = 0x180; // Clear-enable (bit per INTID)
+const GICD_IPRIORITYR: usize = 0x400; // Priority (byte per INTID)
 
 // ── GICR register offsets (per-CPU redistributor) ────────────────────────────
 
-const GICR_BASE: usize = 0x080A_0000;
-/// One CPU's redistributor is a 256 KiB frame; the next CPU's begins
-/// 0x20000 higher (QEMU `virt` lays them out contiguously).
 const GICR_STRIDE: usize = 0x2_0000;
-const GICR_WAKER: usize = 0x014;   // Wake register (relative to frame base)
+const GICR_WAKER: usize = 0x014; // Wake register (relative to frame base)
 /// Redistributor SGI/PPI bank (128 KiB into the 256 KiB frame).
 const GICR_SGI_BASE: usize = 0x1_0000;
 const GICR_IGROUPR0: usize = GICR_SGI_BASE + 0x080; // Group 1 for SGIs/PPIs
@@ -48,7 +49,7 @@ const GICR_ICENABLER0: usize = GICR_SGI_BASE + 0x180; // Clear-enable for SGIs/P
 /// Base address of the *current* CPU's redistributor frame.
 #[inline]
 fn gicr_base() -> usize {
-    GICR_BASE + crate::smp::cpu_index() * GICR_STRIDE
+    machine::machine().gic_redist_base + crate::smp::cpu_index() * GICR_STRIDE
 }
 
 // ── CPU interface (ICC system registers, GICv3 system register mode) ─────────
@@ -56,13 +57,20 @@ fn gicr_base() -> usize {
 #[inline]
 fn write_gicd(offset: usize, val: u32) {
     unsafe {
-        core::ptr::write_volatile(offset as *mut u32, val);
+        core::ptr::write_volatile(
+            (machine::machine().gic_dist_base + offset) as *mut u32,
+            val,
+        );
     }
 }
 
 #[inline]
 fn read_gicd(offset: usize) -> u32 {
-    unsafe { core::ptr::read_volatile(offset as *const u32) }
+    unsafe {
+        core::ptr::read_volatile(
+            (machine::machine().gic_dist_base + offset) as *const u32,
+        )
+    }
 }
 
 #[inline]

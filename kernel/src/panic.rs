@@ -3,13 +3,15 @@ use core::panic::PanicInfo;
 
 /// Minimal UART write for panic messages.
 ///
-/// QEMU `virt` exposes a PL011 UART at 0x0900_0000.  Writing a byte to the
-/// Data Register (offset 0) outputs it immediately — no init needed because
-/// QEMU pre-initialises the UART for us.
+/// QEMU `virt` exposes a PL011 UART at 0x0900_0000; `sbsa-ref` at
+/// 0x6000_0000 (Phase 16).  Writing a byte to the Data Register (offset 0)
+/// outputs it immediately — no init needed because QEMU pre-initialises
+/// the UART for us.  (Used before the log backend is up, and after it
+/// panicked.)
 fn uart_write_bytes(bytes: &[u8]) {
-    const UART0_DR: *mut u8 = 0x0900_0000 as *mut u8;
+    let uart = crate::arch::aarch64::machine().uart_base as *mut u8;
     for &b in bytes {
-        unsafe { core::ptr::write_volatile(UART0_DR, b) };
+        unsafe { core::ptr::write_volatile(uart, b) };
     }
 }
 

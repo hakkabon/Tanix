@@ -14,6 +14,13 @@ embed-zephyr-stub = []
 # tanix-mem --package tanix-dev --package tanix-worker first.
 embed-servers = []
 
+# Phase 16: target the QEMU SBSA Reference Platform (`-machine sbsa-ref`)
+# instead of the `virt` machine.  Real-hardware style: no `virt`-style
+# virtio-mmio transports, PSCI is NOT emulated by QEMU (the EL3 firmware
+# must provide it), RAM starts at 1 TiB, GIC at 0x4006_0000 etc.  Requires
+# the EL3 monitor at boot (sbsa-ref CPUs reset at EL3).
+sbsa-ref = []
+
 # Probe for the Gunyah hypervisor via SMCCC HVC at boot.
 # Enable ONLY when actually booting under Gunyah — on bare-metal EL1 an HVC
 # is UNDEFINED and would take an unexpected exception.

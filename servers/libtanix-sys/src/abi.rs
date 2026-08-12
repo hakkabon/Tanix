@@ -29,10 +29,16 @@ pub const M_ANY: i32 = -1;
 /// Phase 6: servers run at EL0 and call the kernel with `svc #0` — the
 /// syscall number goes in x0, arguments in x1-x3, result back in x0 (see
 /// `sys.rs` for the numbers).  There is no function-pointer table anymore.
+///
+/// Phase 16: `machine` is the machine id the kernel detected at boot (see
+/// the kernel's `arch::aarch64::machine`); machine-aware drivers use it to
+/// pick MMIO windows and IRQ numbers at runtime.
 #[repr(C)]
 pub struct BootInfo {
     /// This task's own id.
     pub task_id: u32,
+    /// Machine id (0 = QEMU virt, 1 = QEMU sbsa-ref).
+    pub machine: u32,
 }
 
 // ── Per-server protocol constants ─────────────────────────────────────────────
