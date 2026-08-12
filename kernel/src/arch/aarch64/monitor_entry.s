@@ -9,7 +9,7 @@
 //
 // Context slots (Rust statics):  __ns_ctx[cpu],  __sec_ctx[cpu]
 //   layout: x0..x30 @ 0..248, sp_el1 @ 248, elr @ 256, spsr @ 264  (272 B)
-// PSCI command slots:          __psci_cmd_slots[cpu] = { magic, entry }
+// PSCI command slots:          __psci_cmd_slots[cpu] = ( magic, entry )
 // Secure payload runtime base: __sec_runtime_base (Rust-owned)
 
     .section .text.monitor, "ax"
@@ -233,7 +233,7 @@ park_cpu:
     b    1b
 
     // ── Secondary-CPU park loop (boot): wfi + poll the PSCI cmd slot ────
-    // The kernel's CPU_ON writes {CMD_MAGIC, entry} into this CPU's slot
+    // The kernel's CPU_ON writes (CMD_MAGIC, entry) into this CPU's slot
     // and sends an SGI to wake the WFI; the loop then erets the CPU to EL1
     // at `entry` with the kernel's secondary boot path (SPSR = EL1h).
     .global monitor_park_loop

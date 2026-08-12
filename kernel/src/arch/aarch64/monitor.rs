@@ -234,7 +234,7 @@ pub extern "C" fn monitor_el3_init(dtb: u64, is_secondary: u64, el1_entry: u64) 
     }
 
     // 4. CPU count from the DT (sbsa-ref lists /cpus/cpu@N).
-    let ncpus = super::fdt::cpu_count(dtb) as u64;
+    let ncpus = super::fdt::cpu_count(dtb as usize) as u64;
     unsafe { MONITOR_CPU_COUNT = if ncpus != 0 { ncpus } else { 1 } };
 
     // 5. Install the secure payload (primary only — the secondaries park).

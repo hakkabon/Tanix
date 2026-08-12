@@ -199,7 +199,7 @@ impl Task {
             recv_buf: core::ptr::null_mut(),
             pending_senders: [None, None],
             send_full_wait: None,
-            boot: BootInfo { task_id: 0 },
+            boot: BootInfo { task_id: 0, machine: 0 },
             irq_wait: None,
             sleep_deadline: 0,
         }
@@ -223,7 +223,7 @@ impl Task {
             recv_buf: core::ptr::null_mut(),
             pending_senders: [None, None],
             send_full_wait: None,
-            boot: BootInfo { task_id: 0 },
+            boot: BootInfo { task_id: 0, machine: 0 },
             irq_wait: None,
             sleep_deadline: 0,
         }

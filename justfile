@@ -205,3 +205,37 @@ qemu-phase11: kernel-phase11
 # from the host (UDP in/out, TCP echo, TCP out) and asserts the results
 net-test: kernel-phase11
     ./scripts/net-test.sh
+
+# ── Phase 16: sbsa-ref (EL3 monitor + TrustZone) ──────────────────────────────
+
+# Build every server binary *for the sbsa-ref machine*: linked at the 1 TiB
+# RAM window (TANIX_LINK_SHIFT), into a separate target dir (target-sbsa)
+# so the virt binaries in target/ stay untouched.  The virtio transport
+# guest (zephyr-stub) is built here too so the whole embedded image set
+# comes from one directory.
+servers-sbsa:
+    TANIX_LINK_SHIFT=0xFFC000000000 CARGO_TARGET_DIR=target-sbsa cargo build \
+        --package tanix-zephyr-stub --package tanix-libsys \
+        --package tanix-init --package tanix-pm --package tanix-mem \
+        --package tanix-dev --package tanix-worker \
+        --package tanix-libtanix-ui --package tanix-display \
+        --package tanix-ui-demo --package tanix-hog --package tanix-wm \
+        --package tanix-counter --package tanix-clock --package tanix-ramfs \
+        --package tanix-shell --package tanix-libdrv --package tanix-net \
+        --package tanix-ping --package tanix-pong \
+        --target {{TARGET}}
+
+# Build the kernel for sbsa-ref (feature sbsa-ref: EL3-reset boot, EL3
+# monitor, secure payload, sbsa linker script) with the sbsa server
+# binaries embedded.  Kernel lands in target-sbsa/ too.
+kernel-sbsa: servers-sbsa
+    CARGO_TARGET_DIR=target-sbsa TANIX_SERVER_TARGET_DIR=target-sbsa \
+        cargo build --package {{KERNEL_PKG}} --target {{TARGET}} \
+        --features sbsa-ref,embed-servers
+
+# Boot the sbsa-ref kernel in QEMU: EL3 → monitor → EL2 → EL1, TrustZone
+# secure payload on the second serial (target-sbsa/sec.log), PSCI from the
+# EL3 monitor, phase-16 TCB-measurement + world-switch demos, then the
+# machine-agnostic servers (init/pm/mem/dev/worker/net/hog/ping/pong).
+qemu-sbsa: kernel-sbsa
+    ./scripts/qemu-sbsa.sh

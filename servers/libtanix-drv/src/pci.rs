@@ -1,10 +1,15 @@
-//! PCIe ECAM config-space driver — QEMU `virt` machine (`highmem=off`).
+//! PCIe ECAM config-space driver — QEMU `virt` and `sbsa-ref`.
 //!
-//! With `highmem=off` the machine places the PCIe ECAM window at
+//! With `highmem=off` the `virt` machine places the PCIe ECAM window at
 //! `0x3F00_0000` (16 MiB → 16 buses), clear of the 256 MiB DDR that
 //! starts at 0x4000_0000.  (On this QEMU's default `highmem` layout the
 //! ECAM window overlaps the RAM window and the RAM wins, so PCI config
 //! space is unreachable — the machine must run with `highmem=off`.)
+//!
+//! `sbsa-ref` (Phase 16) puts ECAM at `0xF000_0000`, its 2 GiB 32-bit
+//! MMIO window at `0x8000_0000`, and its legacy INTx lines at GIC SPIs
+//! `40..43`.  The driver picks the machine's windows from
+//! `BootInfo.machine` (read once by `pci_init()`).
 //!
 //! ECAM addressing: config space of device `(bus, dev, func)` sits at
 //! `ECAM_BASE + (bus << 20) | (dev << 15) | (func << 12)`.  All accesses
@@ -15,10 +20,53 @@ use core::ptr;
 
 use tanix_libsys::sys;
 
-/// ECAM window base (QEMU `virt,highmem=off`).
-pub const ECAM_BASE: usize = 0x3F00_0000;
+/// Machine ids mirrored from the kernel (`BootInfo.machine`).
+pub const MACHINE_SBSA_REF: u32 = 1;
+
+// ── Machine-dependent PCI windows (Phase 16) ─────────────────────────────────
+
+/// ECAM window base on QEMU `virt,highmem=off`.
+pub const ECAM_BASE_VIRT: usize = 0x3F00_0000;
+/// ECAM window base on QEMU `sbsa-ref`.
+pub const ECAM_BASE_SBSA: usize = 0xF000_0000;
 /// ECAM window size: 16 MiB = 16 buses × 1 MiB.
 pub const ECAM_SIZE: usize = 16 * 1024 * 1024;
+/// Legacy INTx GIC SPI base on `virt` (SPI 35..38).
+pub const INTX_BASE_VIRT: u32 = 35;
+/// Legacy INTx GIC SPI base on `sbsa-ref` (SPI 40..43).
+pub const INTX_BASE_SBSA: u32 = 40;
+/// Address a zero BAR is guest-assigned to: the top of the 32-bit PCI
+/// window, clear of the ECAM region (both machines).
+pub const BAR_WINDOW_VIRT: usize = 0x3EFE_0000;
+pub const BAR_WINDOW_SBSA: usize = 0xEFE0_0000;
+
+static mut ECAM_BASE_RT: usize = ECAM_BASE_VIRT;
+static mut INTX_BASE_RT: u32 = INTX_BASE_VIRT;
+static mut BAR_WINDOW_RT: usize = BAR_WINDOW_VIRT;
+
+/// Select the machine's PCI windows from `BootInfo.machine`.  An
+/// idempotent call — safe any time before the first config access; the
+/// PCI functions re-run it lazily, so callers cannot forget.
+pub fn pci_init() {
+    unsafe {
+        let m = sys::boot_info().machine;
+        ECAM_BASE_RT = if m == MACHINE_SBSA_REF { ECAM_BASE_SBSA } else { ECAM_BASE_VIRT };
+        INTX_BASE_RT = if m == MACHINE_SBSA_REF { INTX_BASE_SBSA } else { INTX_BASE_VIRT };
+        BAR_WINDOW_RT = if m == MACHINE_SBSA_REF { BAR_WINDOW_SBSA } else { BAR_WINDOW_VIRT };
+    }
+}
+
+/// The active ECAM base.
+pub fn ecam_base() -> usize {
+    pci_init();
+    unsafe { ECAM_BASE_RT }
+}
+
+/// The active guest-assignment window for zero BARs.
+pub fn bar_window() -> u64 {
+    pci_init();
+    unsafe { BAR_WINDOW_RT as u64 }
+}
 
 /// Red Hat / Qumranet vendor id — every virtio PCI device.
 pub const VIRTIO_VENDOR: u16 = 0x1AF4;
@@ -56,7 +104,7 @@ pub struct VirtioCap {
 
 #[inline]
 fn cfg_addr(b: Bdf, off: usize) -> usize {
-    ECAM_BASE
+    ecam_base()
         | ((b.0 as usize) << 20)
         | ((b.1 as usize) << 15)
         | ((b.2 as usize) << 12)
@@ -257,19 +305,20 @@ pub fn map_mmio(base: u64, size: usize) -> Result<u64, i32> {
 /// Map the whole ECAM region (config space of every bus) into this task's
 /// address space.  Must run before any config read/write.
 pub fn map_ecam() -> Result<(), i32> {
-    map_mmio(ECAM_BASE as u64, ECAM_SIZE)?;
+    map_mmio(ecam_base() as u64, ECAM_SIZE)?;
     Ok(())
 }
 
 /// The GIC SPI for a device's legacy INTx line.
 ///
 /// QEMU `virt` routes the gpex host bridge's four INTx lines to GIC SPIs
-/// `32 + VIRT_PCIE` = 35..38 (hw/arm/virt.c `a15irqmap`); a device at
-/// slot `s` with interrupt pin `p` (1-based) swizzles to line
+/// `32 + VIRT_PCIE` = 35..38 (hw/arm/virt.c `a15irqmap`); `sbsa-ref` uses
+/// `SBSA_PCIE` = 40..43 (hw/arm/sbsa-ref.c `sbsa_ref_irqmap`).  A device
+/// at slot `s` with interrupt pin `p` (1-based) swizzles to line
 /// `(s + p - 1) % 4` (hw/pci-host/gpex.c `gpex_swizzle_map_irq_fn`).
 pub fn intx_irq(b: Bdf) -> u32 {
-    const PCI_IRQ_BASE: u32 = 35;
     let slot = (b.1 >> 3) as u32;
     let pin = interrupt_pin(b).max(1) as u32 - 1;
-    PCI_IRQ_BASE + (slot + pin) % 4
+    pci_init();
+    unsafe { INTX_BASE_RT + (slot + pin) % 4 }
 }

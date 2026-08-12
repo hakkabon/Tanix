@@ -246,4 +246,4 @@ sec_stack_top:
     .org 0x8000
     .global sec_payload_end
 sec_payload_end:
-    .balign 15                 // advertise 32 KiB alignment for the region
+    .p2align 15                 // advertise 32 KiB alignment for the region

@@ -211,7 +211,11 @@ pub unsafe fn map_page(vaddr: VirtAddr, paddr: PhysAddr, flags: u64) {
 
     let l3 = ensure_table(l2, l2_idx(vaddr));
 
-    (*l3).set_entry(l3_idx(vaddr), (paddr as u64) | flags);
+    // At level 3 every valid descriptor must carry the page-descriptor
+    // encoding bits[1:0] = 0b11.  Callers pass block-style flags (e.g.
+    // FLAGS_BLOCK_DEVICE); force the PAGE type bit so the entry is a
+    // valid L3 page descriptor regardless.
+    (*l3).set_entry(l3_idx(vaddr), (paddr as u64) | flags | DESC_PAGE);
 }
 
 /// Map a contiguous physical range [paddr .. paddr + size) to the same
@@ -437,22 +441,21 @@ pub unsafe fn enable(ram_base: usize, ram_size: usize) {
     // 1. Entire DRAM window as 2 MiB blocks (identity, RWX for now).
     map_block(ram_base, ram_base, ram_size, FLAGS_BLOCK_NORMAL);
 
-    // 2. GICv3 distributor + redistributors (device-nGnRnE).
-    map_block(m.gic_dist_base, m.gic_dist_base, 2 * 1024 * 1024, FLAGS_BLOCK_DEVICE);
-    map_block(m.gic_redist_base, m.gic_redist_base, 2 * 1024 * 1024, FLAGS_BLOCK_DEVICE);
+    // 2. GICv3 distributor + redistributors (device-nGnRnE).  Page
+    //    granularity: the machine bases (0x0800_0000 / 0x080A_0000 on
+    //    `virt`, 0x4006_0000 / 0x4008_0000 on `sbsa-ref`) are not 2 MiB
+    //    aligned, so 2 MiB block descriptors cannot cover them directly.
+    map_range(m.gic_dist_base, 2 * 1024 * 1024, FLAGS_BLOCK_DEVICE);
+    map_range(m.gic_redist_base, 2 * 1024 * 1024, FLAGS_BLOCK_DEVICE);
 
-    // 3. PL011 UART (device-nGnRnE), rounded to a 2 MiB block.
-    map_block(
-        m.uart_base & !(2 * 1024 * 1024 - 1),
-        m.uart_base & !(2 * 1024 * 1024 - 1),
-        2 * 1024 * 1024,
-        FLAGS_BLOCK_DEVICE,
-    );
+    // 3. PL011 UART (device-nGnRnE), one page is enough.
+    map_range(m.uart_base, PAGE_SIZE, FLAGS_BLOCK_DEVICE);
 
-    // 4. `virt` only: QEMU virtio-mmio transports (32 slots).
-    //    `sbsa-ref` has no virtio-mmio (everything is on the PCI bus).
+    // 4. `virt` only: QEMU virtio-mmio transports (32 slots × 0x200 in a
+    //    2 MiB window).  `sbsa-ref` has no virtio-mmio (everything is on
+    //    the PCI bus).
     if m.virtio_mmio_base != 0 {
-        map_block(m.virtio_mmio_base, m.virtio_mmio_base, 2 * 1024 * 1024, FLAGS_BLOCK_DEVICE);
+        map_range(m.virtio_mmio_base, 2 * 1024 * 1024, FLAGS_BLOCK_DEVICE);
     }
 
     // 5. Install TTBR0_EL1 (user/low address space) — we use TTBR0 for

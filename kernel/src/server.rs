@@ -117,6 +117,37 @@ pub const SERVER_BASES: &[(&str, usize)] = &[
     ("pong",    0x411E_0000),
 ];
 
+/// Phase 16: the fixed link bases above are chosen for the `virt` machine's
+/// 1 GiB DRAM window (`0x4000_0000`).  Other machines move the whole RAM
+/// window by a constant offset — `sbsa-ref` starts its DDR at 1 TiB
+/// (`0x100_0000_0000`) — and every server binary is *linked at the shifted
+/// address* (the sbsa server build sets `TANIX_LINK_SHIFT` in its build.rs,
+/// which all `servers/*/build.rs` add to their base).  This must stay in
+/// lockstep with those build scripts.
+fn machine_base_shift() -> usize {
+    let m = crate::arch::aarch64::machine();
+    if m.id == crate::arch::aarch64::machine::MACHINE_SBSA_REF {
+        m.dram_base.wrapping_sub(0x4000_0000)
+    } else {
+        0
+    }
+}
+
+/// The runtime base of server `name`, machine-aware (Phase 16).
+pub fn server_link_base(name: &str) -> usize {
+    let virt_base = SERVER_BASES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, b)| *b);
+    match virt_base {
+        Some(b) => b + machine_base_shift(),
+        None => {
+            log::error!("server: unknown server name '{}'", name);
+            0
+        }
+    }
+}
+
 /// Scheduling priority per server (Phase 7) — lower runs first.  The
 /// display server owns the GPU, so it is highest; the `hog` demo spins on
 /// the CPU at the lowest priority and is only scheduled when everything
@@ -162,11 +193,10 @@ pub fn spawn_by_name_locked(name: &str) -> Result<TaskId, i32> {
         .find(|(n, _)| *n == name)
         .map(|(_, b)| *b)
         .ok_or(-7)?; // unknown server name
-    let base = SERVER_BASES
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, b)| *b)
-        .ok_or(-7)?; // unknown server name
+    let base = server_link_base(name);
+    if base == 0 {
+        return Err(-7);
+    }
 
     let ram_size = SERVER_RAM_PAGES * PAGE_SIZE;
 
@@ -273,7 +303,8 @@ pub fn available() -> bool {
 /// live server image, silently corrupting its code and data.  Must be
 /// called before any server task can run or make allocations.
 pub fn reserve_regions() {
-    for &(_, base) in SERVER_BASES {
+    for &(name, _) in SERVER_BASES {
+        let base = server_link_base(name);
         let size = SERVER_RAM_PAGES * PAGE_SIZE;
         unsafe {
             crate::mem::frame::reserve_region(base, size);

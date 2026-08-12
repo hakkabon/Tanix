@@ -47,7 +47,7 @@ fn rd_be32(p: *const u8) -> u32 {
 }
 
 fn rd_be64(p: *const u8) -> u64 {
-    (rd_be32(p) as u64) << 32 | rd_be32(p.add(4)) as u64
+    (rd_be32(p) as u64) << 32 | rd_be32(unsafe { p.add(4) }) as u64
 }
 
 /// Returns the first `/memory@...` node's base + size, or None when the
@@ -61,8 +61,8 @@ pub fn dram_region(dtb: usize) -> Option<MemoryRegion> {
     // Header: magic, totalsize, off_dt_struct, off_dt_strings, off_mem_rsvmap,
     // version, last_comp_version, boot_cpuid_phys, size_dt_strings,
     // size_dt_struct.
-    let struct_off = rd_be32(base.add(8)) as usize;
-    let strings_off = rd_be32(base.add(12)) as usize;
+    let struct_off = rd_be32(unsafe { base.add(8) }) as usize;
+    let strings_off = rd_be32(unsafe { base.add(12) }) as usize;
 
     // Root node's #address-cells / #size-cells (default 2/2 per the spec's
     // "default empty case" — both QEMU machines set 2/2 explicitly).
@@ -74,7 +74,7 @@ pub fn dram_region(dtb: usize) -> Option<MemoryRegion> {
 
     let mut p = struct_off;
     loop {
-        let token = rd_be32(base.add(p));
+        let token = rd_be32(unsafe { base.add(p) });
         p += 4;
         match token {
             FDT_BEGIN_NODE => {
@@ -95,10 +95,10 @@ pub fn dram_region(dtb: usize) -> Option<MemoryRegion> {
                 depth += 1;
             }
             FDT_PROP => {
-                let len = rd_be32(base.add(p)) as usize;
-                let nameoff = rd_be32(base.add(p + 4)) as usize;
+                let len = rd_be32(unsafe { base.add(p) }) as usize;
+                let nameoff = rd_be32(unsafe { base.add(p + 4) }) as usize;
                 p += 8;
-                let val = base.add(p);
+                let val = unsafe { base.add(p) };
                 let name = unsafe {
                     let mut n = 0;
                     while core::ptr::read_volatile(base.add(strings_off + nameoff + n)) != 0 {
@@ -112,12 +112,12 @@ pub fn dram_region(dtb: usize) -> Option<MemoryRegion> {
                             let mut off = 0;
                             let mut addr = 0u64;
                             for _ in 0..addr_cells {
-                                addr = (addr << 32) | rd_be32(val.add(off)) as u64;
+                                addr = (addr << 32) | rd_be32(unsafe { val.add(off) }) as u64;
                                 off += 4;
                             }
                             let mut size = 0u64;
                             for _ in 0..size_cells {
-                                size = (size << 32) | rd_be32(val.add(off)) as u64;
+                                size = (size << 32) | rd_be32(unsafe { val.add(off) }) as u64;
                                 off += 4;
                             }
                             if size != 0 {
@@ -158,7 +158,7 @@ pub fn cpu_count(dtb: usize) -> usize {
     if rd_be32(base) != FDT_MAGIC {
         return 1;
     }
-    let struct_off = rd_be32(base.add(8)) as usize;
+    let struct_off = rd_be32(unsafe { base.add(8) }) as usize;
 
     // Depth counts BEGIN_NODEs: root = 1, its children = 2, grandchildren
     // = 3.  `/cpus` sits at depth 2, `cpu@N` at depth 3.
@@ -167,7 +167,7 @@ pub fn cpu_count(dtb: usize) -> usize {
     let mut count = 1usize;
     let mut p = struct_off;
     loop {
-        let token = rd_be32(base.add(p));
+        let token = rd_be32(unsafe { base.add(p) });
         p += 4;
         match token {
             FDT_BEGIN_NODE => {
@@ -191,7 +191,7 @@ pub fn cpu_count(dtb: usize) -> usize {
                 }
             }
             FDT_PROP => {
-                let len = rd_be32(base.add(p)) as usize;
+                let len = rd_be32(unsafe { base.add(p) }) as usize;
                 p += 8;
                 p = (p + len + 3) & !3;
             }

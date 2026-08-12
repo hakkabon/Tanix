@@ -91,8 +91,9 @@ impl VirtioPci {
         // BARs that came up zero get a guest-assigned address inside the
         // 32-bit PCI window (see `pci::assign_bar` — QEMU's mmio64 window
         // vanishes with `highmem=off`, leaving 64-bit prefetchable BARs
-        // unassigned).
-        let mut window = 0x3EFE_0000u64;
+        // unassigned; `sbsa-ref` has no firmware to enumerate either, so
+        // the same guest-side assignment is needed there — Phase 16).
+        let mut window = pci::bar_window();
         let mut mapped_bars = [0u64; 6];
         let mut bar_span = [0usize; 6];
         for cap in &caps[..n] {

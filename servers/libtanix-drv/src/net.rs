@@ -154,6 +154,11 @@ impl VirtioNet {
     pub fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
         let mut used = [(0u16, 0u32); 8];
         let n = self.rx.drain_used(&mut used);
+        // Phase 16: the device DMA-wrote these buffers; on a real SoC the
+        // CPU's caches must be invalidated/cleaned before the reads below
+        // (QEMU's model is coherent, SYS_CACHE_SYNC is a cheap no-op-ish
+        // barrier there).
+        sys::cache_sync();
         for (id, len) in used[..n].iter() {
             // Re-arm the slot regardless of how we consume it below.
             self.rx.write_desc(*id, self.rx_base + *id as u64 * RX_BUF_SIZE as u64, RX_BUF_SIZE as u32, DESC_WRITE, 0);
@@ -185,6 +190,9 @@ impl VirtioNet {
         let total = NET_HDR_SIZE + frame.len();
         self.tx.write_desc(TX_SLOT, self.tx_base, total as u32, 0, 0);
         self.tx.publish(TX_SLOT);
+        // Phase 16: clean the CPU's writes to the frame + descriptor before
+        // the device DMA-reads them (see SYS_CACHE_SYNC).
+        sys::cache_sync();
         self.dev.notify(QUEUE_TX);
         self.tx_done = false;
         true

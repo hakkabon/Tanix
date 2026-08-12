@@ -24,9 +24,16 @@ fn main() {
 
     // Rebuild if the guest stub binary changes (or appears).
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
+    // Phase 16: the sbsa-ref build embeds server binaries linked for the
+    // sbsa RAM window (built with TANIX_LINK_SHIFT into a separate target
+    // dir, e.g. target-sbsa); TANIX_SERVER_TARGET_DIR points there.
+    let server_dir =
+        std::env::var("TANIX_SERVER_TARGET_DIR").unwrap_or_else(|_| "target".into());
+    println!("cargo:rerun-if-env-changed=TANIX_SERVER_TARGET_DIR");
+    println!("cargo:rerun-if-env-changed=PROFILE");
     let stub_path = format!(
-        "../../target/aarch64-unknown-none/{}/tanix-zephyr-stub",
-        profile
+        "../../{}/aarch64-unknown-none/{}/tanix-zephyr-stub",
+        server_dir, profile
     );
     println!("cargo:rerun-if-changed={}", stub_path);
     println!("cargo:rustc-env=TANIX_STUB_BIN_PATH={}", stub_path);
@@ -39,8 +46,8 @@ fn main() {
         "wm", "counter", "clock", "ramfs", "shell", "net", "ping", "pong",
     ] {
         let path = format!(
-            "../../target/aarch64-unknown-none/{}/tanix-{}",
-            profile, name
+            "../../{}/aarch64-unknown-none/{}/tanix-{}",
+            server_dir, profile, name
         );
         println!("cargo:rerun-if-changed={}", path);
         println!(
