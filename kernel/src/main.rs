@@ -134,12 +134,30 @@ _start:
     mov  sp, x0
     // Call the EL3 monitor: (dtb, is_secondary, el1_entry).  It erets to
     // `1:` below (primary) or to the EL3 park loop (secondary).
+    // QEMU resets every CPU at this vector; CPU0 is the primary, the
+    // others (Aff0 != 0) park in `monitor_park_loop` until the kernel
+    // wakes them with a PSCI CPU_ON command slot + SGI.
     adr  x2, 1f
     mov  x0, x24
-    mov  x1, #0
+    mrs  x1, MPIDR_EL1
+    and  x1, x1, #0xff
+    cmp  x1, #0
+    cset x1, ne
     bl   monitor_el3_init
 
 1:  // NS EL1h continuation (primary only): SIMD/FP + kernel stack.
+    // (TEMP DEBUG: announce the EL we actually landed at on the NS PL011.)
+    mrs  x9, CurrentEL
+    and  x9, x9, #0xc
+    lsr  x9, x9, #2
+    add  x9, x9, #0x30
+    movz x10, #0x1000, lsl #16   // UART base 0x60000000 (sbsa NS PL011)
+    movk x10, #0x6000, lsl #16
+    add  x10, x10, #0x18         // FR
+2:  ldr  w11, [x10]
+    tbnz w11, #5, 2b             // wait for TX FIFO not full
+    sub  x10, x10, #0x18         // DR
+    strb w9, [x10]
     mov  x1, #3
     lsl  x1, x1, #20
     msr  CPACR_EL1, x1
@@ -691,6 +709,20 @@ fn kmain(dtb: usize) -> ! {
             "phase 16: secure tick counter now {}",
             arch::aarch64::monitor::secure_tick_get()
         );
+    }
+
+    // ── Phase 17: secure services demo (storage / keybox / attestation) ─────
+    //
+    // The `sec` server exercises the EL3 monitor's services end-to-end:
+    // secure storage PUT/GET, keybox seal/unseal, and an attestation
+    // quote of its *own* image (digest + EL3-secret keyed MAC, nonce
+    // bound).  sbsa-ref only — `virt` has no EL3 monitor, and the server
+    // parks with a log line there.
+    if arch::aarch64::machine().id == arch::aarch64::machine::MACHINE_SBSA_REF {
+        match crate::server::spawn_by_name_locked("sec") {
+            Ok(id) => log::info!("phase 17: spawned secure-services server as task {:?}", id),
+            Err(e) => log::warn!("phase 17: could not spawn secure-services server ({})", e),
+        }
     }
 
     // ── Phase 5: display stack ────────────────────────────────────────────────

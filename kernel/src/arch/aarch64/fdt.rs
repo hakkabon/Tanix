@@ -54,6 +54,9 @@ fn rd_be64(p: *const u8) -> u64 {
 /// pointer is not a valid FDT (or has no memory node).
 pub fn dram_region(dtb: usize) -> Option<MemoryRegion> {
     let base = dtb as *const u8;
+    if dtb == 0 {
+        return None;
+    }
     if rd_be32(base) != FDT_MAGIC {
         return None;
     }

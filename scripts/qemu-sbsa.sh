@@ -11,6 +11,10 @@
 # target-sbsa/sec.log.
 #
 # Requires: just kernel-sbsa   (servers + kernel built into target-sbsa/)
+#
+# Note: QEMU 11 keeps TrustZone on sbsa-ref unconditionally (the `secure`
+# machine property was dropped); older QEMU accepted `-machine
+# sbsa-ref,secure=on` and behaves the same.
 
 set -euo pipefail
 
@@ -32,8 +36,8 @@ echo "NS console follows (Ctrl-A X to quit QEMU); secure console → ${SEC_LOG}"
 echo "──────────────────────────────────────────────"
 
 exec qemu-system-aarch64 \
-    -machine sbsa-ref,secure=on \
-    -cpu cortex-a53 \
+    -machine sbsa-ref \
+    -cpu cortex-a57 \
     -m 1G \
     -smp 4 \
     -nographic \

@@ -1,0 +1,10 @@
+EL3 monitor: secure world installed
+1[INFO ] Tanix kernel — aarch64 init
+[INFO ] exception vectors installed
+[INFO ] GICv3 initialised
+[INFO ] timer ready (freq=1000000000 Hz)
+[INFO ] kernel image ends at 0x10000ff0000
+[INFO ] machine 1: DDR 0x10000000000..0x10040000000 (1024 MiB, dtb=0x0)
+[INFO ] frame allocator: 1008 MiB free of 0x10000000000..0x10040000000 (258064 frames)
+[INFO ] dbg: L0[2]=0x10000ff0003 L1[0]=0x10000ff1003 L2[0]=0x10000000701 L2[1]=0x10000200701
+[INFO ] dbg: TTBR0=0x10000f91000 TCR=0x20b5103510 SCTLR=0xc50838 (kernel_l0=0x10000f91000)

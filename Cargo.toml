@@ -23,6 +23,7 @@ members = [
     "servers/net",
     "servers/ping",
     "servers/pong",
+    "servers/sec",
 ]
 
 [workspace.package]

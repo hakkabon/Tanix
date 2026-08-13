@@ -79,6 +79,7 @@ static SERVER_BINS: &[(&str, &[u8])] = &[
     ("net", include_bytes!(env!("TANIX_NET_BIN_PATH"))),
     ("ping", include_bytes!(env!("TANIX_PING_BIN_PATH"))),
     ("pong", include_bytes!(env!("TANIX_PONG_BIN_PATH"))),
+    ("sec", include_bytes!(env!("TANIX_SEC_BIN_PATH"))),
 ];
 
 #[cfg(not(feature = "embed-servers"))]
@@ -115,6 +116,7 @@ pub const SERVER_BASES: &[(&str, usize)] = &[
     ("net",     0x411A_0000),
     ("ping",    0x411C_0000),
     ("pong",    0x411E_0000),
+    ("sec",     0x4120_0000),
 ];
 
 /// Phase 16: the fixed link bases above are chosen for the `virt` machine's
@@ -168,6 +170,7 @@ pub const SERVER_PRIOS: &[(&str, u8)] = &[
     ("net",      96),
     ("ping",     96),
     ("pong",     96),
+    ("sec",      96),
     ("hog",     192),
 ];
 
@@ -269,6 +272,8 @@ pub fn spawn_by_name_locked(name: &str) -> Result<TaskId, i32> {
             kernel_stack_top,
             boot_page,
             boot,
+            base,
+            image_end,
         )
     }
     .ok_or(-8)?;

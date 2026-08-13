@@ -127,6 +127,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tanix-sec"
+version = "0.1.0"
+dependencies = [
+ "tanix-libsys",
+]
+
+[[package]]
 name = "tanix-shell"
 version = "0.1.0"
 dependencies = [

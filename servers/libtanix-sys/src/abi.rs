@@ -41,6 +41,10 @@ pub struct BootInfo {
     pub machine: u32,
 }
 
+/// Machine ids (mirror of `kernel/src/arch/aarch64/machine.rs`).
+pub const MACHINE_VIRT: u32 = 0;
+pub const MACHINE_SBSA_REF: u32 = 1;
+
 // ── Per-server protocol constants ─────────────────────────────────────────────
 
 /// Device server (`dev`) — owns UART0.

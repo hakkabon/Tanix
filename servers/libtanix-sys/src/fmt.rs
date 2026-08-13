@@ -38,6 +38,19 @@ impl StrBuf {
         }
     }
 
+    /// Append `0x` + 16 lowercase hex digits (Phase 17: attestation
+    /// digests / MACs are u64).
+    pub fn push_hex64(&mut self, v: u64) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        self.push_str("0x");
+        for shift in (0..64).step_by(4).rev() {
+            if self.len < self.buf.len() {
+                self.buf[self.len] = HEX[((v >> shift) & 0xf) as usize];
+                self.len += 1;
+            }
+        }
+    }
+
     /// Append decimal digits.
     pub fn push_dec32(&mut self, v: u32) {
         let mut tmp = [0u8; 10];

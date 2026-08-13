@@ -32,6 +32,12 @@ pub const SYS_EXEC: u64 = 14; // Phase 9: exec an embedded app image (replaces a
 pub const SYS_MAP_DEVICE: u64 = 15; // Phase 10: identity-map a device-MMIO window (PCI ECAM/BARs)
 pub const SYS_IRQ_PENDING: u64 = 16; // Phase 10: non-blocking "device IRQ delivered?" poll
 pub const SYS_CACHE_SYNC: u64 = 17; // Phase 16: clean/invalidate caches after DMA ownership transfer
+pub const SYS_SEC_STORAGE_PUT: u64 = 18; // Phase 17: tuck a ≤232 B blob into the EL3 secure store
+pub const SYS_SEC_STORAGE_GET: u64 = 19; // Phase 17: read a blob back out of the secure store
+pub const SYS_KEYBOX_GEN: u64 = 20; // Phase 17: mint a key inside the EL3 keybox (never exported)
+pub const SYS_KEYBOX_SEAL: u64 = 21; // Phase 17: seal a buffer with a key that never leaves EL3
+pub const SYS_KEYBOX_UNSEAL: u64 = 22; // Phase 17: inverse of SYS_KEYBOX_SEAL
+pub const SYS_ATTEST: u64 = 23; // Phase 17: EL3 quote of this task's own image
 
 /// Invoke syscall `nr` with arguments `a0..a2`; returns the kernel's x0.
 ///
@@ -178,6 +184,62 @@ pub fn map_device(phys: u64, pages: u32) -> i32 {
 /// (the sbsa-ref / SBSA story this syscall exists for) are not.
 pub fn cache_sync() -> i32 {
     unsafe { raw_syscall(SYS_CACHE_SYNC, 0, 0, 0) as i32 }
+}
+
+// ── Phase 17 secure services ─────────────────────────────────────────────────
+
+/// `sec_storage_put(name, data)` — store `data` (≤ 232 B) in the EL3
+/// secure store under the 8-byte `name` (sbsa-ref only; -1 on virt).
+/// Returns 0, or -1.
+pub fn sec_storage_put(name: &[u8; 8], data: &[u8]) -> i32 {
+    unsafe {
+        raw_syscall(
+            SYS_SEC_STORAGE_PUT,
+            name.as_ptr() as u64,
+            data.as_ptr() as u64,
+            data.len() as u64,
+        ) as i32
+    }
+}
+
+/// `sec_storage_get(name, out)` — read the blob stored under `name`.
+/// Returns the stored length, -1 if absent, -2 if `out` is too small.
+pub fn sec_storage_get(name: &[u8; 8], out: &mut [u8]) -> i32 {
+    unsafe {
+        raw_syscall(
+            SYS_SEC_STORAGE_GET,
+            name.as_ptr() as u64,
+            out.as_mut_ptr() as u64,
+            out.len() as u64,
+        ) as i32
+    }
+}
+
+/// `keybox_gen(id)` — generate a 16-byte key inside the EL3 keybox
+/// (the key never leaves the secure world).  Returns 0, or -1.
+pub fn keybox_gen(id: u64) -> i32 {
+    unsafe { raw_syscall(SYS_KEYBOX_GEN, id, 0, 0) as i32 }
+}
+
+/// `keybox_seal(id, buf)` — XTEA-CFB the buffer with key `id` inside the
+/// EL3 keybox.  The key itself never leaves the secure world.  Returns 0,
+/// or -1 (unknown key / too large / counter wrap).
+pub fn keybox_seal(id: u64, buf: &mut [u8]) -> i32 {
+    unsafe { raw_syscall(SYS_KEYBOX_SEAL, id, buf.as_mut_ptr() as u64, buf.len() as u64) as i32 }
+}
+
+/// `keybox_unseal(id, buf)` — inverse of `keybox_seal`.
+pub fn keybox_unseal(id: u64, buf: &mut [u8]) -> i32 {
+    unsafe {
+        raw_syscall(SYS_KEYBOX_UNSEAL, id, buf.as_mut_ptr() as u64, buf.len() as u64) as i32
+    }
+}
+
+/// `attest(nonce, out)` — EL3 quote of *this* server's own image, bound
+/// to `nonce`: `out[0]` = FNV-1a digest, `out[1]` = keyed MAC over
+/// (secret ‖ nonce ‖ digest).  Returns 0, or -1.
+pub fn attest(nonce: u64, out: &mut [u64; 2]) -> i32 {
+    unsafe { raw_syscall(SYS_ATTEST, out.as_mut_ptr() as u64, nonce, 0) as i32 }
 }
 
 /// `log(level, msg)` — kernel log line, prefixed with this server's name.

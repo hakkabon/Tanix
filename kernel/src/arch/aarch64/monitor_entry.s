@@ -139,7 +139,14 @@ smc_el3_entry:
     mov  x1, x2                // round
     bl   monitor_prepare_switch // write the payload's run data, then switch
     b    enter_secure
-8:  bl   monitor_smc_dispatch   // x0=fn, x1..x3=args → result in x0
+8:  // Pass the full arg set (x0..x5) to the Rust dispatcher.  x11 (the
+    // NS ctx pointer) is caller-saved per AAPCS64, so the Rust code may
+    // clobber it — park it on the EL3 stack around the call.
+    str  x11, [sp, #-16]!
+    ldr  x4, [x11, #32]
+    ldr  x5, [x11, #40]
+    bl   monitor_smc_dispatch   // x0=fn, x1..x5=args → result in x0
+    ldr  x11, [sp], #16
     str  x0, [x11, #0]
     b    restore_ns
     // ── secure caller (the payload's return): hand the result to the NS

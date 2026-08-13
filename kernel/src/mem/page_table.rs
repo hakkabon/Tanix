@@ -462,6 +462,17 @@ pub unsafe fn enable(ram_base: usize, ram_size: usize) {
     //    the identity map since our kernel VAs are below 0x0001_0000_0000.
     //    Real hardware: DSB ISH makes the table writes above globally
     //    visible before the MMU reads them.
+    {
+        let l0 = kernel_l0_phys() as *const u64;
+        let e2 = core::ptr::read_volatile(l0.add(2));
+        let l1 = (e2 & 0x0000_FFFF_FFFF_F000) as *const u64;
+        let e1 = core::ptr::read_volatile(l1);
+        let l2 = (e1 & 0x0000_FFFF_FFFF_F000) as *const u64;
+        log::info!(
+            "dbg: L0[2]={:#x} L1[0]={:#x} L2[0]={:#x} L2[1]={:#x}",
+            e2, e1, core::ptr::read_volatile(l2), core::ptr::read_volatile(l2.add(1))
+        );
+    }
     cache::dsb_ish();
     let ttbr0 = kernel_l0_phys() as u64;
     core::arch::asm!(
@@ -477,6 +488,20 @@ pub unsafe fn enable(ram_base: usize, ram_size: usize) {
     // 7. Enable MMU: set SCTLR_EL1.M (bit 0), I-cache (bit 12) and the
     //    cacheability bits (C bit 2, D-cache) — the identity map is
     //    Normal WB/WA, so the D-cache must be on to use it as intended.
+    {
+        let (ttbr0, tcr, sctlr): (u64, u64, u64);
+        core::arch::asm!(
+            "mrs {a}, TTBR0_EL1",
+            "mrs {b}, TCR_EL1",
+            "mrs {c}, SCTLR_EL1",
+            a = out(reg) ttbr0, b = out(reg) tcr, c = out(reg) sctlr,
+            options(nomem, nostack)
+        );
+        log::info!(
+            "dbg: TTBR0={:#x} TCR={:#x} SCTLR={:#x} (kernel_l0={:#x})",
+            ttbr0, tcr, sctlr, kernel_l0_phys()
+        );
+    }
     let mut sctlr: u64;
     core::arch::asm!("mrs {s}, SCTLR_EL1", s = out(reg) sctlr, options(nomem, nostack));
     sctlr |= 1 | (1 << 2) | (1 << 12); // M | C | I

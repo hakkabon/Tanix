@@ -65,6 +65,12 @@ pub const SYS_EXEC: u64 = 14; // Phase 9: exec an embedded app image (replaces a
 pub const SYS_MAP_DEVICE: u64 = 15; // Phase 10: identity-map a device-MMIO window (PCI ECAM/BARs)
 pub const SYS_IRQ_PENDING: u64 = 16; // Phase 10: non-blocking "device IRQ delivered?" poll
 pub const SYS_CACHE_SYNC: u64 = 17; // Phase 16: clean/invalidate caches after DMA ownership transfer
+pub const SYS_SEC_STORAGE_PUT: u64 = 18; // Phase 17: tuck a ≤232 B blob into the EL3 secure store
+pub const SYS_SEC_STORAGE_GET: u64 = 19; // Phase 17: read a blob back out of the secure store
+pub const SYS_KEYBOX_GEN: u64 = 20; // Phase 17: mint a key inside the EL3 keybox (never exported)
+pub const SYS_KEYBOX_SEAL: u64 = 21; // Phase 17: seal a buffer with a key that never leaves EL3
+pub const SYS_KEYBOX_UNSEAL: u64 = 22; // Phase 17: inverse of SYS_KEYBOX_SEAL
+pub const SYS_ATTEST: u64 = 23; // Phase 17: EL3 quote of this task's own image
 
 // ── Active TTBR0 helpers ──────────────────────────────────────────────────────
 
@@ -606,16 +612,37 @@ unsafe fn sys_wait_irq(irq: u32) -> i32 {
 /// its own address space; a global barrier is the safe one-size-fits-all
 /// for a microkernel syscall that takes no address).
 fn sys_cache_sync() -> u64 {
-    unsafe {
-        core::arch::asm!(
-            "dsb ish",
-            "ic iallu",
-            "dsb ish",
-            "isb",
-            options(nostack)
-        );
+     unsafe {
+         core::arch::asm!(
+             "dsb ish",
+             "ic iallu",
+             "dsb ish",
+             "isb",
+             options(nostack)
+         );
+     }
+     0
+ }
+
+/// Phase 17: EL3 attestation of the calling task's own image.
+///
+/// The kernel quotes `[image_base, image_end)` — the very bytes the
+/// server's loader wrote into its region — bound to the caller's `nonce`,
+/// and returns digest + MAC in `out[0..2]`.  `out` must be 16 writable
+/// bytes (EL0 memory of the caller).  Returns 0, or -1 (no image bounds —
+/// kernel context or exec'd task — or the monitor rejected the request).
+///
+/// # Safety
+/// `out` must be a valid 16-byte writable region.
+unsafe fn sys_attest(out: *mut [u64; 2], nonce: u64) -> i64 {
+    if out.is_null() {
+        return -1;
     }
-    0
+    let (base, end) = crate::sched::task::current_image_range();
+    if base == 0 || end <= base {
+        return -1;
+    }
+    crate::arch::aarch64::monitor::attest(base, end - base, nonce, unsafe { &mut *out })
 }
 
 /// `irq_pending(irq) -> 1|0` — Phase 10.  Non-blocking sibling of
@@ -735,6 +762,43 @@ pub unsafe extern "C" fn tanix_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> u6
         SYS_MAP_DEVICE => sys_map_device(a0, a1) as u64,
         SYS_IRQ_PENDING => sys_irq_pending(a0 as u32) as u64,
         SYS_CACHE_SYNC => sys_cache_sync(),
+        // Phase 17 secure services — forwarded to the EL3 monitor.  On
+        // `virt` there is no EL3 monitor; QEMU traps the SMC and returns
+        // PSCI_NOT_SUPPORTED (the wrappers translate it to an error).
+        SYS_SEC_STORAGE_PUT => {
+            if a0 == 0 || a1 == 0 {
+                !0 as u64
+            } else {
+                let name = *(a0 as *const [u8; 8]);
+                crate::arch::aarch64::monitor::secure_storage_put(&name, core::slice::from_raw_parts(a1 as *const u8, a2 as usize)) as u64
+            }
+        }
+        SYS_SEC_STORAGE_GET => {
+            if a0 == 0 || a1 == 0 {
+                !0 as u64
+            } else {
+                let name = *(a0 as *const [u8; 8]);
+                crate::arch::aarch64::monitor::secure_storage_get(&name, core::slice::from_raw_parts_mut(a1 as *mut u8, a2 as usize)) as u64
+            }
+        }
+        SYS_KEYBOX_GEN => {
+            crate::arch::aarch64::monitor::keybox_gen(a0) as u64
+        }
+        SYS_KEYBOX_SEAL => {
+            if a1 == 0 {
+                !0 as u64
+            } else {
+                crate::arch::aarch64::monitor::keybox_seal(a0, core::slice::from_raw_parts_mut(a1 as *mut u8, a2 as usize)) as u64
+            }
+        }
+        SYS_KEYBOX_UNSEAL => {
+            if a1 == 0 {
+                !0 as u64
+            } else {
+                crate::arch::aarch64::monitor::keybox_unseal(a0, core::slice::from_raw_parts_mut(a1 as *mut u8, a2 as usize)) as u64
+            }
+        }
+        SYS_ATTEST => sys_attest(a0 as *mut [u64; 2], a1) as u64,
         SYS_LOG => {
             sys_log(a0 as u32, a1 as *const u8);
             0

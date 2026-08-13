@@ -6,7 +6,11 @@
 //   +0x6000  sec_data — shared data (monitor writes iters/round/uart,
 //                       payload counts ticks; monitor serves read them)
 //   +0x7000  secure stack (grows down, 4 KiB)
-//   +0x8000  end of region (32 KiB total)
+//   +0x8000  sec_data_store — secure storage: 32 slots × 256 B (8 KiB),
+//            served by the EL3 monitor (S-EL1 payload never touches it)
+//   +0xA000  sec_data_keybox — keybox: 16 keys × 32 B (512 B)
+//   +0xA200  sec_data_secret — EL3-generated attestation secret (8 B)
+//   +0xC000  end of region (48 KiB total)
 //
 // The EL3 monitor copies the blob into secure RAM on `sbsa-ref`
 // (0x20000000, NS-invisible) and runs it in place on `virt`.  Everything
@@ -243,7 +247,32 @@ sec_data_scratch: .space 24    // +0x30  itoa scratch
     .global sec_stack_top
 sec_stack_top:
 
+    // ── Secure storage (Phase 17): 32 slots × 256 B ─────────────────────
+    // Slot layout (see monitor.rs STORE_* constants):
+    //   +0x00 u64 magic ("STOR"), +0x08 u64 name, +0x10 u64 len,
+    //   +0x18 .. +0xF8 data (232 B max).  Served by the EL3 monitor; the
+    //   payload never touches it.  Lives in secure RAM on sbsa-ref.
     .org 0x8000
+    .global sec_data_store
+sec_data_store:  .space 8192
+
+    // ── Keybox (Phase 17): 16 keys × 32 B ────────────────────────────────
+    // Slot layout: +0x00 u64 valid, +0x08 u64 key[0..8], +0x10 u64 key[8..16],
+    //              +0x18 u64 ctr (per-key use counter, CFB IV source).
+    // Keys are generated inside the secure world and never exported.
+    .org 0xA000
+    .global sec_data_keybox
+sec_data_keybox: .space 512
+
+    // ── Attestation secret (Phase 17): written by EL3 at boot ────────────
+    // 64-bit MAC key the NS kernel can never read; every attestation
+    // quote is keyed on it, so a forged quote is rejected by any verifier
+    // that holds the secret.
+    .org 0xA200
+    .global sec_data_secret
+sec_data_secret: .quad 0
+
+    .org 0xC000
     .global sec_payload_end
 sec_payload_end:
-    .p2align 15                 // advertise 32 KiB alignment for the region
+    .p2align 15                 // advertise 48 KiB alignment for the region

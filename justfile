@@ -46,6 +46,10 @@ servers-phase9: servers-phase8
 servers-phase10: servers-phase9
     cargo build --package tanix-libdrv --package tanix-net --target {{TARGET}}
 
+# Build the Phase-17 secure-services demo server
+servers-phase17: servers-phase10
+    cargo build --package tanix-sec --target {{TARGET}}
+
 # Build the kernel with all Phase-9 servers embedded
 kernel-phase9: servers-phase9
     cargo build --package {{KERNEL_PKG}} --target {{TARGET}} \
@@ -222,7 +226,7 @@ servers-sbsa:
         --package tanix-ui-demo --package tanix-hog --package tanix-wm \
         --package tanix-counter --package tanix-clock --package tanix-ramfs \
         --package tanix-shell --package tanix-libdrv --package tanix-net \
-        --package tanix-ping --package tanix-pong \
+        --package tanix-ping --package tanix-pong --package tanix-sec \
         --target {{TARGET}}
 
 # Build the kernel for sbsa-ref (feature sbsa-ref: EL3-reset boot, EL3

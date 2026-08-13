@@ -1,0 +1,8 @@
+[package]
+name = "tanix-sec"
+version.workspace = true
+edition.workspace = true
+description = "Tanix Phase-17 secure-services demo server — storage/keybox/attestation over SMC"
+
+[dependencies]
+tanix-libsys = { path = "../libtanix-sys" }

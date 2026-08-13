@@ -182,6 +182,13 @@ pub struct Task {
     /// is Blocked in `sys_sleep`; the timer-tick handler wakes the task once
     /// `timer::ticks()` passes it.
     pub sleep_deadline: u64,
+    // ── Phase 17 attestation bounds ──────────────────────────────────────────
+    /// First byte of the task's image in its (identity-mapped) address
+    /// space, as recorded by `spawn_user`; 0 = unknown.  Together with
+    /// `image_end` this is what `SYS_ATTEST` quotes.
+    pub image_base: usize,
+    /// One past the last byte of the image (exclusive bound).
+    pub image_end: usize,
 }
 
 impl Task {
@@ -202,6 +209,8 @@ impl Task {
             boot: BootInfo { task_id: 0, machine: 0 },
             irq_wait: None,
             sleep_deadline: 0,
+            image_base: 0,
+            image_end: 0,
         }
     }
 
@@ -226,6 +235,10 @@ impl Task {
             boot: BootInfo { task_id: 0, machine: 0 },
             irq_wait: None,
             sleep_deadline: 0,
+            // Phase 17 attestation bounds — set by `spawn_user`; 0 = unknown
+            // (kernel contexts, exec'd tasks without a recorded region).
+            image_base: 0,
+            image_end: 0,
         }
     }
 
@@ -364,6 +377,8 @@ impl Scheduler {
         kernel_stack_top: usize,
         boot_info: usize,
         boot: BootInfo,
+        image_base: usize,
+        image_end: usize,
     ) -> Option<TaskId> {
         let slot_idx = (1..MAX_TASKS).find(|i| self.tasks[*i].is_none())?;
         let slot = &mut self.tasks[slot_idx];
@@ -376,6 +391,8 @@ impl Scheduler {
             core::ptr::write_volatile(boot_info as *mut BootInfo, t.boot);
         }
         t.ttbr0 = ttbr0;
+        t.image_base = image_base;
+        t.image_end = image_end;
         t.ctx = Context::new_user(entry, sp_el0, ttbr0, kernel_stack_top, boot_info);
         // The new task is ready and waiting: record it so the spawner's
         // syscall tail can hand over to it if it is higher priority.
@@ -600,11 +617,15 @@ pub fn spawn_server_user(
     kernel_stack_top: usize,
     boot_info: usize,
     boot: BootInfo,
+    image_base: usize,
+    image_end: usize,
 ) -> Option<TaskId> {
     let lock = sched_lock();
     lock.lock();
     let r = unsafe {
-        spawn_server_user_locked(name, entry, ttbr0, sp_el0, kernel_stack_top, boot_info, boot)
+        spawn_server_user_locked(
+            name, entry, ttbr0, sp_el0, kernel_stack_top, boot_info, boot, image_base, image_end,
+        )
     };
     lock.unlock();
     r
@@ -621,10 +642,13 @@ pub(crate) unsafe fn spawn_server_user_locked(
     kernel_stack_top: usize,
     boot_info: usize,
     boot: BootInfo,
+    image_base: usize,
+    image_end: usize,
 ) -> Option<TaskId> {
     unsafe {
-        (*core::ptr::addr_of_mut!(SCHEDULER))
-            .spawn_user(name, entry, ttbr0, sp_el0, kernel_stack_top, boot_info, boot)
+        (*core::ptr::addr_of_mut!(SCHEDULER)).spawn_user(
+            name, entry, ttbr0, sp_el0, kernel_stack_top, boot_info, boot, image_base, image_end,
+        )
     }
 }
 
@@ -641,6 +665,20 @@ pub fn add_idle(cpu: usize) -> usize {
 /// Id of the currently running task (0 = kernel boot context).
 pub fn current_id() -> TaskId {
     unsafe { (*core::ptr::addr_of_mut!(SCHEDULER)).current_id() }
+}
+
+/// Image bounds `(image_base, image_end)` of the currently running task —
+/// Phase 17 `SYS_ATTEST` support.  Valid while `SCHED_LOCK` is held (the
+/// syscall path); `(0, 0)` for kernel contexts and tasks without recorded
+/// bounds.
+pub fn current_image_range() -> (usize, usize) {
+    unsafe {
+        let sched = &*core::ptr::addr_of!(SCHEDULER);
+        sched.tasks[crate::smp::current_idx()]
+            .as_ref()
+            .map(|t| (t.image_base, t.image_end))
+            .unwrap_or((0, 0))
+    }
 }
 
 /// Physical address of the current task's L0 page table (0 = kernel table).
