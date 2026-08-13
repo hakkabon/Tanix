@@ -1,4 +1,0 @@
-cargo:rerun-if-changed=/Users/uffe/Documents/ai-coding/opencode/Tanix/servers/zephyr-stub/link.ld
-cargo:rustc-link-arg=-T/Users/uffe/Documents/ai-coding/opencode/Tanix/servers/zephyr-stub/link.ld
-cargo:rustc-link-arg=--entry=_start
-cargo:rustc-link-arg=--no-dynamic-linker

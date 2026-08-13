@@ -1,6 +1,0 @@
-cargo:rerun-if-changed=/Users/uffe/Documents/ai-coding/opencode/Tanix/servers/display/../link.ld
-cargo:rustc-link-arg=-T/Users/uffe/Documents/ai-coding/opencode/Tanix/servers/display/../link.ld
-cargo:rustc-link-arg=--entry=_start
-cargo:rustc-link-arg=--no-dynamic-linker
-cargo:rerun-if-env-changed=TANIX_LINK_SHIFT
-cargo:rustc-link-arg=--defsym=LINK_BASE=0xffc0410a0000
