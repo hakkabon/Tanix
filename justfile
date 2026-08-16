@@ -218,7 +218,7 @@ net-test: kernel-phase11
 # guest (zephyr-stub) is built here too so the whole embedded image set
 # comes from one directory.
 servers-sbsa:
-    TANIX_LINK_SHIFT=0xFFC000000000 CARGO_TARGET_DIR=target-sbsa cargo build \
+    TANIX_LINK_SHIFT=0xFFC0000000 CARGO_TARGET_DIR=target-sbsa cargo build \
         --package tanix-zephyr-stub --package tanix-libsys \
         --package tanix-init --package tanix-pm --package tanix-mem \
         --package tanix-dev --package tanix-worker \

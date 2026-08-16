@@ -24,20 +24,22 @@ SECTIONS
         *(.text*)
     }
 
-    .rodata : ALIGN(8) {
+    /* Phase 18: sections page-aligned so the ELF can be wrapped into a
+     * PE/COFF image (EFI requires 4 KiB-aligned section RVAs). */
+    .rodata : ALIGN(4096) {
         *(.rodata*)
     }
 
-    .data : ALIGN(8) {
+    .data : ALIGN(4096) {
         *(.data*)
     }
 
     /* Small data / GOT — needed even if Rust does not emit much here */
-    .got : ALIGN(8) {
+    .got : ALIGN(4096) {
         *(.got*)
     }
 
-    .bss (NOLOAD) : ALIGN(8) {
+    .bss (NOLOAD) : ALIGN(4096) {
         __bss_start = .;
         *(.bss*)
         *(COMMON)

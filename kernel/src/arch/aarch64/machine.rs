@@ -52,10 +52,16 @@ pub struct Machine {
     /// TrustZone secure RAM (0 = none — secure payload runs in place).
     pub secure_ram_base: usize,
     pub secure_ram_size: usize,
+    /// GIC ITS base (Phase 18 — MSI-X/LPI doorbells; 0 = no ITS).
+    pub its_base: usize,
+    /// PCIe ECAM window base (Phase 18; 0 = no PCIe).
+    pub ecam_base: usize,
 }
 
-/// The machine this kernel was built for.
-pub fn machine() -> Machine {
+/// Phase 18: the machine the kernel was *built for* (compile-time default).
+/// `machine()` may be overridden at boot with ACPI-discovered values
+/// (`set_from_acpi`), so this is only the pre-firmware answer.
+const fn default_machine() -> Machine {
     #[cfg(feature = "sbsa-ref")]
     {
         Machine {
@@ -70,6 +76,8 @@ pub fn machine() -> Machine {
             virtio_mmio_base: 0,
             secure_ram_base: 0x2000_0000,
             secure_ram_size: 512 * 1024 * 1024,
+            its_base: 0x4408_1000,
+            ecam_base: 0xF000_0000,
         }
     }
     #[cfg(not(feature = "sbsa-ref"))]
@@ -86,8 +94,45 @@ pub fn machine() -> Machine {
             virtio_mmio_base: 0x0A00_0000,
             secure_ram_base: 0,
             secure_ram_size: 0,
+            its_base: 0,
+            ecam_base: 0x3F00_0000,
         }
     }
+}
+
+/// The active machine: compile-time default, replaced once at boot when
+/// ACPI tables are available (Phase 18).  Single-threaded boot-time write
+/// — every reader uses `machine()`.
+static mut CURRENT: Machine = default_machine();
+
+/// The machine this kernel runs on.
+pub fn machine() -> Machine {
+    unsafe { CURRENT }
+}
+
+/// Phase 18: override the compile-time machine with values parsed from the
+/// ACPI tables published by the UEFI firmware.  Only non-zero ACPI values
+/// win; everything else keeps the build-time default.  Must be called
+/// before any hardware init (single-threaded boot phase).
+pub fn set_from_acpi(info: &crate::arch::aarch64::acpi::AcpiInfo) {
+    let mut m = machine();
+    if info.gic_dist_base != 0 {
+        m.gic_dist_base = info.gic_dist_base;
+    }
+    if info.gic_redist_base != 0 {
+        m.gic_redist_base = info.gic_redist_base;
+    }
+    if info.its_base != 0 {
+        m.its_base = info.its_base;
+    }
+    if info.uart_base != 0 {
+        m.uart_base = info.uart_base;
+        m.secure_uart_base = info.uart_base;
+    }
+    if info.ecam_base != 0 {
+        m.ecam_base = info.ecam_base;
+    }
+    unsafe { CURRENT = m };
 }
 
 /// True when this build targets the SBSA reference platform.

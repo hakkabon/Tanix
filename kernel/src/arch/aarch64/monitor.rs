@@ -379,6 +379,9 @@ pub extern "C" fn monitor_el3_init(dtb: u64, is_secondary: u64, el1_entry: u64) 
                 "msr ELR_EL2, {elr}",
                 "mov x10, {spsr1}",
                 "msr SPSR_EL2, x10",   // EL1h, DAIF masked
+                "mov x1, xzr",         // Phase 18: `_start` 1: stashes x1 as
+                                       // the EFI system table — this is a
+                                       // `-kernel` boot, so hand over 0.
                 "isb",
                 "eret",
                 elr = in(reg) el1_entry,

@@ -93,6 +93,12 @@ _start:
     eret
 
 2:  // EL2 -> EL1: HCR_EL2.RW=1 forces AArch64 at EL1.
+    // Phase 18: when UEFI firmware starts the kernel as an EFI app, x1
+    // holds the EFI system table pointer (0 under QEMU -kernel).  Stash
+    // it before clobbering x1 — efi::handoff reads it after BSS zeroing.
+    adrp x2, EFI_SYSTAB
+    add  x2, x2, :lo12:EFI_SYSTAB
+    str  x1, [x2]
     mov  x1, #1
     lsl  x1, x1, #31
     msr  HCR_EL2, x1
@@ -106,6 +112,19 @@ _start:
 
 1:  // EL1h: allow SIMD/FP at EL1 (CPACR_EL1.FPEN=3) — the server tasks
     // use NEON in libtanix-sys (e.g. buffer zeroing in `log`).
+    // Phase 18: a firmware that starts the EFI app at EL1 hands control
+    // with the EL1 MMU *on* and x1 = system table.  Detect that (SCTLR_EL1
+    // bit 0 = M), stash x1, and drop the firmware stage-1 translation
+    // before the kernel's own MMU config takes over.  Under `-kernel`
+    // SCTLR_EL1 is already 0 and x1 is the EL1 return address — skip.
+    mrs  x9, SCTLR_EL1
+    tbz  x9, #0, 4f
+    adrp x2, EFI_SYSTAB
+    add  x2, x2, :lo12:EFI_SYSTAB
+    str  x1, [x2]
+    msr  SCTLR_EL1, xzr
+    isb
+4:
     mov  x1, #3
     lsl  x1, x1, #20
     msr  CPACR_EL1, x1
@@ -126,8 +145,19 @@ global_asm!(
     .global _start
 _start:
     // Save the DTB pointer (x0 from QEMU) before touching any register.
+    // Phase 18: when UEFI starts this image x0 is the image handle instead
+    // — the EL2/EL1 paths below treat x0 as junk and pass 0 as the DTB.
     mov  x24, x0
-    // At EL3 with SPsel=0: switch to SP_EL3 and set up the monitor stack.
+    mrs  x9, CurrentEL
+    and  x9, x9, #0xc
+    cmp  x9, #0xc
+    b.eq 3f
+    cmp  x9, #0x8
+    b.eq 2f
+    b    1f
+
+3:  // EL3 reset (-kernel): run the EL3 monitor.  At EL3 with SPsel=0:
+    // switch to SP_EL3 and set up the monitor stack.
     msr  SPSel, #1
     adrp x0, __el3_stack_top
     add  x0, x0, :lo12:__el3_stack_top
@@ -145,8 +175,39 @@ _start:
     cset x1, ne
     bl   monitor_el3_init
 
+2:  // EL2 entry (UEFI app): stash x1 = EFI system table, drop to EL1.
+    // Idle cores that QEMU's -kernel reset in ... (not reached at reset:
+    // secondaries enter at `secondary_entry`).
+    adrp x2, EFI_SYSTAB
+    add  x2, x2, :lo12:EFI_SYSTAB
+    str  x1, [x2]
+    mov  x1, #1
+    lsl  x1, x1, #31
+    msr  HCR_EL2, x1
+    msr  SCTLR_EL2, xzr
+    isb
+    adr  x1, 1f
+    msr  ELR_EL2, x1
+    mov  x1, #0x3c5      // SPSR: EL1h, DAIF masked
+    msr  SPSR_EL2, x1
+    mov  x1, xzr         // `1:` below re-stashes x1 — keep the saved table
+    eret
+
 1:  // NS EL1h continuation (primary only): SIMD/FP + kernel stack.
-    // (TEMP DEBUG: announce the EL we actually landed at on the NS PL011.)
+    // Phase 18: x1 is the EFI system table when a UEFI firmware started
+    // us (either direct at EL1, or via the EL2 leg above whose final eret
+    // leaves x1 = 0), and 0 on the EL3 `-kernel` path (the EL3 monitor
+    // zeroes x1 before its own final eret).  Stash it before the firmware
+    // stage-1 MMU is dropped — this must not be conditional on the MMU
+    // state (SbsaQemu's EDK2 enters the app at EL1 with it off).
+    adrp x2, EFI_SYSTAB
+    add  x2, x2, :lo12:EFI_SYSTAB
+    str  x1, [x2]
+    mrs  x9, SCTLR_EL1
+    tbz  x9, #0, 4f
+    msr  SCTLR_EL1, xzr
+    isb
+4:  // (TEMP DEBUG: announce the EL we actually landed at on the NS PL011.)
     mrs  x9, CurrentEL
     and  x9, x9, #0xc
     lsr  x9, x9, #2
@@ -318,8 +379,42 @@ pub extern "C" fn kmain_secondary_entry() -> ! {
 // ── Kernel main ───────────────────────────────────────────────────────────────
 
 fn kmain(dtb: usize) -> ! {
+    // ── Phase 18: firmware handoff ──────────────────────────────────────────
+    //
+    // When UEFI loaded this image, `_start` stashed the EFI system table
+    // and this is what we want back from the firmware: the ACPI RSDP (the
+    // real "how the platform describes itself" on FVP/real boards) and a
+    // device tree if the firmware carries one.  The ACPI parse runs before
+    // the UART is up (no logging here); its outcome is logged after init.
+    let efi = arch::aarch64::efi::handoff();
+    let dtb = if efi.booted_from_efi { efi.dtb } else { dtb };
+    let acpi = if efi.rsdp != 0 {
+        arch::aarch64::acpi::probe(efi.rsdp)
+    } else {
+        None
+    };
+    if let Some(info) = &acpi {
+        arch::aarch64::machine::set_from_acpi(info);
+    }
+
     // ── Phase 1: hardware ────────────────────────────────────────────────────
     arch::aarch64::init();
+
+    if efi.booted_from_efi {
+        log::info!(
+            "phase 18: UEFI boot — system table {:#x}, rsdp {:#x}, dtb {:#x}",
+            efi.systab, efi.rsdp, dtb
+        );
+        match &acpi {
+            Some(i) => log::info!(
+                "phase 18: ACPI machine — GICD={:#x} GICR={:#x} ITS={:#x} UART={:#x} ECAM={:#x}",
+                i.gic_dist_base, i.gic_redist_base, i.its_base, i.uart_base, i.ecam_base
+            ),
+            None => log::warn!(
+                "phase 18: no usable ACPI tables — falling back to machine defaults"
+            ),
+        }
+    }
 
     // ── Phase 2: memory + hypervisor ─────────────────────────────────────────
     let kernel_end = {
@@ -685,12 +780,17 @@ fn kmain(dtb: usize) -> ! {
     // QEMU's `virt` has no EL3 monitor of our own, so the calls trap to
     // QEMU's emulated PSCI for the PSCI ids and to our monitor-less
     // fallback for the rest; the demo therefore only runs on sbsa-ref).
-    if arch::aarch64::machine().id == arch::aarch64::machine::MACHINE_SBSA_REF {
+    // Phase 18: under UEFI the EL3 monitor / TrustZone setup never ran
+    // (the EL3-reset boot path installs it), so the SMC demos have no
+    // target — skip them and continue with the scheduler phases.
+    if arch::aarch64::machine().id == arch::aarch64::machine::MACHINE_SBSA_REF
+        && !efi.booted_from_efi
+    {
         let kernel_start = {
             extern "C" { static __kernel_start: u8; }
             core::ptr::addr_of!(__kernel_start) as usize
         };
-        let local = fnv1a(kernel_start, kernel_end);
+        let local = fnv1a(kernel_start, kernel_end - kernel_start);
         let measured = arch::aarch64::monitor::secure_measure_smc(kernel_start, kernel_end - kernel_start);
         log::info!(
             "phase 16: TCB measurement of kernel image \
@@ -718,7 +818,9 @@ fn kmain(dtb: usize) -> ! {
     // quote of its *own* image (digest + EL3-secret keyed MAC, nonce
     // bound).  sbsa-ref only — `virt` has no EL3 monitor, and the server
     // parks with a log line there.
-    if arch::aarch64::machine().id == arch::aarch64::machine::MACHINE_SBSA_REF {
+    if arch::aarch64::machine().id == arch::aarch64::machine::MACHINE_SBSA_REF
+        && !efi.booted_from_efi
+    {
         match crate::server::spawn_by_name_locked("sec") {
             Ok(id) => log::info!("phase 17: spawned secure-services server as task {:?}", id),
             Err(e) => log::warn!("phase 17: could not spawn secure-services server ({})", e),

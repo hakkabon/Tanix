@@ -11,7 +11,7 @@ fn main() {
     // Link the server at its final runtime address (see kernel server.rs).
     // Phase 16: TANIX_LINK_SHIFT (hex) moves the fixed virt link base onto
     // another machine's RAM window (the sbsa-ref build sets it to
-    // 0xFFC000000000 = its 1 TiB RAM base minus virt's 1 GiB base).
+    // 0xFFC0000000 = its 1 TiB RAM base minus virt's 1 GiB base).
     let shift = std::env::var("TANIX_LINK_SHIFT")
         .ok()
         .map(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0))

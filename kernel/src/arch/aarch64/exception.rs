@@ -264,8 +264,32 @@ pub extern "C" fn sync_handler(esr: u64, elr: u64, _far: u64, sp: u64) {
 /// Called for all unexpected / fatal exception slots.
 #[no_mangle]
 pub extern "C" fn exception_handler(kind: u64, esr: u64, elr: u64, far: u64) -> ! {
+    let (ttbr0, tcr, sctlr): (u64, u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "mrs {a}, TTBR0_EL1",
+            "mrs {b}, TCR_EL1",
+            "mrs {c}, SCTLR_EL1",
+            a = out(reg) ttbr0,
+            b = out(reg) tcr,
+            c = out(reg) sctlr,
+            options(nomem, nostack)
+        );
+    }
+    let l0 = (ttbr0 & 0x0000_FFFF_FFFF_F000) as *const u64;
+    let (l0e, l1e, l2e, l3e): (u64, u64, u64, u64);
+    unsafe {
+        l0e = core::ptr::read_volatile(l0.add(((far >> 39) & 0x1FF) as usize));
+        let l1 = (l0e & 0x0000_FFFF_FFFF_F000) as *const u64;
+        l1e = core::ptr::read_volatile(l1.add(((far >> 30) & 0x1FF) as usize));
+        let l2 = (l1e & 0x0000_FFFF_FFFF_F000) as *const u64;
+        l2e = core::ptr::read_volatile(l2.add(((far >> 21) & 0x1FF) as usize));
+        let l3 = (l2e & 0x0000_FFFF_FFFF_F000) as *const u64;
+        l3e = core::ptr::read_volatile(l3.add(((far >> 12) & 0x1FF) as usize));
+    }
     panic!(
-        "fatal exception kind={} ESR={:#010x} ELR={:#018x} FAR={:#018x}",
-        kind, esr, elr, far
+        "fatal exception kind={} ESR={:#010x} ELR={:#018x} FAR={:#018x} \
+         TTBR0={:#x} L0={:#x} L1={:#x} L2={:#x} L3={:#x}",
+        kind, esr, elr, far, ttbr0, l0e, l1e, l2e, l3e
     );
 }

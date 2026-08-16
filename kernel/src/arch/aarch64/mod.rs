@@ -1,5 +1,7 @@
 pub mod boot;
+pub mod acpi;
 pub mod cache;
+pub mod efi;
 pub mod exception;
 pub mod fdt;
 pub mod gic;
