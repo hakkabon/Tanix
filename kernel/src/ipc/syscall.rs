@@ -71,6 +71,9 @@ pub const SYS_KEYBOX_GEN: u64 = 20; // Phase 17: mint a key inside the EL3 keybo
 pub const SYS_KEYBOX_SEAL: u64 = 21; // Phase 17: seal a buffer with a key that never leaves EL3
 pub const SYS_KEYBOX_UNSEAL: u64 = 22; // Phase 17: inverse of SYS_KEYBOX_SEAL
 pub const SYS_ATTEST: u64 = 23; // Phase 17: EL3 quote of this task's own image
+pub const SYS_MAP_DEMAND: u64 = 24; // Phase 19: declare a zero-fill demand-paging window
+pub const SYS_MAP_COW: u64 = 25; // Phase 19: map a frame run into a task as copy-on-write
+pub const SYS_MAP_CAP: u64 = 26; // Phase 19: map a capability-gated MMIO window
 
 // ── Active TTBR0 helpers ──────────────────────────────────────────────────────
 
@@ -441,9 +444,10 @@ unsafe fn sys_free_frames(base: u64, pages: u32) -> i32 {
 /// the calling task's address space as EL0-visible Device-nGnRnE memory
 /// (and into the kernel's own table so kernel-side access works too).
 ///
-/// This is how a server reaches windows the kernel does not pre-map at
-/// boot — the PCIe ECAM space (0x3F00_0000) and the PCI memory BARs (in
-/// the 0x1000_0000..0x3EFE_FFFF window) on QEMU `virt,highmem=off`.
+/// Phase 19: the window must lie inside one of the caller's *granted MMIO
+/// capabilities* (`server::SERVER_MMIO_CAPS`) — a server can no longer map
+/// arbitrary device addresses, only the windows the kernel has awarded it
+/// (`dev`: UART, `net`: PCIe ECAM + BAR space, `display`: virtio-mmio).
 ///
 /// The physical addresses are those of MMIO, not of allocator frames — the
 /// caller must NOT pass a `SYS_ALLOC_FRAMES` result here (those are already
@@ -457,6 +461,17 @@ unsafe fn sys_map_device(phys: u64, pages: u64) -> i32 {
         return -12;
     }
     let size = pages as usize * PAGE_SIZE;
+
+    // Phase 19: capability gate — the window must be covered by a granted cap.
+    if !crate::server::cap_permits(crate::sched::task::current_name(), base, size) {
+        log::warn!(
+            "map_device: task '{}' denied window {:#x}+{} KiB (no capability)",
+            crate::sched::task::current_name(),
+            base,
+            size / 1024
+        );
+        return -13; // EACCES
+    }
 
     // Kernel view: Device-nGnRnE, non-executable (map_page is a no-op if a
     // covering block already exists — nothing pre-maps these windows).
@@ -472,6 +487,134 @@ unsafe fn sys_map_device(phys: u64, pages: u64) -> i32 {
     page_table::flush_tlb();
     log::trace!("map_device: {:#x}+{} KiB", base, size / 1024);
     0
+}
+
+/// `map_demand(va, pages)` — Phase 19.
+///
+/// Declares a zero-fill demand-paging window `[va, va + pages*4096)` in the
+/// calling task's address space.  No frames are allocated: the first touch
+/// of a page aliases the shared zero page (read-only, COW-tagged) and a
+/// subsequent write copies it into a private frame.  `va` must be
+/// page-aligned and live in the free VA zone above 4 GiB (clear of every
+/// identity-mapped kernel / server / MMIO window on both machines).
+/// Returns 0, or -errno.
+unsafe fn sys_map_demand(va: u64, pages: u64) -> i32 {
+    if current_ttbr0() == 0 {
+        return -5; // not an EL0 task
+    }
+    let base = va as usize;
+    if base & (PAGE_SIZE - 1) != 0 {
+        return -12;
+    }
+    if pages == 0 || pages > 512 {
+        return -12;
+    }
+    if base < 0x1_0000_0000 {
+        return -12; // must sit in the free VA zone above 4 GiB
+    }
+    if !crate::sched::task::push_current_region(
+        crate::sched::task::REGION_DEMAND,
+        base,
+        pages as usize,
+    ) {
+        return -12; // region table full or overlapping
+    }
+    log::debug!(
+        "map_demand: '{}' window {:#x}+{} pages (zero-fill, COW)",
+        crate::sched::task::current_name(),
+        base,
+        pages
+    );
+    0
+}
+
+/// `map_cow(phys, pages, task)` — Phase 19.
+///
+/// Maps the physical run `[phys, phys + pages*4096)` into task `task`'s
+/// address space as shared **read-only** pages carrying the COW tag.  The
+/// first write by that task faults and the kernel copies the frame into a
+/// private RW page (copy-on-write split); every other alias keeps the
+/// shared frame.  `phys` must be a managed-RAM run (e.g. from
+/// `SYS_ALLOC_FRAMES`).  Returns 0, or -errno.
+unsafe fn sys_map_cow(phys: u64, pages: u32, task: u32) -> i32 {
+    if phys == 0 || pages == 0 || pages > 4096 {
+        return -11;
+    }
+    if phys & (PAGE_SIZE as u64 - 1) != 0 {
+        return -12;
+    }
+    let (ram_base, ram_size) = frame::ram_bounds();
+    let size = pages as usize * PAGE_SIZE;
+    if (phys as usize) + size > ram_base + ram_size || (phys as usize) < ram_base {
+        return -12; // not managed RAM
+    }
+    let sched = crate::sched::task::scheduler();
+    let ttbr0 = match sched.task_by_id(TaskId(task)) {
+        Some(dst) => dst.ttbr0,
+        None => return -3, // no such task
+    };
+    if ttbr0 == 0 {
+        return 0; // kernel-side task — nothing to map
+    }
+    with_ttbr0(ttbr0, || {
+        page_table::map_user_pages(
+            ttbr0 as usize,
+            phys as usize,
+            size,
+            page_table::FLAGS_USER_COW,
+        );
+    });
+    page_table::flush_tlb();
+    log::debug!(
+        "map_cow: '{}' -> task {} frames {:#x}+{} pages (shared RO)",
+        crate::sched::task::current_name(),
+        task,
+        phys,
+        pages
+    );
+    0
+}
+
+/// `map_cap(idx)` — Phase 19.
+///
+/// Maps capability `idx` of the calling task's MMIO capability set
+/// (`server::SERVER_MMIO_CAPS`) into its address space as EL0-visible
+/// Device-nGnRnE memory.  Returns the resolved window base on success
+/// (machine-aware), or 0 when the capability does not exist / the window is
+/// unavailable on this machine.
+unsafe fn sys_map_cap(idx: u64) -> u64 {
+    if current_ttbr0() == 0 {
+        return 0;
+    }
+    let name = crate::sched::task::current_name();
+    let (base, size) = match crate::server::cap_window_for(name, idx as usize) {
+        Some(w) => w,
+        None => {
+            log::warn!("map_cap: '{}' has no capability #{}", name, idx);
+            return 0;
+        }
+    };
+    if base == 0 || size == 0 {
+        return 0;
+    }
+    // Kernel view (windowed maps for windows the boot pre-map does not cover).
+    for i in 0..size.div_ceil(PAGE_SIZE) {
+        page_table::map_page(base + i * PAGE_SIZE, base + i * PAGE_SIZE, page_table::FLAGS_DEVICE);
+    }
+    // Caller's view.
+    let ttbr0 = current_ttbr0();
+    if ttbr0 != 0 {
+        page_table::map_user_pages(ttbr0 as usize, base, size, page_table::FLAGS_USER_DEVICE);
+    }
+    page_table::flush_tlb();
+    log::info!(
+        "map_cap: '{}' cap #{} -> {:#x}+{} KiB (device, EL0)",
+        name,
+        idx,
+        base,
+        size / 1024
+    );
+    base as u64
 }
 
 /// `share_frames(base, pages, task)` — Phase 8.
@@ -760,6 +903,9 @@ pub unsafe extern "C" fn tanix_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> u6
         SYS_SLEEP => sys_sleep(a0 as u32, &mut switched) as u64,
         SYS_EXEC => sys_exec(a0 as *const u8) as u64,
         SYS_MAP_DEVICE => sys_map_device(a0, a1) as u64,
+        SYS_MAP_DEMAND => sys_map_demand(a0, a1) as u64,
+        SYS_MAP_COW => sys_map_cow(a0, a1 as u32, a2 as u32) as u64,
+        SYS_MAP_CAP => sys_map_cap(a0),
         SYS_IRQ_PENDING => sys_irq_pending(a0 as u32) as u64,
         SYS_CACHE_SYNC => sys_cache_sync(),
         // Phase 17 secure services — forwarded to the EL3 monitor.  On

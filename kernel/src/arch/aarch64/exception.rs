@@ -231,10 +231,16 @@ pub extern "C" fn sync_handler(esr: u64, elr: u64, _far: u64, sp: u64) {
             unsafe { core::ptr::write_volatile(frame.add(20) as *mut u64, elr + 4) };
         }
 
-        EC_DABT_LOWER | EC_IABT_LOWER => {
+        EC_DABT_LOWER => {
             let frame = sp as *const u64;
             if from_el0(frame) {
-                // An EL0 server faulted — isolate it (Phase 6).
+                // Phase 19: offer the fault to the VM-fault resolver first
+                // (demand paging / COW / stack growth).  On success the
+                // faulting instruction re-executes untouched; otherwise the
+                // task is isolated (Phase 6).
+                if crate::mem::vm_fault::resolve_user_fault(_far as usize, esr) {
+                    return;
+                }
                 unsafe { kill_faulting_task(esr, elr, _far) }
             }
             panic!(

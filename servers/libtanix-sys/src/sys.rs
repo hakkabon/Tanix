@@ -38,6 +38,9 @@ pub const SYS_KEYBOX_GEN: u64 = 20; // Phase 17: mint a key inside the EL3 keybo
 pub const SYS_KEYBOX_SEAL: u64 = 21; // Phase 17: seal a buffer with a key that never leaves EL3
 pub const SYS_KEYBOX_UNSEAL: u64 = 22; // Phase 17: inverse of SYS_KEYBOX_SEAL
 pub const SYS_ATTEST: u64 = 23; // Phase 17: EL3 quote of this task's own image
+pub const SYS_MAP_DEMAND: u64 = 24; // Phase 19: declare a zero-fill demand-paging window
+pub const SYS_MAP_COW: u64 = 25; // Phase 19: map a frame run into a task as copy-on-write
+pub const SYS_MAP_CAP: u64 = 26; // Phase 19: map a capability-gated MMIO window
 
 /// Invoke syscall `nr` with arguments `a0..a2`; returns the kernel's x0.
 ///
@@ -184,6 +187,32 @@ pub fn map_device(phys: u64, pages: u32) -> i32 {
 /// (the sbsa-ref / SBSA story this syscall exists for) are not.
 pub fn cache_sync() -> i32 {
     unsafe { raw_syscall(SYS_CACHE_SYNC, 0, 0, 0) as i32 }
+}
+
+// ── Phase 19 memory + MMIO capability syscalls ───────────────────────────────
+
+/// `map_demand(va, pages)` — declare a zero-fill demand-paging window.
+/// No frames are allocated up front; the first touch aliases the shared
+/// zero page (COW) and a write copies it into a private frame.  `va` must
+/// be page-aligned and above 4 GiB.  Returns 0, or negative errno.
+pub fn map_demand(va: usize, pages: u32) -> i32 {
+    unsafe { raw_syscall(SYS_MAP_DEMAND, va as u64, pages as u64, 0) as i32 }
+}
+
+/// `map_cow(phys, pages, task)` — map the frame run `phys` as shared
+/// read-only (copy-on-write) into task `task`'s address space.  The first
+/// write by that task gets a private copy; other aliases keep the shared
+/// frame.  Returns 0, or negative errno.
+pub fn map_cow(phys: u64, pages: u32, task: u32) -> i32 {
+    unsafe { raw_syscall(SYS_MAP_COW, phys, pages as u64, task as u64) as i32 }
+}
+
+/// `map_cap(idx)` — map MMIO capability `idx` of this task's granted set
+/// (dev: 0 = UART; net: 0 = PCIe ECAM, 1 = PCI BAR window; display:
+/// 0 = virtio-mmio).  Returns the machine-resolved window base on success,
+/// 0 on failure.
+pub fn map_cap(idx: u64) -> usize {
+    unsafe { raw_syscall(SYS_MAP_CAP, idx, 0, 0) as usize }
 }
 
 // ── Phase 17 secure services ─────────────────────────────────────────────────

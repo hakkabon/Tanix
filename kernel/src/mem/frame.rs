@@ -278,3 +278,8 @@ pub fn ram_bounds() -> (PhysAddr, usize) {
         )
     }
 }
+
+/// Number of currently free frames.
+pub fn free_frames() -> usize {
+    unsafe { (*core::ptr::addr_of!(FRAME_ALLOC)).free_frames() }
+}

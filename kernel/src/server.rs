@@ -53,10 +53,88 @@ pub const USER_STACK_SIZE: usize = 16 * 1024;
 const DISPLAY_MMIO_BASE: usize = 0x0A00_0000;
 const DISPLAY_MMIO_SIZE: usize = 32 * 0x200;
 
-/// PL011 UART0 page granted to the `dev` server (its `M_DEV_WRITE` service
-/// writes the console directly).  Machine-aware (Phase 16).
-fn dev_uart_base() -> usize {
-    crate::arch::aarch64::machine().uart_base
+// ── MMIO capability table (Phase 19) ─────────────────────────────────────────
+//
+// A server may map a device window only when the window is covered by one
+// of its granted capabilities — `SYS_MAP_DEVICE` and `SYS_MAP_CAP` are both
+// validated against this table.  The windows are *permissions*, resolved to
+// machine-specific addresses at check time; the mapping itself happens on
+// demand through the syscalls.
+
+/// What a capability names (the address depends on the machine).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapKind {
+    /// The machine's PL011 UART window.
+    Uart,
+    /// QEMU `virt` virtio-mmio transport window (none on `sbsa-ref`).
+    VirtioMmio,
+    /// PCIe ECAM config space.
+    Ecam,
+    /// PCI memory BAR window.
+    PciMem,
+}
+
+/// One granted capability: a device family and a window size.
+#[derive(Clone, Copy)]
+pub struct MmioCap {
+    pub kind: CapKind,
+    pub size: usize,
+}
+
+/// Per-server capability grants (Phase 19).  `dev` owns the console UART,
+/// `net` the PCIe config + BAR space, `display` the virtio-mmio transports.
+pub const SERVER_MMIO_CAPS: &[(&str, &[MmioCap])] = &[
+    ("dev", &[MmioCap { kind: CapKind::Uart, size: PAGE_SIZE }]),
+    (
+        "net",
+        &[
+            MmioCap { kind: CapKind::Ecam, size: 16 * 1024 * 1024 },
+            MmioCap { kind: CapKind::PciMem, size: 0x3000_0000 },
+        ],
+    ),
+    ("display", &[MmioCap { kind: CapKind::VirtioMmio, size: DISPLAY_MMIO_SIZE }]),
+];
+
+/// Resolve a capability window to machine-specific `(base, size)`.
+/// `None` when the cap index is out of range or the window does not exist
+/// on this machine (e.g. virtio-mmio on `sbsa-ref`).
+pub fn cap_window_for(name: &str, idx: usize) -> Option<(usize, usize)> {
+    let caps = SERVER_MMIO_CAPS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, c)| *c)?;
+    let cap = caps.get(idx)?;
+    let m = crate::arch::aarch64::machine();
+    let base = match cap.kind {
+        CapKind::Uart => m.uart_base,
+        CapKind::VirtioMmio => m.virtio_mmio_base,
+        CapKind::Ecam => {
+            if m.id == crate::arch::aarch64::machine::MACHINE_SBSA_REF {
+                0xF000_0000
+            } else {
+                0x3F00_0000
+            }
+        }
+        CapKind::PciMem => {
+            if m.id == crate::arch::aarch64::machine::MACHINE_SBSA_REF {
+                0xC000_0000
+            } else {
+                0x1000_0000
+            }
+        }
+    };
+    if base == 0 {
+        return None;
+    }
+    Some((base, cap.size))
+}
+
+/// Does the caller's capability set permit mapping `[base, base + size)`?
+pub fn cap_permits(name: &str, base: usize, size: usize) -> bool {
+    (0..16).any(|i| match cap_window_for(name, i) {
+        Some((cap_base, cap_size)) => base >= cap_base && size <= cap_size && base - cap_base + size <= cap_size,
+        None => false,
+    })
 }
 
 // ── Embedded binaries ─────────────────────────────────────────────────────────
@@ -216,9 +294,13 @@ pub fn spawn_by_name_locked(name: &str) -> Result<TaskId, i32> {
     // ── Phase 6: per-task address space ─────────────────────────────────────
     // Clone the kernel's identity map (all of it EL1-only) and open up
     // exactly what this server may touch at EL0:
-    //   • its own region: image + bootinfo page + user stack (RWX for now;
-    //     RO-for-text is a later tightening),
-    //   • display only: the virtio-mmio transport window.
+    //   • its own region: image + bootinfo page (RWX for now; RO-for-text
+    //     is a later tightening),
+    //   • the top 4 KiB of its user stack — the rest of the stack window is
+    //     faulted in page-by-page as it grows down (Phase 19),
+    //   • Phase 19: device windows are no longer granted here — servers
+    //     request them through SYS_MAP_DEVICE / SYS_MAP_CAP, which the
+    //     kernel validates against SERVER_MMIO_CAPS.
     // The kernel stack at the top of the region stays EL1-only.
     let ttbr0 = unsafe { page_table::clone_kernel_table() };
 
@@ -229,32 +311,26 @@ pub fn spawn_by_name_locked(name: &str) -> Result<TaskId, i32> {
         "server '{}': image too large for its region ({:#x} .. {:#x})",
         name, base, base + ram_size
     );
+    let stack_window_base = boot_page + PAGE_SIZE;
     unsafe {
         page_table::map_user_pages(ttbr0, base, boot_page - base, page_table::FLAGS_USER_RWX);
         page_table::map_user_pages(ttbr0, boot_page, PAGE_SIZE, page_table::FLAGS_USER_RWX);
         page_table::map_user_pages(
             ttbr0,
-            boot_page + PAGE_SIZE,
-            USER_STACK_SIZE,
+            stack_window_base + USER_STACK_SIZE - PAGE_SIZE,
+            PAGE_SIZE,
             page_table::FLAGS_USER_RWX,
         );
-        if name == "display" {
-            // `sbsa-ref` has no virtio-mmio transports; the display
-            // server simply finds no GPU there (Phase 16).
-            if DISPLAY_MMIO_BASE != 0 {
-                page_table::map_user_pages(
-                    ttbr0,
-                    DISPLAY_MMIO_BASE,
-                    DISPLAY_MMIO_SIZE,
-                    page_table::FLAGS_USER_DEVICE,
-                );
-            }
-        }
-        if name == "dev" {
+        // `display` (legacy, `virt` only) probes the virtio-mmio window with
+        // fixed build-time addresses and never asks for it — keep the
+        // spawn-time grant (its grant is mirrored in SERVER_MMIO_CAPS).  On
+        // `sbsa-ref` the window does not exist.  Phase 19: all other windows
+        // are requested through SYS_MAP_DEVICE / SYS_MAP_CAP instead.
+        if name == "display" && DISPLAY_MMIO_BASE != 0 {
             page_table::map_user_pages(
                 ttbr0,
-                dev_uart_base(),
-                PAGE_SIZE,
+                DISPLAY_MMIO_BASE,
+                DISPLAY_MMIO_SIZE,
                 page_table::FLAGS_USER_DEVICE,
             );
         }
@@ -277,6 +353,16 @@ pub fn spawn_by_name_locked(name: &str) -> Result<TaskId, i32> {
         )
     }
     .ok_or(-8)?;
+    // Phase 19: record the (bottom, top] stack window so the fault
+    // resolver can grow it page-by-page from the single mapped top page.
+    if !crate::sched::task::push_region_for(
+        id,
+        crate::sched::task::REGION_STACK,
+        stack_window_base,
+        USER_STACK_SIZE / PAGE_SIZE,
+    ) {
+        log::warn!("server: '{}' stack region registration failed", name);
+    }
     // Phase 7: assign the server's scheduling priority.
     let prio = SERVER_PRIOS
         .iter()

@@ -923,6 +923,28 @@ fn kmain(dtb: usize) -> ! {
         );
     }
 
+    // ── Phase 19: demand paging / COW / stack growth / MMIO caps ─────────────
+    //
+    // The machinery is live from the moment the first server runs: every
+    // EL0 data abort is offered to the VM-fault resolver (translation
+    // faults inside a stack or demand window get repaired; permission
+    // faults on COW-tagged pages split the frame; access-flag faults get
+    // the AF bit set), and SYS_MAP_DEVICE / SYS_MAP_CAP are validated
+    // against the per-server capability table (server::SERVER_MMIO_CAPS).
+    //
+    // The demo lives in the servers themselves:
+    //   • `init`  — demand-maps an 8-page window (zero-fill COW, then
+    //               write-splits), COW-maps two of its own frames and
+    //               writes them apart, all verified through the syscalls;
+    //   • `dev`   — requests the UART through SYS_MAP_CAP (no more
+    //               hardcoded virt address) and grows its stack lazily.
+    log::info!(
+        "phase 19: VM fault resolver + MMIO capability gates armed \
+         (zero page {:#x}, {} free frames)",
+        mem::page_table::zero_page_phys(),
+        mem::frame::free_frames()
+    );
+
     // ── Idle ─────────────────────────────────────────────────────────────────
     arch::aarch64::halt();
 }

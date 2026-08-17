@@ -133,6 +133,80 @@ pub extern "C" fn server_main(_info: *const BootInfo) -> ! {
         pack_str(&mut msg, "init: boot complete");
         let _ = call(dev as u32, &msg);
     }
+
+    // ── Phase 19: demand paging + copy-on-write (stack growth is dev's). ──
+    {
+        let my_id = unsafe { (*_info).task_id };
+
+        // 6a. Demand paging: an 8-page window above 4 GiB.  Nothing is
+        //     mapped until touched; the first read aliases the kernel's
+        //     shared zero page (COW) and the first write splits it.
+        let va = 0x1_0000_0000usize;
+        let rc = sys::map_demand(va, 8);
+        if rc != 0 {
+            let mut b = StrBuf::new();
+            b.push_str("init: map_demand failed rc=");
+            b.push_dec32(rc as u32);
+            sys::log(2, b.as_str());
+        } else {
+            let zero_ok = (0..8)
+                .all(|i| unsafe { core::ptr::read_volatile((va + i * 4096) as *const u64) == 0 });
+            for i in 0..8usize {
+                unsafe {
+                    core::ptr::write_volatile(
+                        (va + i * 4096) as *mut u64,
+                        0xfeed_0000_0000 + i as u64,
+                    );
+                }
+            }
+            let mut ok = true;
+            for i in 0..8usize {
+                let v = unsafe { core::ptr::read_volatile((va + i * 4096) as *const u64) };
+                if v != 0xfeed_0000_0000 + i as u64 {
+                    ok = false;
+                }
+            }
+            let mut b = StrBuf::new();
+            b.push_str("init: demand pages zero-filled=");
+            b.push_dec32(zero_ok as u32);
+            b.push_str(" written/readback=");
+            b.push_dec32(ok as u32);
+            sys::log(0, b.as_str());
+        }
+
+        // 6b. COW: give pm a shared read-only alias of our frame run, then
+        //     re-map our own alias as COW too and write it — the kernel
+        //     splits a private frame, leaves the shared one intact.
+        let base = sys::alloc_frames(2);
+        if base != 0 {
+            unsafe { core::ptr::write_volatile(base as *mut u64, 0xA11CE) };
+            let rc = sys::map_cow(base, 2, pm.max(0) as u32);
+            let mut b = StrBuf::new();
+            b.push_str("init: map_cow into pm rc=");
+            b.push_dec32(rc as u32);
+            sys::log(0, b.as_str());
+
+            let rc2 = sys::map_cow(base, 2, my_id);
+            let mut b2 = StrBuf::new();
+            b2.push_str("init: map_cow into self rc=");
+            b2.push_dec32(rc2 as u32);
+            sys::log(0, b2.as_str());
+
+            if rc2 == 0 {
+                unsafe { core::ptr::write_volatile((base + 4096) as *mut u64, 0xB0B) };
+                let got = unsafe { core::ptr::read_volatile((base + 4096) as *const u64) };
+                let mut b3 = StrBuf::new();
+                b3.push_str("init: COW write landed (readback=");
+                b3.push_hex32((got >> 32) as u32);
+                b3.push_hex32(got as u32);
+                b3.push_str(")");
+                sys::log(0, b3.as_str());
+            }
+        } else {
+            sys::log(2, "init: alloc_frames failed (OOM)");
+        }
+    }
+
     sys::log(0, "init: done, exiting");
     sys::exit();
 }

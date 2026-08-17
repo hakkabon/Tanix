@@ -107,6 +107,40 @@ pub const FLAGS_USER_DEVICE: u64 = DESC_VALID
     | DESC_PXN
     | ATTR_DEVICE;
 
+// ── Copy-on-write marker bit (Phase 19) ───────────────────────────────────────
+
+/// Bit 12 of a stage-1 descriptor is architecturally *Ignored* — never
+/// interpreted by the translation hardware.  We borrow it as a kernel-side
+/// "copy-on-write" tag: a valid user page with this bit set is shared
+/// read-only (AP = 0b11 — R/O at both EL1 and EL0).  A permission fault on
+/// a tagged page makes the kernel copy the frame into a fresh private
+/// frame and remap it RW — the copy-on-write split (Phase 19).
+pub const DESC_COW_TAG: u64 = 1 << 12;
+
+/// Shared read-only page (EL0 and EL1), carrying the COW tag — used for the
+/// shared zero page (demand filling) and for COW-mapped frame runs.
+pub const FLAGS_USER_COW: u64 = DESC_VALID
+    | DESC_PAGE
+    | DESC_AF
+    | DESC_SH_INNER
+    | (0b11 << 6)
+    | DESC_COW_TAG
+    | ATTR_NORMAL;
+
+/// The physical frame every zero-fill demand page initially aliases
+/// (Phase 19).  A write to it is caught, the COW split copies this page
+/// into a private frame and remaps the VA RW.
+#[repr(C, align(4096))]
+struct ZeroPage([u8; PAGE_SIZE]);
+
+static mut ZERO_PAGE: ZeroPage = ZeroPage([0u8; PAGE_SIZE]);
+
+/// Physical address of the shared zero page (identity-mapped in the kernel
+/// image's .bss).
+pub fn zero_page_phys() -> PhysAddr {
+    core::ptr::addr_of!(ZERO_PAGE) as PhysAddr
+}
+
 // ── Table type ────────────────────────────────────────────────────────────────
 
 /// A single page-table level — 512 × 8-byte entries.
@@ -347,6 +381,69 @@ pub unsafe fn map_user_pages(root: PhysAddr, va: usize, size: usize, flags: u64)
     }
     // Real hardware (Phase 16): the table writes above are plain stores;
     // make them globally visible, then drop stale TLB entries.
+    super::super::arch::aarch64::cache::tlb_flush_all();
+}
+
+/// Map a single page `va → pa` in the table rooted at `root` (Phase 19).
+///
+/// Unlike `map_user_pages` (identity VA == PA), the destination frame is
+/// explicit — the demand-fill path maps VAs onto the shared zero page, and
+/// the COW split maps them onto a fresh private frame.
+///
+/// Intermediate levels are allocated on demand, so a fault address with no
+/// table entries at all (a free VA zone) works too.
+///
+/// # Safety
+/// `root` must be a valid task table (phys) and `va`/`pa` page-aligned.
+pub unsafe fn map_user_frame(root: PhysAddr, va: usize, pa: PhysAddr, flags: u64) {
+    debug_assert_eq!(va & (PAGE_SIZE - 1), 0, "map_user_frame: va unaligned");
+    debug_assert_eq!(pa & (PAGE_SIZE - 1), 0, "map_user_frame: pa unaligned");
+
+    let l0 = root as *mut PageTable;
+    let l1 = ensure_table(l0, l0_idx(va));
+    let l2 = ensure_table(l1, l1_idx(va));
+    let l3 = ensure_table(l2, l2_idx(va));
+    (*l3).set_entry(l3_idx(va), (pa as u64) | flags);
+    super::super::arch::aarch64::cache::tlb_flush_all();
+}
+
+/// Read the level-3 descriptor for `va` in the table rooted at `root`
+/// (0 when none — missing intermediate tables read as zero) (Phase 19).
+///
+/// # Safety
+/// `root` must be a valid task table (phys).
+pub unsafe fn read_user_page(root: PhysAddr, va: usize) -> u64 {
+    let l0 = root as *const PageTable;
+    let l0e = (*l0).entry(l0_idx(va));
+    if l0e & DESC_VALID == 0 {
+        return 0;
+    }
+    let l1 = (l0e & 0x0000_FFFF_FFFF_F000) as *const PageTable;
+    let l1e = (*l1).entry(l1_idx(va));
+    if l1e & DESC_VALID == 0 {
+        return 0;
+    }
+    let l2 = (l1e & 0x0000_FFFF_FFFF_F000) as *const PageTable;
+    let l2e = (*l2).entry(l2_idx(va));
+    if l2e & DESC_VALID == 0 || l2e & DESC_TABLE != 0 {
+        return 0;
+    }
+    let l3 = (l2e & 0x0000_FFFF_FFFF_F000) as *const PageTable;
+    (*l3).entry(l3_idx(va))
+}
+
+/// Overwrite the level-3 descriptor for `va` in the table rooted at `root`
+/// and flush the TLB (Phase 19).  The old entry must be a valid page
+/// descriptor (COW split / AF fixup both rewrite existing pages).
+///
+/// # Safety
+/// `root` must be a valid task table (phys).
+pub unsafe fn write_user_page(root: PhysAddr, va: usize, entry: u64) {
+    let l0 = root as *mut PageTable;
+    let l1 = ((&*l0).entry(l0_idx(va)) & 0x0000_FFFF_FFFF_F000) as *mut PageTable;
+    let l2 = ((&*l1).entry(l1_idx(va)) & 0x0000_FFFF_FFFF_F000) as *mut PageTable;
+    let l3 = ((&*l2).entry(l2_idx(va)) & 0x0000_FFFF_FFFF_F000) as *mut PageTable;
+    (*l3).set_entry(l3_idx(va), entry);
     super::super::arch::aarch64::cache::tlb_flush_all();
 }
 

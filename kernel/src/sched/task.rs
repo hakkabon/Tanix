@@ -28,6 +28,7 @@
 //! (slot 0), each secondary has a dedicated idle task slot.
 
 use super::{BootInfo, Message, PendingSend, StagedSend, TaskId, TaskState, M_ANY};
+use crate::mem::PAGE_SIZE;
 use crate::sync::SpinLock;
 
 /// Guards the entire scheduler state (task table, states, `woken`).
@@ -141,6 +142,37 @@ pub const TASK_NAME_LEN: usize = 16;
 /// Maximum number of senders blocked on one task at a time.
 pub const MAX_PENDING_SENDERS: usize = 2;
 
+// ── Phase 19 per-task memory regions ─────────────────────────────────────────
+
+pub const REGION_NONE: u8 = 0;
+/// Page-identity user stack — only the top page is mapped at spawn; a
+/// translation fault further down (but above `base`) maps the covering
+/// page — lazy downward stack growth.
+pub const REGION_STACK: u8 = 1;
+/// Zero-fill demand-paging window — nothing is mapped at `map_demand`; the
+/// first touch maps the shared COW zero page and a subsequent write splits
+/// it into a private frame.
+pub const REGION_DEMAND: u8 = 2;
+
+/// Cap on concurrent regions per task (one stack + a handful of demand
+/// windows is all the current API can create).
+pub const TASK_REGIONS: usize = 6;
+
+/// A task's virtual-memory region — the fault resolver's map of what may
+/// be faulted in and how.
+#[derive(Clone, Copy, Debug)]
+pub struct TaskRegion {
+    pub kind: u8,
+    pub base: usize,
+    pub pages: usize,
+}
+
+impl TaskRegion {
+    pub const fn none() -> Self {
+        Self { kind: REGION_NONE, base: 0, pages: 0 }
+    }
+}
+
 pub struct Task {
     pub id: TaskId,
     pub state: TaskState,
@@ -189,6 +221,9 @@ pub struct Task {
     pub image_base: usize,
     /// One past the last byte of the image (exclusive bound).
     pub image_end: usize,
+    // ── Phase 19 demand/stack topology ───────────────────────────────────────
+    /// The fault resolver's region table (stack window, demand windows).
+    pub regions: [TaskRegion; TASK_REGIONS],
 }
 
 impl Task {
@@ -211,6 +246,7 @@ impl Task {
             sleep_deadline: 0,
             image_base: 0,
             image_end: 0,
+            regions: [TaskRegion::none(); TASK_REGIONS],
         }
     }
 
@@ -239,6 +275,7 @@ impl Task {
             // (kernel contexts, exec'd tasks without a recorded region).
             image_base: 0,
             image_end: 0,
+            regions: [TaskRegion::none(); TASK_REGIONS],
         }
     }
 
@@ -693,6 +730,77 @@ pub fn current_ttbr0() -> u64 {
             .as_ref()
             .map(|t| t.ttbr0)
             .unwrap_or(0)
+    }
+}
+
+/// Register a Phase-19 region on a specific task (`SCHED_LOCK` must be
+/// held — the boot path registers a server's stack window right after
+/// spawn).  Rejects overlaps and returns false when the table is full.
+pub fn push_region_for(id: TaskId, kind: u8, base: usize, pages: usize) -> bool {
+    if pages == 0 || base & (PAGE_SIZE - 1) != 0 {
+        return false;
+    }
+    unsafe {
+        let sched = &mut *core::ptr::addr_of_mut!(SCHEDULER);
+        let task = match sched.task_by_id_mut(id) {
+            Some(t) => t,
+            None => return false,
+        };
+        let end = base + pages * PAGE_SIZE;
+        for r in task.regions.iter() {
+            if r.kind != REGION_NONE && r.base < end && r.base + r.pages * PAGE_SIZE > base {
+                return false; // overlap
+            }
+        }
+        for r in task.regions.iter_mut() {
+            if r.kind == REGION_NONE {
+                *r = TaskRegion { kind, base, pages };
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Register a Phase-19 region on the *current* task (caller must hold
+/// `SCHED_LOCK`).  Rejects a region that overlaps an existing one and
+/// returns false when the region table is full or the range is invalid.
+pub fn push_current_region(kind: u8, base: usize, pages: usize) -> bool {
+    if pages == 0 || base & (PAGE_SIZE - 1) != 0 {
+        return false;
+    }
+    unsafe {
+        let sched = &mut *core::ptr::addr_of_mut!(SCHEDULER);
+        let idx = crate::smp::current_idx();
+        let task = match sched.tasks[idx].as_mut() {
+            Some(t) => t,
+            None => return false,
+        };
+        let end = base + pages * PAGE_SIZE;
+        for r in task.regions.iter() {
+            if r.kind != REGION_NONE && r.base < end && r.base + r.pages * PAGE_SIZE > base {
+                return false; // overlap
+            }
+        }
+        for r in task.regions.iter_mut() {
+            if r.kind == REGION_NONE {
+                *r = TaskRegion { kind, base, pages };
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Snapshot of the current task's region table (caller must hold
+/// `SCHED_LOCK`).
+pub fn current_regions() -> [TaskRegion; TASK_REGIONS] {
+    unsafe {
+        let sched = &*core::ptr::addr_of!(SCHEDULER);
+        sched.tasks[crate::smp::current_idx()]
+            .as_ref()
+            .map(|t| t.regions)
+            .unwrap_or([TaskRegion::none(); TASK_REGIONS])
     }
 }
 
