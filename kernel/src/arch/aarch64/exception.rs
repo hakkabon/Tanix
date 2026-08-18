@@ -41,7 +41,7 @@ fn esr_ec(esr: u64) -> u64 {
 
 const EC_HVC64:          u64 = 0x16; // HVC from AArch64
 const EC_IABT_LOWER:     u64 = 0x20; // Instruction abort from lower EL
-const EC_DABT_LOWER:     u64 = 0x24; // Data abort from lower EL
+const EC_DABT_LOWER:     u64 = 0x24; // Data abort from lower EL (ARM ARM EC 0x24; 0x25 = current-EL)
 
 // ── IRQ handler ───────────────────────────────────────────────────────────────
 

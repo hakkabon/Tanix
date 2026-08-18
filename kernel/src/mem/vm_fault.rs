@@ -62,8 +62,9 @@ pub fn resolve_user_fault(far: usize, esr: u64) -> bool {
     }
     let regions = current_regions();
 
-    let handled = if in_class(d, DFSC_TT_FIRST) {
-        // Translation fault: find the covering region.
+    let mut handled = false;
+    if in_class(d, DFSC_TT_FIRST) {
+        // Translation fault: find the covering region and repair it.
         for r in regions.iter() {
             if r.kind == REGION_STACK
                 && page >= r.base
@@ -73,8 +74,10 @@ pub fn resolve_user_fault(far: usize, esr: u64) -> bool {
                     page_table::map_user_frame(ttbr0, page, page, page_table::FLAGS_USER_RWX);
                 }
                 log::debug!("phase 19: stack grow -> {:#x} (task '{}')", page, task_name);
-                true
-            } else if r.kind == REGION_DEMAND
+                handled = true;
+                break;
+            }
+            if r.kind == REGION_DEMAND
                 && page >= r.base
                 && page < r.base + r.pages * PAGE_SIZE
             {
@@ -93,25 +96,38 @@ pub fn resolve_user_fault(far: usize, esr: u64) -> bool {
                     page,
                     task_name
                 );
-                true
-            } else {
-                false
-            };
+                handled = true;
+                break;
+            }
         }
-        false
     } else if in_class(d, DFSC_PERM_FIRST) {
         // Permission fault: only COW-tagged pages are repaired (split).
         let entry = unsafe { page_table::read_user_page(ttbr0, page) };
-        if entry & page_table::DESC_VALID != 0 && entry & page_table::DESC_COW_TAG != 0 {
+        log::debug!(
+            "phase 19: PERM fault {:#x} entry={:#x} (task '{}')",
+            page,
+            entry,
+            task_name
+        );
+        handled = if entry & page_table::DESC_VALID != 0 && entry & page_table::DESC_COW_TAG != 0 {
             unsafe { cow_split(ttbr0, page, entry) }
         } else {
             false
-        }
+        };
     } else if in_class(d, DFSC_AF_FIRST) {
-        // Access-flag fault on a non-COW user page: set AF in the
-        // descriptor and re-execute.
+        // Access-flag fault: COW-tagged pages split (the first write to a
+        // zero-fill alias can surface as an AF fault instead of a
+        // permission fault); plain pages just get AF set in place.
         let entry = unsafe { page_table::read_user_page(ttbr0, page) };
-        if entry & page_table::DESC_VALID != 0
+        log::debug!(
+            "phase 19: AF fault {:#x} entry={:#x} (task '{}')",
+            page,
+            entry,
+            task_name
+        );
+        handled = if entry & page_table::DESC_VALID != 0 && entry & page_table::DESC_COW_TAG != 0 {
+            unsafe { cow_split(ttbr0, page, entry) }
+        } else if entry & page_table::DESC_VALID != 0
             && entry & page_table::DESC_COW_TAG == 0
             && entry & page_table::DESC_AF == 0
         {
@@ -120,10 +136,8 @@ pub fn resolve_user_fault(far: usize, esr: u64) -> bool {
             true
         } else {
             false
-        }
-    } else {
-        false
-    };
+        };
+    }
 
     lock.unlock();
     handled

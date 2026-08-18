@@ -16,6 +16,7 @@
 use tanix_libsys::abi::{
     BootInfo, Message, M_ANY, M_DEV_WRITE, M_DEV_WRITE_REPLY, MAX_INLINE_STR,
 };
+use tanix_libsys::fmt::StrBuf;
 use tanix_libsys::sys;
 
 /// PL011 base — resolved once via the MMIO capability (0 until map_cap).
@@ -41,19 +42,38 @@ fn puts(s: &str) {
     }
 }
 
-/// Bounded deep recursion: consumes about `depth * 64` bytes of user
-/// stack per frame, forcing the fault resolver to map pages below the
-/// single page mapped at spawn.
+/// Deepest stack pointer reached by `deep` (the fault resolver's
+/// high-water mark for the lazy-stack demo).
+static mut DEEPEST_SP: usize = usize::MAX;
+
+/// Bounded deep recursion: descends until SP has dropped `target` bytes
+/// below the caller's SP (each frame is ≥ 64 B, so this always crosses
+/// whole 4 KiB pages), or `cap` frames.  The pages below the single page
+/// mapped at spawn are faulted in by the VM-fault resolver.
 #[inline(never)]
-fn deep(depth: usize) -> usize {
-    if depth == 0 {
-        return 0x19;
+fn deep(depth: usize, target: usize, cap: usize) -> usize {
+    let sp: usize;
+    unsafe { core::arch::asm!("mov {}, sp", out(reg) sp) };
+    unsafe {
+        if sp < DEEPEST_SP {
+            DEEPEST_SP = sp;
+        }
+        if depth >= cap || DEEPEST_SP <= target {
+            return 0x19;
+        }
     }
     let mut frame_marker = [0u8; 64];
     frame_marker[0] = depth as u8;
-    let r = deep(depth - 1);
+    let r = deep(depth + 1, target, cap);
     frame_marker[63] = r as u8;
+    core::hint::black_box(&frame_marker);
     r.wrapping_add(1)
+}
+
+fn sp_now() -> usize {
+    let sp: usize;
+    unsafe { core::arch::asm!("mov {}, sp", out(reg) sp) };
+    sp
 }
 
 #[no_mangle]
@@ -73,11 +93,20 @@ pub extern "C" fn server_main(_info: *const BootInfo) -> ! {
     }
 
     // ── Phase 19b: lazy stack growth. ──────────────────────────────────────
-    // 64 B per stack frame × 105 frames ≈ 10 KiB — comfortably past the
-    // 2-3 pages the resolver must fault in, but inside the 12 KiB growth
-    // budget of the 16 KiB stack window.
-    let _ = deep(105);
-    sys::log(0, "dev: stack grew downward 105 frames (fault-in)");
+    // Descend until SP is 10 KiB below the entry point — two full pages
+    // beyond the single mapped top page, inside the 12 KiB growth budget
+    // of the 16 KiB stack window — and report the actual drop.
+    let start = sp_now();
+    let _ = deep(0, start - 10 * 1024, 512);
+    let deepest = unsafe { DEEPEST_SP };
+    let grown = start.saturating_sub(deepest) / 1024;
+    {
+        let mut b = StrBuf::new();
+        b.push_str("dev: stack grew downward ");
+        b.push_dec32(grown as u32);
+        b.push_str(" KiB (fault-in, budget 12 KiB)");
+        sys::log(0, b.as_str());
+    }
 
     sys::log(0, "dev: ready");
     loop {

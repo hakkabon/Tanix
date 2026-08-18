@@ -425,8 +425,8 @@ pub unsafe fn read_user_page(root: PhysAddr, va: usize) -> u64 {
     }
     let l2 = (l1e & 0x0000_FFFF_FFFF_F000) as *const PageTable;
     let l2e = (*l2).entry(l2_idx(va));
-    if l2e & DESC_VALID == 0 || l2e & DESC_TABLE != 0 {
-        return 0;
+    if l2e & DESC_VALID == 0 || l2e & DESC_TABLE == 0 {
+        return 0; // L2 is a block descriptor (or absent) — no L3 slot
     }
     let l3 = (l2e & 0x0000_FFFF_FFFF_F000) as *const PageTable;
     (*l3).entry(l3_idx(va))
