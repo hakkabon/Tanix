@@ -359,39 +359,31 @@ impl Fat16 {
         if cluster < 2 {
             return 0;
         }
+        let remain = size.saturating_sub(offset) as usize;
         let mut written = 0usize;
-        let mut buf = [0u8; 8192]; // up to 16-sector clusters
-        loop {
-            if cluster < 2 {
-                break;
-            }
-            let n = cb.min(buf.len());
+        let mut sec = [0u8; 512];
+        let mut sskip = skip; // intra-cluster bytes to drop (first cluster only)
+        while cluster >= 2 && written < remain && written < out.len() {
             let sector = self.sector_of(cluster);
             for i in 0..self.sectors_per_cluster as usize {
-                let mut sec = [0u8; 512];
-                if !blk.read_sector(sector + i as u64, &mut sec) {
+                if written >= remain || written >= out.len() {
                     break;
                 }
-                buf[i * 512..(i + 1) * 512].copy_from_slice(&sec);
+                if !blk.read_sector(sector + i as u64, &mut sec) {
+                    return written;
+                }
+                let s = sskip.min(512); // drop this many bytes inside the sector
+                let take = (512 - s).min(remain - written).min(out.len() - written);
+                if take > 0 {
+                    out[written..written + take].copy_from_slice(&sec[s..s + take]);
+                    written += take;
+                }
+                sskip = sskip.saturating_sub(512);
             }
-            let take = (n - skip).min(out.len() - written);
-            if take == 0 {
-                // Whole cluster skipped (first cluster only).
-            } else {
-                out[written..written + take].copy_from_slice(&buf[skip..skip + take]);
-                written += take;
-            }
-            skip = 0;
-            if written == out.len() {
-                break;
-            }
+            sskip = 0;
             cluster = self.next_cluster(cluster);
         }
-        if written < out.len() {
-            written.min(size.saturating_sub(offset) as usize)
-        } else {
-            written
-        }
+        written
     }
 
     /// Overwrite or append `data` within the file described by an existing
@@ -412,14 +404,15 @@ impl Fat16 {
         }
         let cb = self.cluster_bytes as usize;
         let mut cluster = entry.start_cluster;
-        let mut skip = offset as usize;
+        let mut pos = offset as usize;
+        let mut skip = pos;
+        let mut src = 0usize;
+        let mut sec = [0u8; 512];
 
         // If the file has no clusters yet, allocate the first one.
         if cluster == 0 {
-            let c = self.alloc_cluster(0)?;
-            self.write_cluster_bytes(blk, c, &[0u8; 8192].as_slice(), 0); // zero it
-            cluster = c;
-            entry.start_cluster = c;
+            cluster = self.alloc_cluster(0)?;
+            entry.start_cluster = cluster;
         }
 
         // Walk to the covering cluster.
@@ -428,9 +421,7 @@ impl Fat16 {
             let next = self.next_cluster(cluster);
             if next == 0 {
                 // Extending beyond the chain: allocate.
-                let c = self.alloc_cluster(cluster)?;
-                self.write_cluster_bytes(blk, c, [0u8; 8192].as_slice(), 0);
-                cluster = c;
+                cluster = self.alloc_cluster(cluster)?;
             } else {
                 cluster = next;
             }
@@ -439,25 +430,34 @@ impl Fat16 {
             return None;
         }
 
-        let mut pos = offset as usize;
-        let mut src = 0usize;
-        let mut cbuf = [0u8; 8192];
-        loop {
-            if src == data.len() {
-                break;
+        let mut sskip = skip; // intra-cluster bytes to skip (first cluster only)
+
+        while src < data.len() {
+            let sector = self.sector_of(cluster);
+            for i in 0..self.sectors_per_cluster as usize {
+                if src == data.len() {
+                    break;
+                }
+                let s = sskip.min(512); // offset inside the first touched sector
+                let need = (512 - s).min(data.len() - src);
+                // Read-modify-write unless we're overwriting the whole
+                // sector in place.
+                if s > 0 || need < 512 {
+                    if !blk.read_sector(sector + i as u64, &mut sec) {
+                        return None;
+                    }
+                } else {
+                    sec = [0u8; 512];
+                }
+                sec[s..s + need].copy_from_slice(&data[src..src + need]);
+                if !blk.write_sector(sector + i as u64, &sec) {
+                    return None;
+                }
+                src += need;
+                pos += need;
+                sskip = sskip.saturating_sub(512);
             }
-            // Load the cluster, patch it, write it back.
-            let n = cb.min(cbuf.len());
-            self.read_cluster_into(blk, cluster, &mut cbuf);
-            let off_in = skip.min(n);
-            let take = (n - off_in).min(data.len() - src).min(n - off_in);
-            cbuf[off_in..off_in + take].copy_from_slice(&data[src..src + take]);
-            // Zero-fill the tail when appending past the current cluster
-            // extent's data (the trailing bytes may be stale).
-            self.write_cluster_bytes(blk, cluster, &cbuf[..n], 0);
-            pos += take;
-            src += take;
-            skip = 0;
+            sskip = 0;
             if src < data.len() {
                 let next = self.next_cluster(cluster);
                 cluster = if next == 0 { self.alloc_cluster(cluster)? } else { next };
@@ -470,26 +470,6 @@ impl Fat16 {
         }
         self.write_root_entry(blk, entry_idx, entry);
         Some(entry.size)
-    }
-
-    fn read_cluster_into(&self, blk: &mut dyn BlockIo, cluster: u16, out: &mut [u8]) {
-        let sector = self.sector_of(cluster);
-        for i in 0..self.sectors_per_cluster as usize {
-            let mut sec = [0u8; 512];
-            if !blk.read_sector(sector + i as u64, &mut sec) {
-                break;
-            }
-            out[i * 512..(i + 1) * 512].copy_from_slice(&sec);
-        }
-    }
-
-    fn write_cluster_bytes(&mut self, blk: &mut dyn BlockIo, cluster: u16, data: &[u8], _off: usize) {
-        let sector = self.sector_of(cluster);
-        for i in 0..self.sectors_per_cluster as usize {
-            let mut sec = [0u8; 512];
-            sec.copy_from_slice(&data[i * 512..(i + 1) * 512]);
-            let _ = blk.write_sector(sector + i as u64, &sec);
-        }
     }
 
     /// Write a root entry back to its slot on disk.
@@ -655,6 +635,34 @@ mod tests {
         let mut tail = [0u8; 100];
         fs.read_file(&mut blk, 2, 3100, 3000, &mut tail);
         assert!(tail.iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn find_entries_after_root_slot_zero() {
+        // Mirrors the real mkfat16 demo volume: entries at indices 0..3
+        // in the root directory, found by 8.3 name (regression for the
+        // demo volume where only slot 0 ever matched).
+        let mut blk = MemBlk::new();
+        let spec = [
+            ("README.TXT", 2u16, 162u32),
+            ("VERSION.TXT", 3, 42),
+            ("DATA.BIN", 4, 3000),
+            ("VISIT.LOG", 0, 0),
+        ];
+        for (i, (name, cluster, size)) in spec.iter().enumerate() {
+            blk.root(i, &fat16_entry(name, *cluster, *size));
+        }
+        let mut fs = Fat16::mount(&mut blk).unwrap();
+        for (i, (name, cluster, size)) in spec.iter().enumerate() {
+            let short = Fat16::short_name(name).unwrap();
+            let (idx, e) = fs.find_root(&mut blk, &short).unwrap();
+            assert_eq!(idx, i, "expected entry {name} at index {i}");
+            assert_eq!(e.start_cluster, *cluster);
+            assert_eq!(e.size, *size);
+        }
+        // A name that is not present must not be found.
+        let missing = Fat16::short_name("NOPE.DAT").unwrap();
+        assert!(fs.find_root(&mut blk, &missing).is_none());
     }
 
     #[test]

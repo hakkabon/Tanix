@@ -15,9 +15,16 @@
 //!   • translation fault inside a `REGION_DEMAND` window — the page
 //!     aliases the shared zero page through a COW descriptor, so a read
 //!     needs no frame while a write triggers the split below;
-//!   • permission / access-flag fault on a COW-tagged page — the frame is
-//!     copied into a fresh private frame and the page is remapped RW
-//!     (the copy-on-write split; the other aliases keep the shared frame).
+//!   • permission fault on a COW-tagged page — the frame is copied into a
+//!     fresh private frame and the page is remapped RW (the copy-on-write
+//!     split; the other aliases keep the shared frame).
+//!
+//! A task table is a clone of the kernel's identity map, so the pages of a
+//! window that were never explicitly opened still carry the kernel's
+//! EL1-only descriptor from the block split; touching them raises a
+//! *permission* fault (not a translation fault).  The permission branch
+//! opens such pages up exactly like the translation paths do when they
+//! fall inside a `REGION_STACK` / `REGION_DEMAND` window.
 //!
 //! The stack-growth and demand windows are described by the current task's
 //! region table (`sched::task::regions`); a COW page is recognised from
@@ -34,8 +41,8 @@ use crate::sched::task::{current_regions, sched_lock, REGION_DEMAND, REGION_STAC
 /// DFSC class bases (bits [5:0] of ESR_EL1), stage-1 only: each class
 /// covers the four levels (L0..L3).
 const DFSC_TT_FIRST: u64 = 0b000100; // translation fault
-const DFSC_AF_FIRST: u64 = 0b001100; // access-flag fault
-const DFSC_PERM_FIRST: u64 = 0b010100; // permission fault
+const DFSC_AF_FIRST: u64 = 0b001000; // access-flag fault
+const DFSC_PERM_FIRST: u64 = 0b001100; // permission fault
 
 fn in_class(dfsc: u64, first: u64) -> bool {
     dfsc >= first && dfsc <= first + 3
@@ -101,7 +108,13 @@ pub fn resolve_user_fault(far: usize, esr: u64) -> bool {
             }
         }
     } else if in_class(d, DFSC_PERM_FIRST) {
-        // Permission fault: only COW-tagged pages are repaired (split).
+        // Permission fault.  Two kinds of page can deny a user write:
+        //   • a COW-tagged page — shared R/O, repaired by the split;
+        //   • a page inside a REGION_STACK / REGION_DEMAND window that
+        //     still carries the kernel's EL1-only block-fill descriptor
+        //     (the task table is a clone of the identity map, and only
+        //     the window's top page is opened at spawn) — repaired by
+        //     opening it up exactly like the translation-fault paths do.
         let entry = unsafe { page_table::read_user_page(ttbr0, page) };
         log::debug!(
             "phase 19: PERM fault {:#x} entry={:#x} (task '{}')",
@@ -112,7 +125,44 @@ pub fn resolve_user_fault(far: usize, esr: u64) -> bool {
         handled = if entry & page_table::DESC_VALID != 0 && entry & page_table::DESC_COW_TAG != 0 {
             unsafe { cow_split(ttbr0, page, entry) }
         } else {
-            false
+            let mut grew = false;
+            for r in regions.iter() {
+                if page >= r.base && page < r.base + r.pages * PAGE_SIZE {
+                    if r.kind == REGION_STACK {
+                        unsafe {
+                            page_table::map_user_frame(
+                                ttbr0,
+                                page,
+                                page,
+                                page_table::FLAGS_USER_RWX,
+                            );
+                        }
+                        log::debug!(
+                            "phase 19: PERM stack grow -> {:#x} (task '{}')",
+                            page,
+                            task_name
+                        );
+                        grew = true;
+                    } else if r.kind == REGION_DEMAND {
+                        unsafe {
+                            page_table::map_user_frame(
+                                ttbr0,
+                                page,
+                                page_table::zero_page_phys(),
+                                page_table::FLAGS_USER_COW,
+                            );
+                        }
+                        log::debug!(
+                            "phase 19: PERM demand page {:#x} -> shared zero page (task '{}')",
+                            page,
+                            task_name
+                        );
+                        grew = true;
+                    }
+                    break;
+                }
+            }
+            grew
         };
     } else if in_class(d, DFSC_AF_FIRST) {
         // Access-flag fault: COW-tagged pages split (the first write to a

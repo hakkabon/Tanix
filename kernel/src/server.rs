@@ -211,13 +211,20 @@ pub const SERVER_BASES: &[(&str, usize)] = &[
 /// 1 GiB DRAM window (`0x4000_0000`).  Other machines move the whole RAM
 /// window by a constant offset — `sbsa-ref` starts its DDR at 1 TiB
 /// (`0x100_0000_0000`) — and every server binary is *linked at the shifted
-/// address* (the sbsa server build sets `TANIX_LINK_SHIFT` in its build.rs,
+/// address* (the sbsa server build sets `TANIX_LINK_SHIFT` in `justfile`,
 /// which all `servers/*/build.rs` add to their base).  This must stay in
 /// lockstep with those build scripts.
 fn machine_base_shift() -> usize {
     let m = crate::arch::aarch64::machine();
     if m.id == crate::arch::aarch64::machine::MACHINE_SBSA_REF {
-        m.dram_base.wrapping_sub(0x4000_0000)
+        // The sbsa-ref kernel image — .text/.rodata/.data, .bss (ends
+        // 0x100010f0158), the EL3 stack and the secure payload — spans
+        // `_start`..`__kernel_end` (0x10000080000..0x10001110000) and
+        // overlaps the plain-shifted server map (worker..wm).  Walk the
+        // whole map up by 32 MiB so every server region sits above the
+        // kernel image; mirrors `TANIX_LINK_SHIFT=0xFFC2000000` in the
+        // `servers-sbsa` recipe of `justfile`.
+        m.dram_base.wrapping_sub(0x4000_0000) + 0x200_0000
     } else {
         0
     }

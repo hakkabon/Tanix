@@ -20,7 +20,7 @@ use core::ptr;
 use tanix_libsys::sys;
 
 use crate::virtio_pci::VirtioPci;
-use crate::vring::{Vring, DESC_WRITE};
+use crate::vring::{Vring, DESC_NEXT, DESC_WRITE};
 
 /// virtio-blk device id.
 pub const VIRTIO_BLK_S: u16 = 2;
@@ -143,14 +143,14 @@ impl VirtioBlk {
             SLOT_HEADER,
             self.header_base,
             core::mem::size_of::<BlkReq>() as u32,
-            0,
+            DESC_NEXT,
             SLOT_DATA,
         );
         self.q.write_desc(
             SLOT_DATA,
             self.data_base,
             len as u32, // bytes the device transfers
-            if write { 0 } else { DESC_WRITE },
+            if write { DESC_NEXT } else { DESC_NEXT | DESC_WRITE },
             SLOT_STATUS,
         );
         self.q.write_desc(SLOT_STATUS, self.header_base + 512, 1, DESC_WRITE, 0);
@@ -179,7 +179,20 @@ impl VirtioBlk {
             }
             rounds += 1;
             if rounds >= WAIT_ROUNDS {
-                sys::log(1, "virtio-blk: request timed out");
+                let mut s = tanix_libsys::fmt::StrBuf::new();
+                s.push_str("virtio-blk: request timed out used_idx=");
+                s.push_dec32(self.q.used_idx() as u32);
+                s.push_str(" desc=");
+                s.push_hex64(self.q.desc_base);
+                s.push_str(" avail=");
+                s.push_hex64(self.q.avail_base);
+                s.push_str(" used=");
+                s.push_hex64(self.q.used_base);
+                s.push_str(" hdr=");
+                s.push_hex64(self.header_base);
+                s.push_str(" data=");
+                s.push_hex64(self.data_base);
+                sys::log(1, s.as_str());
                 return false;
             }
         }

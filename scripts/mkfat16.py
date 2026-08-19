@@ -82,14 +82,13 @@ def main():
         return first
 
     def root_entry(name8_3: bytes, attr: int, first: int, size: int):
-        # 8.3: 11 bytes, upper-case.
-        name = bytearray(11)
+        # 8.3: 11 bytes, upper-case, space-padded (spec form — the fs
+        # server's short_name() compares against spaces, not NULs).
+        name = bytearray(b" " * 11)
         base, _, ext = name8_3.partition(b".")
+        name[:len(base)] = base.upper()
         if ext:
-            name[:len(base)] = base.upper()
             name[8:8 + len(ext)] = ext[:3].upper()
-        else:
-            name[:len(base)] = base.upper()
         # name(11) + attr(1) + NTRes..wrtDate(14) + startCluster(2) + size(4)
         return struct.pack("<11sB14xHI", bytes(name), attr, first, size)
 

@@ -109,13 +109,15 @@ pub const FLAGS_USER_DEVICE: u64 = DESC_VALID
 
 // ── Copy-on-write marker bit (Phase 19) ───────────────────────────────────────
 
-/// Bit 12 of a stage-1 descriptor is architecturally *Ignored* — never
-/// interpreted by the translation hardware.  We borrow it as a kernel-side
+/// Bit 11 of a stage-1 descriptor is *ignored* by the translation
+/// hardware: it is AP[2], only meaningful when the AN bit (bit 10) is
+/// set, and it is never part of a physical address (4 KiB-aligned frames
+/// leave bits [11:0] clear).  We borrow it as a kernel-side
 /// "copy-on-write" tag: a valid user page with this bit set is shared
-/// read-only (AP = 0b11 — R/O at both EL1 and EL0).  A permission fault on
-/// a tagged page makes the kernel copy the frame into a fresh private
+/// read-only (AP = 0b11 — R/O at both EL1 and EL0).  A permission fault
+/// on a tagged page makes the kernel copy the frame into a fresh private
 /// frame and remap it RW — the copy-on-write split (Phase 19).
-pub const DESC_COW_TAG: u64 = 1 << 12;
+pub const DESC_COW_TAG: u64 = 1 << 11;
 
 /// Shared read-only page (EL0 and EL1), carrying the COW tag — used for the
 /// shared zero page (demand filling) and for COW-mapped frame runs.

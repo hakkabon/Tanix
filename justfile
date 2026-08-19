@@ -216,9 +216,11 @@ net-test: kernel-phase11
 # RAM window (TANIX_LINK_SHIFT), into a separate target dir (target-sbsa)
 # so the virt binaries in target/ stay untouched.  The virtio transport
 # guest (zephyr-stub) is built here too so the whole embedded image set
-# comes from one directory.
+# comes from one directory.  Phase 20: the shift also walks the map 32 MiB
+# above the raw RAM window to clear the sbsa kernel image (kernel
+# `machine_base_shift()` in server.rs must match).
 servers-sbsa:
-    TANIX_LINK_SHIFT=0xFFC0000000 CARGO_TARGET_DIR=target-sbsa cargo build \
+    TANIX_LINK_SHIFT=0xFFC2000000 CARGO_TARGET_DIR=target-sbsa cargo build \
         --package tanix-zephyr-stub --package tanix-libsys \
         --package tanix-init --package tanix-pm --package tanix-mem \
         --package tanix-dev --package tanix-worker \

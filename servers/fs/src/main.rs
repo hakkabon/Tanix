@@ -285,8 +285,10 @@ fn serve_close(dst: u32, msg: &Message) {
 }
 
 /// The `offset`-th live root entry (skipping deleted/volume entries).
-/// Returns (name word0, word1, is_dir, size), or None past the end.
-fn next_root_entry(offset: usize) -> Option<(u32, u32, u32, u32)> {
+/// Returns (name word0, name word1, extension word, is_dir, size), or
+/// None past the end.  The two name words carry name[0..8]; the extension
+/// word carries name[8..11] (little-endian byte order).
+fn next_root_entry(offset: usize) -> Option<(u32, u32, u32, u32, u32)> {
     let st = sched_state().unwrap();
     let mut seen = 0usize;
     for idx in 0..st.fs.root_entries as usize {
@@ -306,7 +308,8 @@ fn next_root_entry(offset: usize) -> Option<(u32, u32, u32, u32)> {
             continue;
         }
         let (w0, w1) = e.name_words();
-        return Some((w0, w1, e.is_dir() as u32, e.size));
+        let w2 = u32::from_le_bytes([e.name[8], e.name[9], e.name[10], 0]);
+        return Some((w0, w1, w2, e.is_dir() as u32, e.size));
     }
     None
 }
@@ -314,12 +317,13 @@ fn next_root_entry(offset: usize) -> Option<(u32, u32, u32, u32)> {
 fn serve_list(dst: u32, msg: &Message) {
     let mut data = [0u32; 8];
     match next_root_entry(msg.data[0] as usize) {
-        Some((w0, w1, is_dir, size)) => {
+        Some((w0, w1, w2, is_dir, size)) => {
             data[0] = 1;
             data[1] = w0;
             data[2] = w1;
-            data[3] = is_dir;
-            data[4] = size;
+            data[3] = w2;
+            data[4] = is_dir;
+            data[5] = size;
         }
         None => data[0] = 0,
     }
@@ -373,12 +377,15 @@ fn demo() {
     // Root listing.
     for i in 0..8 {
         match next_root_entry(i) {
-            Some((w0, w1, _, size)) => {
+            Some((w0, w1, w2, _, size)) => {
                 let mut n = ShortName::default();
                 for (j, w) in [w0, w1].iter().enumerate() {
                     for k in 0..4 {
                         n[j * 4 + k] = ((*w >> (8 * k)) & 0xFF) as u8;
                     }
+                }
+                for k in 0..3 {
+                    n[8 + k] = ((w2 >> (8 * k)) & 0xFF) as u8;
                 }
                 let mut b = StrBuf::new();
                 b.push_str("fs: root ");

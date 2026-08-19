@@ -124,7 +124,7 @@ impl Vring {
     }
 
     /// Read the device's current used index (Acquire order).
-    fn used_idx(&self) -> u16 {
+    pub fn used_idx(&self) -> u16 {
         let idx = unsafe { ptr::read_volatile(self.used_idx_ptr()) };
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         idx

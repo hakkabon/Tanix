@@ -70,9 +70,11 @@ pub fn bar_window() -> u64 {
 
 /// Red Hat / Qumranet vendor id — every virtio PCI device.
 pub const VIRTIO_VENDOR: u16 = 0x1AF4;
-/// Modern-only virtio device ids: `0x1040 + device_id` (virtio 1.0);
-/// transitional devices keep the legacy `0x1000 + device_id`.
+/// Modern (virtio 1.0) device ids: `0x1040 + device_id` (net 0x1041,
+/// blk 0x1042); transitional devices keep the legacy pair.
 pub const VIRTIO_DEVICE_MODERN_BASE: u16 = 0x1040;
+/// Transitional (legacy) device ids: `0x1000 + device_id - 1` (net
+/// 0x1000, blk 0x1001, console 0x1003).
 pub const VIRTIO_DEVICE_LEGACY_BASE: u16 = 0x1000;
 
 /// Virtio vendor capability (PCI_CAP_ID_VNDR = 0x09) configuration types.
@@ -235,14 +237,14 @@ pub fn find(vendor_id: u16, device_id: u16) -> Option<Bdf> {
 }
 
 /// Find a virtio device of the given device id (works for both the modern
-/// `0x1040 + id` and transitional `0x1000 + id` encodings).
+/// `0x1040 + id` and transitional `0x1000 + id - 1` encodings).
 pub fn find_virtio(device_id: u16) -> Option<Bdf> {
     let mut found = None;
     for_each(|b| {
         if found.is_none()
             && vendor(b) == VIRTIO_VENDOR
             && (device(b) == VIRTIO_DEVICE_MODERN_BASE + device_id
-                || device(b) == VIRTIO_DEVICE_LEGACY_BASE + device_id)
+                || device(b) == VIRTIO_DEVICE_LEGACY_BASE + device_id - 1)
         {
             found = Some(b);
         }
