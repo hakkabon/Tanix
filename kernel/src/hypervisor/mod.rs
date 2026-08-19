@@ -123,6 +123,11 @@ pub enum VcpuExit {
     /// Bare-metal surrogate: the guest called the kernel's yield function
     /// (the EL1 cooperative stand-in for a trap exit).
     Yielded,
+    /// Phase 21: the vCPU did not yield — its co-tenant time slice expired,
+    /// the EL1 tick preempted it inside the guest and the full vCPU state
+    /// was captured in its context.  The VMM may re-run the vCPU later; it
+    /// resumes exactly where it was interrupted.
+    Preempted,
 }
 
 // ── VM configuration ──────────────────────────────────────────────────────────

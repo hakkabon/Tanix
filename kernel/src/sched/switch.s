@@ -91,7 +91,44 @@ context_switch:
     msr  ELR_EL1, x30
     eret
 
-// ── Lock-releasing variant (Phase 11) ───────────────────────────────────────
+// ── Phase 21: restore-only switch (tenant preemption) ────────────────────────
+//   x0 = *to ; never returns
+//
+// Used by the tick handler when it preempts a guest vCPU: the guest's
+// whole state is already captured in its context (the IRQ frame base, the
+// `restore_preempted_guest` stub as resume PC, callee-saved registers), so
+// the current execution stream — irq_handler running on the *guest's* stack
+// — is abandoned here.  Nothing may be saved: the caller never resumes (the
+// guest does, from its captured frame, and the kernel's own state was saved
+// into the guest VM's `kernel_ctx` when the guest was entered).
+//
+// The restore half is byte-identical to `context_switch`'s: register-only
+// until SP is reloaded, then TTBR0 + TLB + `eret` into the saved context.
+
+.section .text, "ax"
+.global context_switch_preempt
+.type context_switch_preempt, %function
+context_switch_preempt:
+    ldp  x19, x20, [x0, #0]
+    ldp  x21, x22, [x0, #16]
+    ldp  x23, x24, [x0, #32]
+    ldp  x25, x26, [x0, #48]
+    ldp  x27, x28, [x0, #64]
+    ldp  x29, x30, [x0, #80]   // fp, lr (→ ELR_EL1)
+    ldr  x9,       [x0, #96]   // kernel sp
+    mov  sp,  x9
+    ldr  x9,       [x0, #104]  // user sp_el0
+    msr  SP_EL0,   x9
+    ldr  x9,       [x0, #112]  // SPSR_EL1
+    msr  SPSR_EL1, x9
+    ldr  x9,       [x0, #120]  // page table
+    msr  TTBR0_EL1, x9
+    isb
+    tlbi vmalle1is
+    dsb  sy
+    isb
+    msr  ELR_EL1, x30
+    eret
 //   x0 = *lock, x1 = *from, x2 = *to
 .global context_switch_unlock
 .type context_switch_unlock, %function

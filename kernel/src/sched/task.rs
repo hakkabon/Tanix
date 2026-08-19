@@ -1264,6 +1264,12 @@ extern "C" {
         from: *mut Context,
         to: *const Context,
     );
+    /// Phase 21: restore `to` and `eret` into it, abandoning the current
+    /// execution stream.  Used by the tick handler when it preempts a guest
+    /// vCPU: the guest's state lives entirely in its captured context
+    /// (kernel_ctx), so nothing on the current stack (the guest's!) may be
+    /// saved or resumed.  Never returns.
+    pub(crate) fn context_switch_preempt(to: *const Context) -> !;
 }
 
 /// SGI-poke every online secondary that is parked idle in WFI, so it

@@ -48,10 +48,19 @@ const EC_DABT_LOWER:     u64 = 0x24; // Data abort from lower EL (ARM ARM EC 0x2
 /// Called from `vectors.s` slot 5 (current EL/SPx IRQ — `from_el0 == 0`)
 /// and slot 9 (lower EL AArch64 IRQ — `from_el0 == 1`).
 ///
+/// `frame` is the base of the full IRQ_ENTRY frame the assembly macro
+/// pushed on the interrupted stack (272 bytes: x0-x18, x30, ELR_EL1,
+/// SPSR_EL1 and — Phase 21 — x19-x29; offsets in `vectors.s`).
+///
 /// Acknowledges the interrupt, dispatches it, signals EOI, then lets the
-/// scheduler preempt when the tick interrupted an EL0 task.
+/// scheduler preempt:
+///   • slot 9 (EL0 task)                         → `task::tick_preempt`;
+///   • slot 5 with a guest vCPU running (Phase 21) → the co-tenant
+///     scheduler decrements the tenant's quantum and, on expiry, captures
+///     the frame and switches to the next tenant (never returns);
+///   • slot 5 inside plain kernel code           → `task::tick_preempt(false)`.
 #[no_mangle]
-pub extern "C" fn irq_handler(from_el0: u64) {
+pub extern "C" fn irq_handler(from_el0: u64, frame: *mut u64) {
     use super::gic;
     use crate::sched::task;
 
@@ -66,10 +75,22 @@ pub extern "C" fn irq_handler(from_el0: u64) {
         // kernel, e.g. the SYS_WAIT_IRQ wait loop, just tick).
         30 => {
             super::timer::tick();
-            log::trace!("irq: tick #{}", super::timer::ticks());
             gic::eoi(intid);
-            unsafe {
-                task::tick_preempt(from_el0 != 0);
+            if from_el0 != 0 {
+                unsafe {
+                    task::tick_preempt(true);
+                }
+            } else if crate::hypervisor::backend::guest_tick_active() {
+                // Phase 21: tick landed inside a guest vCPU run.  The
+                // tenant scheduler consumes the tick; it may preempt the
+                // guest (never returns) or leave it running.
+                unsafe {
+                    crate::hypervisor::backend::tick_guest(frame);
+                }
+            } else {
+                unsafe {
+                    task::tick_preempt(false);
+                }
             }
         }
 
@@ -138,8 +159,15 @@ pub extern "C" fn irq_handler(from_el0: u64) {
 
 /// SPSR_EL1 saved in the exception frame — the exception level of the
 /// interrupted context is PSTATE.M[3:0] (0 = EL0t, 4 = EL1h, 5 = EL1t).
-fn from_el0(frame: *const u64) -> bool {
-    unsafe { core::ptr::read_volatile(frame.add(21)) & 0xF == 0 }
+///
+/// Phase 21: takes the already-snapshot *value* instead of re-reading the
+/// shared frame from a raw pointer — `sync_handler` copies the frame's
+/// words it needs into locals, and `from_el0` derives its answer from that
+/// snapshot, so no aliasing `*const`/`*mut` reads ever touch the same
+/// memory location.
+#[inline]
+fn from_el0(spsr: u64) -> bool {
+    spsr & 0xF == 0
 }
 
 /// Abort from an EL0 task: log, mark it zombie and switch away.  Never
@@ -208,14 +236,13 @@ pub extern "C" fn sync_handler(esr: u64, elr: u64, _far: u64, sp: u64) {
         EC_HVC64 => {
             // The guest's x0-x3 (function ID + arguments) are in the saved
             // frame — the stub has already clobbered the live registers
-            // with ESR/ELR/etc.
+            // with ESR/ELR/etc.  Snapshot the words we need into locals
+            // (Phase 21: no long-lived raw alias of the shared frame).
             let frame = sp as *const u64;
-            let args = [
-                unsafe { core::ptr::read_volatile(frame) },
-                unsafe { core::ptr::read_volatile(frame.add(1)) },
-                unsafe { core::ptr::read_volatile(frame.add(2)) },
-                unsafe { core::ptr::read_volatile(frame.add(3)) },
-            ];
+            let mut args = [0u64; 4];
+            unsafe {
+                core::ptr::copy_nonoverlapping(frame, args.as_mut_ptr(), 4);
+            }
 
             // Dispatch through the VMM service handler.
             // get_backend() returns the same singleton instance as
@@ -234,7 +261,8 @@ pub extern "C" fn sync_handler(esr: u64, elr: u64, _far: u64, sp: u64) {
 
         EC_DABT_LOWER => {
             let frame = sp as *const u64;
-            if from_el0(frame) {
+            let spsr = unsafe { core::ptr::read_volatile(frame.add(21)) };
+            if from_el0(spsr) {
                 // Phase 19: offer the fault to the VM-fault resolver first
                 // (demand paging / COW / stack growth).  On success the
                 // faulting instruction re-executes untouched; otherwise the
@@ -252,7 +280,8 @@ pub extern "C" fn sync_handler(esr: u64, elr: u64, _far: u64, sp: u64) {
 
         other => {
             let frame = sp as *const u64;
-            if from_el0(frame) {
+            let spsr = unsafe { core::ptr::read_volatile(frame.add(21)) };
+            if from_el0(spsr) {
                 // Anything unexpected from EL0 (undefined instruction,
                 // alignment, …) is treated as a task fault, not a kernel
                 // bug — the server must be quarantined.

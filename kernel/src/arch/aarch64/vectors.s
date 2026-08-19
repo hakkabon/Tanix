@@ -37,15 +37,37 @@ __vectors:
 1:  b    1b
 .endm
 
-// ── Macro: save caller-saves, call irq_handler(from_el0), restore, return ────
+// ── Macro: save, call irq_handler(from_el0, frame), restore, return ────────
 //
-// `\lower` is 0 for current-EL IRQs (slot 5 — landed inside the kernel,
-// e.g. the SYS_WAIT_IRQ wait loop) and 1 for lower-EL IRQs (slot 9 — an
-// EL0 task was interrupted).  The scheduler only preempts on the latter.
+// `\lower` is 0 for current-EL IRQs (slot 5 — landed inside the kernel or
+// inside an EL1 guest) and 1 for lower-EL IRQs (slot 9 — an EL0 task was
+// interrupted).  The scheduler only preempts on the latter — and, since
+// Phase 21, on slot-5 ticks that land inside a guest vCPU, which is why
+// this macro (unlike the slot-8/9 SMALLER frames) also saves the
+// callee-saved registers x19-x29.
+//
+// Frame layout (272 bytes, in ::vm::sched and `restore_preempted_guest`):
+//   [sp+0]   x0    [sp+80]  x10   [sp+160] ELR_EL1  [sp+240] x27
+//   [sp+8]   x1    [sp+88]  x11   [sp+168] SPSR_EL1 [sp+248] x28
+//   [sp+16]  x2    [sp+96]  x12   [sp+176] x19      [sp+256] x29 (fp)
+//   [sp+24]  x3    [sp+104] x13   [sp+184] x20      [sp+264] pad (SP align)
+//   [sp+32]  x4    [sp+112] x14   [sp+192] x21
+//   [sp+40]  x5    [sp+120] x15   [sp+200] x22
+//   [sp+48]  x6    [sp+128] x16   [sp+208] x23
+//   [sp+56]  x7    [sp+136] x17   [sp+216] x24
+//   [sp+64]  x8    [sp+144] x18   [sp+224] x25
+//   [sp+72]  x9    [sp+152] x30   [sp+232] x26
+//
+// The complete per-vCPU snapshot ([sp+0..168] + [sp+176..264], ELR, SPSR)
+// is what the Phase-21 tenant preemption captures into a preempted guest's
+// context: `restore_preempted_guest` reloads everything from this frame
+// and `eret`s back into the interrupted guest.
 
 .macro IRQ_ENTRY lower
-    // Save all caller-saved registers (x0-x18, x29, x30, SP alignment).
-    sub  sp, sp, #176
+    // Save the full register set: caller-saved (x0-x18, x30), ELR/SPSR,
+    // and — Phase 21 — callee-saved (x19-x29) so a tick inside a guest
+    // vCPU can capture the whole preemption point.
+    sub  sp, sp, #272
     stp  x0,  x1,  [sp,   #0]
     stp  x2,  x3,  [sp,  #16]
     stp  x4,  x5,  [sp,  #32]
@@ -59,8 +81,15 @@ __vectors:
     mrs  x0,  ELR_EL1
     mrs  x1,  SPSR_EL1
     stp  x0,  x1,  [sp, #160]
+    stp  x19, x20, [sp, #176]
+    stp  x21, x22, [sp, #192]
+    stp  x23, x24, [sp, #208]
+    stp  x25, x26, [sp, #224]
+    stp  x27, x28, [sp, #240]
+    str  x29,      [sp, #256]
 
     mov  x0, #\lower
+    mov  x1, sp        // frame base — Phase 21 guest-preemption capture
     bl   irq_handler
 
     // Restore and return.
@@ -77,7 +106,13 @@ __vectors:
     ldp  x14, x15, [sp, #112]
     ldp  x16, x17, [sp, #128]
     ldp  x18, x30, [sp, #144]
-    add  sp, sp, #176
+    ldp  x19, x20, [sp, #176]
+    ldp  x21, x22, [sp, #192]
+    ldp  x23, x24, [sp, #208]
+    ldp  x25, x26, [sp, #224]
+    ldp  x27, x28, [sp, #240]
+    ldr  x29,      [sp, #256]
+    add  sp, sp, #272
     eret
 .endm
 
@@ -213,6 +248,72 @@ lower_sync_full:
     ldp  x18, x30, [sp, #144]
     add  sp, sp, #176
     eret
+
+// ── Phase 21: preempted-guest resume stub ─────────────────────────────────────
+//
+// A tick that preempts an EL1 guest captures the whole IRQ_ENTRY frame
+// (see the frame layout above) into the guest's context and hands the CPU
+// to another tenant.  When the preempted tenant is later re-run,
+// `context_switch` restores its context with:
+//   sp = frame base (the guest's IRQ frame top),  ELR = this stub,
+//   SPSR = EL1h (masked),  x19-x29 = the guest's callee-saved values
+// (context_switch restored them from the context; this stub reloads them
+// from the frame copy for a single source of truth).
+//
+// The stub then resurrects the guest from the frame: caller-saved
+// registers, ELR_EL1/SPSR_EL1 (the guest's real PSTATE, IRQ unmasked),
+// and finally pops the frame before `eret` so SP is exactly where the
+// guest left it.  Nothing on this path may touch the stack before the
+// final `add sp, sp, #272` — the frame itself is the working area.
+//
+// Interrupts are masked until the final `eret` (SPSR_EL1 is only applied
+// at exception return), so the 272-byte reload cannot itself be
+// interrupted.
+
+.section .text, "ax"
+.global restore_preempted_guest
+.type restore_preempted_guest, %function
+restore_preempted_guest:
+    ldp  x0,  x1,  [sp,   #0]
+    ldp  x2,  x3,  [sp,  #16]
+    ldp  x4,  x5,  [sp,  #32]
+    ldp  x6,  x7,  [sp,  #48]
+    ldp  x8,  x9,  [sp,  #64]
+    ldp  x10, x11, [sp,  #80]
+    ldp  x12, x13, [sp,  #96]
+    ldp  x14, x15, [sp, #112]
+    ldp  x16, x17, [sp, #128]
+    ldp  x18, x30, [sp, #144]
+    ldp  x19, x20, [sp, #176]
+    ldp  x21, x22, [sp, #192]
+    ldp  x23, x24, [sp, #208]
+    ldp  x25, x26, [sp, #224]
+    ldp  x27, x28, [sp, #240]
+    ldr  x29,      [sp, #256]
+    ldp  x9,  x10, [sp, #160]
+    msr  ELR_EL1,  x9
+    msr  SPSR_EL1, x10
+    add  sp, sp, #272
+    eret
+
+// ── Phase 21: yield entry — interrupt-masked prologue ─────────────────────────
+//
+// The guest calls `vm_yield_entry` to hand control back to the kernel.  The
+// cooperative switch inside must never be interrupted: a preemption tick in
+// the middle of `context_switch` would capture a half-switched register
+// file.  This tiny prologue masks IRQ (they are already masked whenever the
+// kernel runs; only guest execution is unmasked) and then falls through
+// into the Rust implementation.  Guests are entered with IRQ enabled
+// (SPSR 0x345), so unless masked here the tick could land mid-switch.
+// #2 in `daifset` = the I bit.
+
+.section .text, "ax"
+.global vm_yield_entry
+.type vm_yield_entry, %function
+vm_yield_entry:
+    msr  daifset, #2
+    isb
+    b    vm_yield_entry_masked
 
 // ── Out-of-line fallback: lower-EL synchronous exceptions that are not
 //    SVC64 (HVC, aborts). ──────────────────────────────────────────────────

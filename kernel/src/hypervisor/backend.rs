@@ -113,6 +113,18 @@ struct VmRecord {
     /// True while a vCPU is inside the context switch (only vCPU 0 exists
     /// on the bare-metal backend).
     running: bool,
+    /// True while the CPU is actually executing this VM's vCPU.
+    /// Distinguishes "mid `enter_guest`" from "back in kernel code after
+    /// the guest yielded / was preempted" — only the former may be
+    /// preempted by a tick.
+    in_guest: bool,
+    /// True if the last `vcpu_run` returned because the tick preempted
+    /// the guest (Phase 21) rather than because the guest yielded.
+    preempted: bool,
+    /// Remaining time-slice budget in ticks (Phase 21 co-tenancy).  Set at
+    /// every `vcpu_run` entry; consumed by ticks that land inside the
+    /// guest; reaching 0 arms the preemption capture.
+    budget_ticks: u32,
     /// The kernel/guest context pair for the cooperative vCPU.
     kernel_ctx: Context,
     guest_ctx: Context,
@@ -197,6 +209,9 @@ impl Hypervisor for BareMetalBackend {
             boot: config.boot,
             started: false,
             running: false,
+            in_guest: false,
+            preempted: false,
+            budget_ticks: 0,
             kernel_ctx: Context::zeroed(),
             guest_ctx: Context::zeroed(),
         });
@@ -235,21 +250,53 @@ impl Hypervisor for BareMetalBackend {
                     vm, vm_rec.entry, vm_rec.ram_base + vm_rec.ram_size
                 );
             }
+            // Phase 21: guests run with IRQ *enabled* so the tick can
+            // preempt them (co-tenancy time-slicing).  `context_switch`
+            // stores a constant masked SPSR every time the guest context
+            // is saved, so re-prime it on every entry.
+            vm_rec.guest_ctx.spsr = SPSR_GUEST;
+            // Fresh time slice for the upcoming run.
+            vm_rec.budget_ticks = QUANTUM_TICKS;
         }
 
         // The actual CPU transfer into the guest.  `enter_guest` returns
         // when the guest yields control back (its vm_yield_entry call) —
         // on Gunyah this is GH_VCPU_RUN returning with an exit reason.
+        // Phase 21: it also returns, via `context_switch_preempt`, when a
+        // tick cut the guest's time slice short — same resume point, the
+        // loop continuation, so both exits converge here.
         unsafe {
             let vm_rec = self.find_vm(vm).unwrap();
             let boot = vm_rec.boot;
             vm_rec.running = true;
-            enter_guest(&mut vm_rec.kernel_ctx, &vm_rec.guest_ctx, boot);
+            vm_rec.in_guest = true;
+            ACTIVE_VM = Some(vm);
+            ACTIVE_CPU = crate::smp::cpu_index();
+            enter_guest(&mut vm_rec.kernel_ctx, &mut vm_rec.guest_ctx, boot);
+            vm_rec.in_guest = false;
             vm_rec.running = false;
+            ACTIVE_VM = None;
         }
 
-        log::info!("vcpu_run: {:?} vCPU 0 exited (yield)", vm);
-        Ok(VcpuExit::Yielded)
+        // Distinguish the two exit reasons for the co-tenant scheduler.
+        let preempted = self
+            .find_vm(vm)
+            .map(|r| {
+                let p = r.preempted;
+                r.preempted = false;
+                p
+            })
+            .unwrap_or(false);
+        log::info!(
+            "vcpu_run: {:?} vCPU 0 exited ({})",
+            vm,
+            if preempted { "preempted" } else { "yielded" }
+        );
+        Ok(if preempted {
+            VcpuExit::Preempted
+        } else {
+            VcpuExit::Yielded
+        })
     }
 
     fn vcpu_stop(&mut self, vm: VmHandle, _vcpu: u32) -> Result<(), HvError> {
@@ -354,6 +401,134 @@ impl Hypervisor for BareMetalBackend {
 
 // ── Cooperative vCPU switch machinery (bare-metal only) ───────────────────────
 
+/// PSTATE guests run with (Phase 21): EL1h with the IRQ bit *unmasked* so
+/// the EL1 physical timer (PPI 30) can interrupt a running vCPU and the
+/// co-tenant scheduler can cut its time slice.  Differential: D/A/F stay
+/// masked (0x345 = 0x3c5 & ~(1<<7)); the kernel itself always runs with
+/// DAIF masked.
+const SPSR_GUEST: u64 = 0x345;
+
+/// The tenant whose vCPU is currently executing (None when no guest runs).
+static mut ACTIVE_VM: Option<VmHandle> = None;
+
+/// The CPU currently executing a guest vCPU (only CPU 0 hosts tenants, but
+/// secondaries' ticks must not preempt what they are not running).
+static mut ACTIVE_CPU: usize = 0;
+
+/// Phase 21: while true, a tick inside a guest may preempt it.  Set by the
+/// co-tenant scheduler (`vm::sched::run`) for its duration; the earlier
+/// single-guest demos (phases 3/14) run with this false and keep their
+/// purely cooperative semantics.
+static mut PREEMPT_ENABLED: bool = false;
+
+/// Default time slice in ticks, loaded into every `vcpu_run` entry.
+static mut QUANTUM_TICKS: u32 = 0;
+
+/// Arm the co-tenant preemption machinery.  Called by `vm::sched::run`.
+///
+/// # Safety
+/// Single-CPU boot context (no guest runs concurrently on other cores).
+pub unsafe fn enable_guest_preemption(quantum_ticks: u32) {
+    PREEMPT_ENABLED = true;
+    QUANTUM_TICKS = quantum_ticks;
+    log::info!(
+        "phase 21: co-tenant preemption armed (quantum={} ticks)",
+        quantum_ticks
+    );
+}
+
+/// Disarm the co-tenant preemption machinery after the tenant scheduler
+/// finishes.  Beware of the Phase-20 `MAX_LOG_LEVEL_FILTER` lesson: log
+/// through the kernel's own path; this runs in the boot context where the
+/// global filter is intact.
+///
+/// # Safety
+/// No guest may be running when this is called.
+pub unsafe fn disable_guest_preemption() {
+    PREEMPT_ENABLED = false;
+    QUANTUM_TICKS = 0;
+}
+
+/// True when a tick that just fired is inside a guest vCPU run and the
+/// co-tenant scheduler is armed.  If so, `irq_handler` must hand the tick
+/// to `tick_guest` instead of `task::tick_preempt`.
+pub fn guest_tick_active() -> bool {
+    unsafe {
+        PREEMPT_ENABLED && ACTIVE_VM.is_some() && crate::smp::cpu_index() == ACTIVE_CPU
+    }
+}
+
+/// The tick that just interrupted a guest vCPU: consume one tick of the
+/// running tenant's quantum; when the slice is spent, capture the entire
+/// preemption frame (the IRQ_ENTRY frame on the guest's stack) into the
+/// tenant's context and switch to the tenant's kernel-side continuation
+/// (the VMM loop) — which then runs the next tenant.  Never returns when
+/// it preempts.
+///
+/// # Safety
+/// Only ever called from `irq_handler` for a tick that landed inside a
+/// guest (slot 5, interrupts masked by hardware), with
+/// `guest_tick_active()` true.
+pub unsafe fn tick_guest(frame: *mut u64) {
+    if !PREEMPT_ENABLED || crate::smp::cpu_index() != ACTIVE_CPU {
+        return; // stale tick — ignore
+    }
+    let Some(handle) = ACTIVE_VM else {
+        return;
+    };
+    let backend = &mut *core::ptr::addr_of_mut!(BARE);
+    let Some(rec) = backend.find_vm(handle) else {
+        return;
+    };
+    // A tick between `enter_guest`'s return and the flag-clearing tail is
+    // not inside guest code — leave it to the task scheduler.
+    if !rec.in_guest {
+        return;
+    }
+
+    if rec.budget_ticks > 0 {
+        rec.budget_ticks -= 1;
+        return; // slice not spent — keep the tenant running
+    }
+
+    // ── Preempt: capture the whole vCPU from the IRQ frame ────────────────
+    // Frame (272 B, `IRQ_ENTRY` in vectors.s):
+    //   [0..152]  x0-x18 + x30      [160] ELR_EL1   [168] SPSR_EL1
+    //   [176..248] x19-x28          [256] x29
+    // The frame stays on the guest's stack: context.sp is set to its base,
+    // so `restore_preempted_guest` picks it up on the next run.
+    let f = frame as *const u64;
+    for i in 0..10 {
+        rec.guest_ctx.x19_to_x28[i] = core::ptr::read_volatile(f.add(22 + i));
+    }
+    rec.guest_ctx.fp = core::ptr::read_volatile(f.add(32));
+    rec.guest_ctx.sp = frame as u64;
+    rec.guest_ctx.lr = restore_preempted_guest as *const () as u64;
+    // The stub runs at EL1h with interrupts masked; the guest's own PSTATE
+    // (IRQ unmasked) sits in the frame at [sp+168] and is reinstated by the
+    // stub's final `eret`.
+    rec.guest_ctx.spsr = crate::sched::task::SPSR_KERNEL;
+    rec.guest_ctx.ttbr0 = crate::mem::page_table::kernel_l0_phys() as u64;
+    rec.preempted = true;
+
+    log::trace!(
+        "phase 21: preempting guest {:?} (frame={:#x} elr={:#x})",
+        handle,
+        frame as usize,
+        core::ptr::read_volatile(f.add(20))
+    );
+
+    // Abandon this execution stream (it lives on the guest's stack) and
+    // resume the VMM loop where it entered this guest.  Never returns.
+    crate::sched::task::context_switch_preempt(&rec.kernel_ctx);
+}
+
+extern "C" {
+    /// `restore_preempted_guest` in vectors.s — resurrects a preempted
+    /// guest from its captured IRQ frame (see `tick_guest`).
+    fn restore_preempted_guest();
+}
+
 /// Switch from the kernel to the guest, re-establishing the guest's boot
 /// args in x4/x5/x6 (shared-memory base, yield function, guest-context
 /// pointer).
@@ -366,13 +541,19 @@ impl Hypervisor for BareMetalBackend {
 /// register loads and the switch; the block must therefore clobber every
 /// caller-saved register, since `bl` lets the guest run arbitrary code.
 ///
+/// Also primes `guest_ctx.spsr = SPSR_GUEST` (Phase 21: the guest runs
+/// with IRQ enabled for tick-driven co-tenancy preemption) immediately
+/// before the switch.
+///
 /// Returns when the guest yields control back (guest context saved,
-/// kernel context restored).
+/// kernel context restored) — or when the Phase-21 tick preempted the
+/// guest and `context_switch_preempt` restored the kernel context.
 ///
 /// # Safety
 /// `kernel_ctx` must belong to the calling task and `guest_ctx` to the
 /// guest being entered.
-unsafe fn enter_guest(kernel_ctx: &mut Context, guest_ctx: &Context, boot: [u64; 2]) {
+unsafe fn enter_guest(kernel_ctx: &mut Context, guest_ctx: &mut Context, boot: [u64; 2]) {
+    guest_ctx.spsr = SPSR_GUEST;
     core::arch::asm!(
         "mov x4, {s}",
         "mov x5, {y}",
@@ -401,17 +582,23 @@ unsafe fn enter_guest(kernel_ctx: &mut Context, guest_ctx: &Context, boot: [u64;
 /// The guest-facing yield entry: called *by the guest* to hand control
 /// back to the kernel (the bare-metal stand-in for a trap exit).
 ///
+/// The guest calls `vm_yield_entry` — a tiny assembly prologue in
+/// vectors.s that masks IRQ (guests run with IRQ enabled in Phase 21; the
+/// switch to the kernel must never be interrupted mid-way by a
+/// preemption tick) and branches here.
+///
 /// Saves the guest's context into the running VM's `guest_ctx` (whose
 /// address was passed to the guest in x6 at launch) and restores the
 /// kernel context, so the kernel continues right after its `enter_guest`
 /// call.  When the kernel later runs the vCPU again, this function returns
-/// and the guest continues where it left off.
+/// and the guest continues where it left off (IRQ state restored by the
+/// `context_switch` restore — SPSR_GUEST was primed by `enter_guest`).
 #[no_mangle]
-pub extern "C" fn vm_yield_entry(guest_ctx: *mut Context) {
+pub extern "C" fn vm_yield_entry_masked(guest_ctx: *mut Context) {
     unsafe {
         let backend = &mut *core::ptr::addr_of_mut!(BARE);
         let Some(vm) = backend.running_vm_mut() else {
-            log::error!("vm_yield_entry: no running VM");
+            log::error!("vm_yield_entry_masked: no running VM");
             return;
         };
         context_switch(guest_ctx, &vm.kernel_ctx as *const Context);
