@@ -92,6 +92,14 @@ pub const SERVER_MMIO_CAPS: &[(&str, &[MmioCap])] = &[
             MmioCap { kind: CapKind::PciMem, size: 0x3000_0000 },
         ],
     ),
+    // Phase 20: `fs` owns the virtio-blk PCI device (same windows as `net`).
+    (
+        "fs",
+        &[
+            MmioCap { kind: CapKind::Ecam, size: 16 * 1024 * 1024 },
+            MmioCap { kind: CapKind::PciMem, size: 0x3000_0000 },
+        ],
+    ),
     ("display", &[MmioCap { kind: CapKind::VirtioMmio, size: DISPLAY_MMIO_SIZE }]),
 ];
 
@@ -158,6 +166,7 @@ static SERVER_BINS: &[(&str, &[u8])] = &[
     ("ping", include_bytes!(env!("TANIX_PING_BIN_PATH"))),
     ("pong", include_bytes!(env!("TANIX_PONG_BIN_PATH"))),
     ("sec", include_bytes!(env!("TANIX_SEC_BIN_PATH"))),
+    ("fs", include_bytes!(env!("TANIX_FS_BIN_PATH"))),
 ];
 
 #[cfg(not(feature = "embed-servers"))]
@@ -195,6 +204,7 @@ pub const SERVER_BASES: &[(&str, usize)] = &[
     ("ping",    0x411C_0000),
     ("pong",    0x411E_0000),
     ("sec",     0x4120_0000),
+    ("fs",      0x4122_0000),
 ];
 
 /// Phase 16: the fixed link bases above are chosen for the `virt` machine's
@@ -249,6 +259,7 @@ pub const SERVER_PRIOS: &[(&str, u8)] = &[
     ("ping",     96),
     ("pong",     96),
     ("sec",      96),
+    ("fs",       96),
     ("hog",     192),
 ];
 

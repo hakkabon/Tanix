@@ -1,0 +1,7 @@
+[package]
+name = "tanix-libfs"
+version.workspace = true
+edition.workspace = true
+description = "Tanix Phase-20 FAT16 filesystem library (no_std, block-agnostic)"
+
+[dependencies]

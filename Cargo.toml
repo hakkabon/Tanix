@@ -20,6 +20,8 @@ members = [
     "servers/shell",
     "servers/libtanix-drv",
     "servers/libtanix-net",
+    "servers/libtanix-fs",
+    "servers/fs",
     "servers/net",
     "servers/ping",
     "servers/pong",

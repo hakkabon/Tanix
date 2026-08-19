@@ -44,7 +44,7 @@ fn main() {
     for name in [
         "init", "pm", "mem", "dev", "worker", "display", "ui-demo", "hog",
         "wm", "counter", "clock", "ramfs", "shell", "net", "ping", "pong",
-        "sec",
+        "sec", "fs",
     ] {
         let path = format!(
             "../../{}/aarch64-unknown-none/{}/tanix-{}",

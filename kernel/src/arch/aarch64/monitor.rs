@@ -122,6 +122,11 @@ pub static mut __psci_cmd_slots: [[u64; 2]; 8] = [[0; 2]; 8];
 /// EL3 fault record (ESR_EL3, ELR_EL3) written by `el3_error`.
 #[no_mangle]
 pub static mut __el3_fault: [u64; 2] = [0; 2];
+/// NS EL1 state parked by `enter_secure` and restored on the payload's
+/// return — the secure world runs with the EL1 MMU off and its own
+/// vector table: [0] SCTLR_EL1, [2] VBAR_EL1.
+#[no_mangle]
+pub static mut __el3_saved_sctlr_el1: [u64; 3] = [0; 3];
 
 /// Runtime base of the secure payload blob (secure RAM on sbsa-ref, its
 /// link address on virt).  Written by the monitor at boot — BEFORE the
@@ -201,6 +206,50 @@ fn el3_puts(s: &str) {
     }
 }
 
+/// Debug: print a hex value on the NS console from EL3 (temporary).
+fn el3_hex(v: u64) {
+    let mut buf = [0u8; 18];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..16 {
+        let nib = ((v >> (60 - i * 4)) & 0xF) as u8;
+        buf[2 + i] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+    }
+    el3_puts(core::str::from_utf8(&buf).unwrap());
+}
+
+/// Debug (temporary): dump the just-saved SMC context from the vectors.
+/// x0 = &ctx (272-byte slot, x0..x30 @ 0..240, sp_el1 @ 248, elr @ 256,
+/// spsr @ 264).
+#[no_mangle]
+pub extern "C" fn el3_dbg_ctx(ctx: *const u64) {
+    unsafe {
+        el3_puts("EL3 SMC fn=");
+        el3_hex(core::ptr::read_volatile(ctx));
+        el3_puts(" a1=");
+        el3_hex(core::ptr::read_volatile(ctx.add(1)));
+        el3_puts(" a2=");
+        el3_hex(core::ptr::read_volatile(ctx.add(2)));
+        el3_puts(" a3=");
+        el3_hex(core::ptr::read_volatile(ctx.add(3)));
+        el3_puts(" x30=");
+        el3_hex(core::ptr::read_volatile(ctx.add(30)));
+        el3_puts(" elr=");
+        el3_hex(core::ptr::read_volatile(ctx.add(32)));
+        el3_puts(" sps=");
+        el3_hex(core::ptr::read_volatile(ctx.add(33)));
+        el3_puts(" x8=");
+        el3_hex(core::ptr::read_volatile(ctx.add(8)));
+        el3_puts(" x9=");
+        el3_hex(core::ptr::read_volatile(ctx.add(9)));
+        el3_puts(" x10=");
+        el3_hex(core::ptr::read_volatile(ctx.add(10)));
+        el3_puts(" x21=");
+        el3_hex(core::ptr::read_volatile(ctx.add(21)));
+        el3_puts("\r\n");
+    }
+}
+
 // ── EL3 bootstrap ────────────────────────────────────────────────────────────
 
 /// EL3 reset entry, called from `_start` (SP = EL3 stack, MMU off).
@@ -222,8 +271,8 @@ pub extern "C" fn monitor_el3_init(dtb: u64, is_secondary: u64, el1_entry: u64) 
             options(nomem, nostack)
         );
         core::arch::asm!(
-            "msr SCR_EL3, {v}", // NS | SMC | HCE | RW
-            v = in(reg) 0x581u64,
+            "msr SCR_EL3, {v}", // NS | HCE | RW — SMD kept 0 so SMC traps
+            v = in(reg) 0x501u64,
             options(nomem, nostack)
         );
         core::arch::asm!(
@@ -270,6 +319,21 @@ pub extern "C" fn monitor_el3_init(dtb: u64, is_secondary: u64, el1_entry: u64) 
 
     // 3. GIC: distributor up (Group 0 + Group 1S + Group 1NS), this CPU's
     //    redistributor awake, SGIs enabled (wakeups for parked CPUs).
+    //
+    //    IMPORTANT (sbsa-ref, QEMU GICv3 with security extensions, DS=0):
+    //    the SGI/PPI bank (GICR_IGROUPR0 / NSACR) is secure-only — NS
+    //    writes to GICR_IGROUPR0 are ignored, NS ISENABLER0 writes are
+    //    masked by the group bits, and NS ICC_SGI1R writes are dropped
+    //    unless GICR_NSACR grants access.  Everything the NS kernel's
+    //    `gic::init` does to the redistributor silently no-ops here (it
+    //    works on `virt`, whose GICv3 has DS=1).  So this monitor is the
+    //    ONLY place the bank can be configured for the NS kernel:
+    //      * SGIs 0..14  → Group 1NS + enabled (kernel IPIs/doorbells)
+    //      * PPI 30      → Group 1NS + enabled (NS EL1 preemption tick)
+    //      * SGI 15      → stays Group 0 (this monitor's WFI wakeup)
+    //      * PPI 29      → stays Group 0 (secure payload secure timer)
+    //      * NSACR       → all SGIs fully NS-accessible (SGI generation
+    //                      from NS requires NSACR >= 0b10 per SGI)
     let m = machine::machine();
     let cpu = crate::smp::cpu_index();
     unsafe {
@@ -281,8 +345,17 @@ pub extern "C" fn monitor_el3_init(dtb: u64, is_secondary: u64, el1_entry: u64) 
         let waker = core::ptr::read_volatile((gicr + 0x014) as *const u32); // GICR_WAKER
         core::ptr::write_volatile((gicr + 0x014) as *mut u32, waker & !(1 << 1));
         while core::ptr::read_volatile((gicr + 0x014) as *const u32) & (1 << 2) != 0 {}
-        // SGIs 0..15 as Group 0, enabled: they wake parked CPUs from WFI.
-        core::ptr::write_volatile((gicr + 0x1_0000 + 0x100) as *mut u32, 0xFFFFu32);
+        // GICR_IGROUPR0: SGIs 0..14 + PPI 30 → Group 1NS; SGI 15, PPI 29
+        // stay Group 0 (secure).  0x4000_7FFF = bits 0..14 | bit 30.
+        core::ptr::write_volatile((gicr + 0x1_0000 + 0x080) as *mut u32, 0x4000_7FFFu32);
+        // GICR_NSACR: grant NS access to all SGIs (2 bits per SGI).
+        core::ptr::write_volatile((gicr + 0x1_0000 + 0x0E00) as *mut u32, 0xFFFF_FFFFu32);
+        // GICR_ISENABLER0: enable SGIs 0..15, PPI 29, PPI 30 (set-bitmap
+        // semantics — 1s set, 0s ignored).
+        core::ptr::write_volatile(
+            (gicr + 0x1_0000 + 0x100) as *mut u32,
+            0xFFFFu32 | (1 << 29) | (1 << 30),
+        );
     }
 
     // 4. CPU count from the DT (sbsa-ref lists /cpus/cpu@N).

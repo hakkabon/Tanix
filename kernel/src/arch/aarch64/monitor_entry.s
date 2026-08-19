@@ -117,6 +117,13 @@ smc_el3_entry:
     str  x9,  [x11, #256]
     mrs  x9,  SPSR_EL3
     str  x9,  [x11, #264]
+    // DEBUG (temporary): dump the just-saved SMC context
+    stp  x11, x12, [sp, #-32]!
+    str  x14, [sp, #16]
+    mov  x0, x11
+    bl   el3_dbg_ctx
+    ldr  x14, [sp, #16]
+    ldp  x11, x12, [sp], #32
     // dispatch on the caller's world
     mrs  x9, SCR_EL3
     and  x9, x9, #1
@@ -153,6 +160,14 @@ smc_el3_entry:
     //    kernel and restore the NS context.
 sec_caller:
     ldr  x2, [x11, #0]          // payload return value (sec_ctx.regs[0])
+    // Restore the NS EL1 MMU state (SCTLR + vectors) saved at enter_secure.
+    adrp x5, __el3_saved_sctlr_el1
+    add  x5, x5, :lo12:__el3_saved_sctlr_el1
+    ldr  x4, [x5]
+    msr  SCTLR_EL1, x4
+    ldr  x4, [x5, #16]
+    msr  VBAR_EL1, x4
+    isb
     adrp x3, __ns_ctx
     add  x3, x3, :lo12:__ns_ctx
     madd x11, x14, x12, x3      // &ns_ctx[cpu]
@@ -161,11 +176,11 @@ sec_caller:
 
     // ── Restore the non-secure caller (resume after its `smc`) ──────────
 restore_ns:
-    mov  x1, #0x581             // SCR_EL3: NS|SMC|HCE|RW
+    mov  x1, #0x501             // SCR_EL3: NS|HCE|RW (SMD=0 so smc traps)
     msr  SCR_EL3, x1
     ldr  x12, [x11, #248]       // sp_el1
-    ldr  x13, [x11, #256]       // elr
-    add  x13, x13, #4
+    ldr  x13, [x11, #256]       // elr — QEMU already points at smc+4 here,
+                                // so we ERET directly (no extra +4)
     ldr  x14, [x11, #264]       // spsr
     msr  sp_el1, x12
     msr  ELR_EL3, x13
@@ -175,7 +190,7 @@ restore_ns:
     ldp  x4,  x5,  [x11, #32]
     ldp  x6,  x7,  [x11, #48]
     ldp  x8,  x9,  [x11, #64]
-    ldp  x10, x11, [x11, #80]
+    ldr  x10, [x11, #80]
     ldp  x12, x13, [x11, #96]
     ldp  x14, x15, [x11, #112]
     ldp  x16, x17, [x11, #128]
@@ -186,6 +201,7 @@ restore_ns:
     ldp  x26, x27, [x11, #208]
     ldp  x28, x29, [x11, #224]
     ldr  x30, [x11, #240]
+    ldr  x11, [x11, #88]        // x11 restored last — it is the base pointer
     isb
     eret
 
@@ -193,6 +209,19 @@ restore_ns:
     //    already written the payload's run data) ─────────────────────────
     // Self-contained: recomputes the sec_ctx pointer and the payload base.
 enter_secure:
+    // Save the NS EL1 MMU state (SCTLR + vectors) and switch the MMU
+    // off: the payload runs at S-EL1 with the MMU disabled (physical
+    // security state), while the NS kernel's identity mapping must not
+    // be consulted for secure RAM.  VBAR_EL1 is restored on return so a
+    // later NS exception never vectors into the payload.
+    mrs  x6, SCTLR_EL1
+    adrp x5, __el3_saved_sctlr_el1
+    add  x5, x5, :lo12:__el3_saved_sctlr_el1
+    stp  x6, xzr, [x5]
+    mrs  x6, VBAR_EL1
+    str  x6, [x5, #16]
+    msr  SCTLR_EL1, xzr
+    isb
     mrs  x14, MPIDR_EL1
     and  x14, x14, #0xff
     movz x12, #272
@@ -203,7 +232,7 @@ enter_secure:
     add  x3, x3, :lo12:__sec_runtime_base
     ldr  x3, [x3]               // payload base
     // secure world setup
-    mov  x1, #0x580             // SCR_EL3 without NS
+    mov  x1, #0x500             // SCR_EL3 without NS (SMD=0)
     msr  SCR_EL3, x1
     msr  VBAR_EL1, x3           // secure vectors at the payload base
     add  x4, x3, #0x7000        // secure stack top (region-relative)
@@ -259,7 +288,7 @@ monitor_park_loop:
     b.ne monitor_park_loop
     str  xzr, [x11, #0]         // clear the magic
     ldr  x12, [x11, #8]         // entry
-    mov  x1, #0x581
+    mov  x1, #0x501             // SCR_EL3 without... see above (NS|HCE|RW)
     msr  SCR_EL3, x1
     msr  ELR_EL3, x12
     mov  x13, #0x3c5            // SPSR_EL3: EL1h, DAIF masked

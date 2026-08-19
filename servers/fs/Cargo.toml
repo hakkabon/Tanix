@@ -1,0 +1,10 @@
+[package]
+name = "tanix-fs"
+version.workspace = true
+edition.workspace = true
+description = "Tanix Phase-20 filesystem server — FAT16 over virtio-blk, served over IPC"
+
+[dependencies]
+tanix-libsys = { path = "../libtanix-sys" }
+tanix-libdrv = { path = "../libtanix-drv" }
+tanix-libfs = { path = "../libtanix-fs" }

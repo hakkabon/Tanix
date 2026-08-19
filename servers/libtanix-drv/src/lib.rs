@@ -14,6 +14,8 @@
 //!                   the common config, queue notification, ISR handling.
 //!   • `net`       — the virtio-net driver on top (device id 1, RX/TX
 //!                   queues, the 12-byte virtio_net_hdr).
+//!   • `blk`       — the virtio-blk driver (device id 2): one request
+//!                   queue, synchronous request/reply, ≤ 8 sectors each.
 //!
 //! The transport runs **interrupt-driven**: the virtio-pci device asserts
 //! its legacy INTx line (SPI 35..38 depending on the PCI slot) for every
@@ -26,6 +28,7 @@
 
 #![no_std]
 
+pub mod blk;
 pub mod net;
 pub mod pci;
 pub mod virtio_pci;

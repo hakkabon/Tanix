@@ -40,6 +40,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tanix-fs"
+version = "0.1.0"
+dependencies = [
+ "tanix-libdrv",
+ "tanix-libfs",
+ "tanix-libsys",
+]
+
+[[package]]
 name = "tanix-hog"
 version = "0.1.0"
 dependencies = [
@@ -66,6 +75,10 @@ version = "0.1.0"
 dependencies = [
  "tanix-libsys",
 ]
+
+[[package]]
+name = "tanix-libfs"
+version = "0.1.0"
 
 [[package]]
 name = "tanix-libnet"

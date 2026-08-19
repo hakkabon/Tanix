@@ -104,5 +104,28 @@ pub const M_RAMFS_READDIR_REPLY: u32 = 0x0701; // data[0]=1|0, data[1,2]=name (8
 pub const M_RAMFS_READ: u32 = 0x0702; // data[0..6]=path (24 chars), data[6]=byte offset
 pub const M_RAMFS_READ_REPLY: u32 = 0x0703; // data[0]=len (0 = EOF), data[1..8]=bytes
 
+/// Filesystem server (`fs`) — Phase 20.  A FAT16 volume on a virtio-blk
+/// disk, served over IPC with file handles (no paths after open):
+///   M_FS_OPEN(path, flags) → fd, size
+///   M_FS_READ(fd, offset)   → up to 28 bytes (len 0 = EOF)
+///   M_FS_WRITE(fd, offset, len, payload(20 B)) → ok, new size
+///       (offset ≤ size overwrites; offset == size appends, allocating
+///       clusters)
+///   M_FS_LIST(offset)       → one root entry (name 8.3, is_dir, size)
+///   M_FS_INFO               → cluster geometry + free space
+pub const M_FS_INFO: u32 = 0x0800;
+pub const M_FS_INFO_REPLY: u32 = 0x0801; // data[0]=cluster_bytes, data[1]=total_clusters, data[2]=free_clusters
+pub const M_FS_OPEN: u32 = 0x0802; // data[0..6]=path (24 chars), data[6]=flags (0=read, 1=write/create)
+pub const M_FS_OPEN_REPLY: u32 = 0x0803; // data[0]=fd (0xFFFFFFFF = error), data[1]=size, data[2]=ok
+pub const M_FS_READ: u32 = 0x0804; // data[0]=fd, data[1]=byte offset
+pub const M_FS_READ_REPLY: u32 = 0x0805; // data[0]=len (0=EOF, 0xFFFFFFFF=err), data[1..8]=bytes (28)
+pub const M_FS_WRITE: u32 = 0x0806; // data[0]=fd, data[1]=offset, data[2]=len (≤20), data[3..8]=payload
+pub const M_FS_WRITE_REPLY: u32 = 0x0807; // data[0]=ok, data[1]=new size
+pub const M_FS_CLOSE: u32 = 0x0808; // data[0]=fd
+pub const M_FS_CLOSE_REPLY: u32 = 0x0809; // data[0]=ok
+pub const M_FS_LIST: u32 = 0x080A; // data[0]=entry offset
+pub const M_FS_LIST_REPLY: u32 = 0x080B; // data[0]=1|0 (end), data[1,2]=name (8 chars), data[3]=is_dir, data[4]=size
+pub const M_FS_FD_INVALID: u32 = 0xFFFF_FFFF;
+
 /// Maximum string payload carried inside a message (28 chars + NUL).
 pub const MAX_INLINE_STR: usize = 28;

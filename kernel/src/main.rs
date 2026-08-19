@@ -659,10 +659,18 @@ fn kmain(dtb: usize) -> ! {
     unsafe {
         core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); // clear I
     }
+    let mut spins: u64 = 0;
+    diag_dump_gic("pre-wait");
     while hypervisor::doorbell::stats(bell)
         .map(|(_, d)| d == 0)
         .unwrap_or(true)
     {
+        spins += 1;
+        if spins > 60_000_000 {
+            log::warn!("phase 14: doorbell not delivered — giving up");
+            diag_dump_gic("give-up");
+            break;
+        }
         core::hint::spin_loop();
     }
     let (rings, deliveries) = hypervisor::doorbell::stats(bell)
@@ -790,12 +798,20 @@ fn kmain(dtb: usize) -> ! {
             extern "C" { static __kernel_start: u8; }
             core::ptr::addr_of!(__kernel_start) as usize
         };
-        let local = fnv1a(kernel_start, kernel_end - kernel_start);
-        let measured = arch::aarch64::monitor::secure_measure_smc(kernel_start, kernel_end - kernel_start);
+        // Measure only the immutable image ([_start, .bss)): .bss holds the
+        // EL3 monitor's ctx slots and stack, which the SMC save block
+        // mutates between the local hash and the monitor's own read —
+        // including them would make a mismatch unconditional.
+        let measure_end = {
+            extern "C" { static __bss_start: u8; }
+            core::ptr::addr_of!(__bss_start) as usize
+        };
+        let local = fnv1a(kernel_start, measure_end - kernel_start);
+        let measured = arch::aarch64::monitor::secure_measure_smc(kernel_start, measure_end - kernel_start);
         log::info!(
             "phase 16: TCB measurement of kernel image \
              ({:#x}..{:#x}): monitor={:#x} local={:#x} {}",
-            kernel_start, kernel_end, measured, local,
+            kernel_start, measure_end, measured, local,
             if measured == local { "match" } else { "MISMATCH" }
         );
         log::info!("phase 16: PSCI version via monitor: {:#x}", arch::aarch64::monitor::psci_version_smc());
@@ -899,6 +915,11 @@ fn kmain(dtb: usize) -> ! {
             net, hog, ping, pong
         );
 
+        // Phase 20: the filesystem server (FAT16 over virtio-blk, PCI —
+        // machine-agnostic like the NIC).
+        let fs = server::spawn_by_name("fs");
+        log::info!("phase 20: filesystem server spawned (fs={:?})", fs);
+
         // Enable the EL1 physical-timer interrupt (PPI 30) and arm the
         // periodic 1 ms tick (preemption + SYS_SLEEP wake-ups).
         arch::aarch64::gic::enable_irq(30);
@@ -960,6 +981,52 @@ fn guest_info_state(shmem_phys: usize) -> u32 {
         core::ptr::read_volatile(
             (shmem_phys as usize + VMM_INFO_OFF + STATE_OFF) as *const u32,
         )
+    }
+}
+
+/// Phase 14 (temporary diagnostic): dump GIC + CPU-interface state so a
+/// stalled doorbell can be explained.  Register encodings verified against
+/// QEMU's gicv3_cpuif reginfo — ICC_HPPIR1_EL1 is S3_0_C12_C12_2
+/// (returning the highest-priority pending INTID, 1023 = none).
+fn diag_dump_gic(tag: &str) {
+    let daif: u64;
+    let hppir: u64;
+    let igpen: u64;
+    let mpidr: u64;
+    let ctlr: u32;
+    let isen0: u32;
+    let igroup0: u32;
+    let waker0: u32;
+    let typer0: u32;
+    let cpu = crate::smp::cpu_index();
+    let base = crate::arch::aarch64::machine::machine().gic_redist_base;
+    let dist = crate::arch::aarch64::machine::machine().gic_dist_base;
+    let mut wb: u32 = 0;
+    unsafe {
+        core::arch::asm!(
+            "mrs {d}, daif",
+            "mrs {h}, S3_0_C12_C12_2", // ICC_HPPIR1_EL1
+            "mrs {g}, S3_0_C12_C12_7", // ICC_IGRPEN1_EL1
+            "mrs {m}, MPIDR_EL1",
+            d = out(reg) daif,
+            h = out(reg) hppir,
+            g = out(reg) igpen,
+            m = out(reg) mpidr,
+            options(nomem, nostack)
+        );
+        ctlr = core::ptr::read_volatile((dist + 0x000) as *const u32);
+        isen0 = core::ptr::read_volatile((base + 0x1_0000 + 0x100) as *const u32);
+        igroup0 = core::ptr::read_volatile((base + 0x1_0000 + 0x080) as *const u32);
+        waker0 = core::ptr::read_volatile((base + 0x014) as *const u32);
+        typer0 = core::ptr::read_volatile((base + 0x008) as *const u32);
+        // Write-then-read: does the NS view of ISENABLER0 stick at all?
+        core::ptr::write_volatile((base + 0x1_0000 + 0x100) as *mut u32, 0xFFFFu32);
+        wb = core::ptr::read_volatile((base + 0x1_0000 + 0x100) as *const u32);
+        let dspi = core::ptr::read_volatile((dist + 0x100) as *const u32);
+        log::warn!(
+            "cic: {} cpu={} mpidr={:#x} daif={:#x} HPPIR1={} IGRPEN1={:#x} GICD_CTLR={:#x} TYPER={:#x} | ISENABLER0={:#x} (wb={:#x}) IGROUPR0={:#x} WAKER={:#x} GICD_ISENABLER1={:#x}",
+            tag, cpu, mpidr, daif, hppir, igpen, ctlr, typer0, isen0, wb, igroup0, waker0, dspi
+        );
     }
 }
 

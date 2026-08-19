@@ -56,6 +56,7 @@ pub extern "C" fn irq_handler(from_el0: u64) {
     use crate::sched::task;
 
     let intid = gic::ack();
+    log::debug!("irq: acked INTID={}", intid);
 
     match intid {
         // PPI 30 — EL1 physical timer (CNTPNSIRQ on QEMU `virt`; the board
