@@ -229,5 +229,5 @@ static LOGGER: UartLogger = UartLogger;
 /// Call once during `arch::aarch64::init()`.
 pub fn logger_init() {
     log::set_logger(&LOGGER).ok();
-    log::set_max_level(LevelFilter::Trace);
+    log::set_max_level(LevelFilter::Info);
 }
