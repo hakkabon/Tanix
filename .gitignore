@@ -1,4 +1,9 @@
-/target*/
+# Blocks the standard target folder at the root
+/target/
+
+# Blocks custom target folders (like target-sbsa) at any depth
+target-*/
+
 **/*.rs.bk
 *.pdb
 rustc-ice-*.txt
