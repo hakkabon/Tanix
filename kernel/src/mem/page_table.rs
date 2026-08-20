@@ -557,6 +557,16 @@ pub unsafe fn enable(ram_base: usize, ram_size: usize) {
         map_range(m.virtio_mmio_base, 2 * 1024 * 1024, FLAGS_BLOCK_DEVICE);
     }
 
+    // 5. Legacy guest-console window (0x0900_0000): the Phase-3 stub and
+    //    Phase-21 RTOS guests print through a PL011 they hard-wire to the
+    //    QEMU `virt` address.  Mapping it as device memory on *every*
+    //    machine keeps those guests fault-free on `sbsa-ref` (there the
+    //    accesses reach unassigned bus space and are silently absorbed;
+    //    on `virt` it is the real PL011).  Without this a guest's first
+    //    console write takes a data abort in the middle of guest code —
+    //    indistinguishable from a kernel bug.
+    map_range(0x0900_0000, 2 * 1024 * 1024, FLAGS_BLOCK_DEVICE);
+
     // 5. Install TTBR0_EL1 (user/low address space) — we use TTBR0 for
     //    the identity map since our kernel VAs are below 0x0001_0000_0000.
     //    Real hardware: DSB ISH makes the table writes above globally

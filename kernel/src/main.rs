@@ -51,6 +51,26 @@ static ZEPHYR_STUB_BIN: &[u8] = &[
     0xa0, 0x00, 0x1f, 0xd6, // br   x5
 ];
 
+// ── Phase 21: co-tenant RTOS guest binary ─────────────────────────────────────
+
+/// Phase 21: the co-tenant guest — a real (if tiny) RTOS with its own
+/// producer/consumer/timer threads, its own queue and semaphore, and a
+/// tickless idle loop.  Built with `just rtos-guest` (base-0 linked, loaded
+/// into allocated guest RAM like the stub; no TANIX_LINK_SHIFT).
+///
+/// The path is emitted by `build.rs` and is profile-aware (debug/release).
+#[cfg(feature = "embed-rtos")]
+static RTOS_GUEST_BIN: &[u8] = include_bytes!(env!("TANIX_RTOS_BIN_PATH"));
+
+/// Fallback: infinite yield loop (same as the stub fallback) — each tenant
+/// boots, hands control back, and never answers, so the co-tenant demo logs
+/// tenant statistics with zero echoes instead of hanging.
+#[cfg(not(feature = "embed-rtos"))]
+static RTOS_GUEST_BIN: &[u8] = &[
+    0xe0, 0x03, 0x06, 0xaa, // mov  x0, x6
+    0xa0, 0x00, 0x1f, 0xd6, // br   x5
+];
+
 // ── Boot entry ────────────────────────────────────────────────────────────────
 //
 // `_start` is pure assembly: at reset the CPU may be in EL3 or EL2 (QEMU's
@@ -505,6 +525,25 @@ fn kmain(dtb: usize) -> ! {
         guest_handle, shmem_phys
     );
 
+    // TEMP DIAG: dump the walk descriptors for the fault region
+    // (0x1000008de60 / vectors) versus the guest RAM, as EL1 sees them.
+    unsafe {
+        let ttbr0 = crate::mem::page_table::kernel_l0_phys() as *const u64;
+        for va in [0x1000008de60usize, 0x1000008e200, 0x100012ad000, 0x100012a9000] {
+            let l0e = core::ptr::read_volatile(ttbr0.add((va >> 39) & 0x1FF));
+            let l1 = (l0e & 0x0000_FFFF_FFFF_F000) as *const u64;
+            let l1e = core::ptr::read_volatile(l1.add((va >> 30) & 0x1FF));
+            let l2 = (l1e & 0x0000_FFFF_FFFF_F000) as *const u64;
+            let l2e = core::ptr::read_volatile(l2.add((va >> 21) & 0x1FF));
+            let l3 = (l2e & 0x0000_FFFF_FFFF_F000) as *const u64;
+            let l3e = core::ptr::read_volatile(l3.add((va >> 12) & 0x1FF));
+            log::info!(
+                "diag: VA={:#x} L0={:#x} L1={:#x} L2={:#x} L3={:#x}",
+                va, l0e, l1e, l2e, l3e
+            );
+        }
+    }
+
     // 5. Enter the guest.  This switches the CPU into the guest; it returns
     //    when the guest yields control back (right after its boot banner).
     unsafe {
@@ -741,6 +780,86 @@ fn kmain(dtb: usize) -> ! {
         tot_rings, tot_deliveries, tot_rings - tot_deliveries
     );
     log::info!("phase 14: doorbell message-queue demo complete");
+
+    // ── Phase 21: co-tenant vCPU scheduler (multi-VM time slicing) ────────────
+    //
+    // Three tenants share the physical CPU.  Each is a *real* RTOS guest —
+    // its own producer/consumer/timer threads, message queue, semaphore and
+    // tickless idle loop — running in its own 1 MiB guest RAM.  The kernel's
+    // tenant scheduler (`vm::sched`) round-robins them, one quantum per
+    // pass, posting a heartbeat Print into each tenant's virtqueue first.
+    //
+    // The slice boundary is the EL1 physical timer (PPI 30), which the guest
+    // runs with IRQs unmasked: when a quantum is spent, the tick lands in
+    // the *middle of arbitrary guest code* and the whole vCPU frame is
+    // captured (SPSR/ELR/gprs by `backend::tick_guest`); the tenant is
+    // resumed later exactly where it stopped.  A guest with nothing to do
+    // yields cooperatively instead, and one whose RTOS finished writes
+    // PARKED into its info block and drops out of the rotation.
+    //
+    // Each tenant's doorbell (SGIs 3-5) is the Gunyah wake channel — the
+    // kernel rings it with every heartbeat Print (`VCPU_RUN_RESP_IRQ` in
+    // Gunyah terms); the guests drain the ring in their idle loop and
+    // answer with an Echo.
+    const TENANT_RAM_PAGES: usize = 256; // 1 MiB per tenant
+    const TENANT_NAMES: [&str; 3] = ["rtos-a", "rtos-b", "rtos-c"];
+    unsafe {
+        arch::aarch64::gic::enable_irq(30);
+        arch::aarch64::timer::init_tick(); // 10 ms ticks — the slice clock
+    }
+
+    let mut tenants: [vm::sched::Tenant; 3] = core::array::from_fn(|i| {
+        let name = TENANT_NAMES[i];
+        let shmem = unsafe {
+            vm::shmem::alloc_shmem(4, hv)
+                .expect("phase 21: failed to allocate tenant shmem")
+        };
+        let shmem_phys = unsafe {
+            vm::shmem::region_for(shmem)
+                .expect("phase 21: tenant shmem not found")
+                .phys
+        };
+        let boot: [u64; 2] = [
+            shmem_phys as u64,
+            vm::yield_fn_addr() as u64,
+        ];
+        let handle = unsafe {
+            vm::create_vm(name, RTOS_GUEST_BIN, TENANT_RAM_PAGES, hv, boot)
+                .expect("phase 21: failed to create tenant VM")
+        };
+        let bell = hv
+            .doorbell_create(handle, 3 + i as u32) // SGIs 3-5 = tenant doorbells
+            .expect("phase 21: doorbell_create failed");
+        let transport = unsafe {
+            virtio::transport::VirtioTransport::new(shmem_phys, bell)
+        };
+        log::info!(
+            "phase 21: tenant '{}' ready (vm={:?} shmem={:#x} bell={:?})",
+            name, handle, shmem_phys, bell
+        );
+        vm::sched::Tenant::new(name, handle, shmem_phys, transport)
+    });
+
+    // The rotation: 2 ticks (20 ms) per slice.  Each guest's demo spans
+    // several slices, so the tick demonstrably cuts each RTOS mid-thread.
+    unsafe {
+        vm::sched::run(&mut tenants, 2, 200, hv)
+            .expect("phase 21: tenant scheduler failed");
+    }
+
+    // Summary: per-tenant scheduling statistics.
+    for (i, t) in tenants.iter().enumerate() {
+        log::info!(
+            "phase 21: tenant {} ({}) — runs={} preempts={} yields={} echoes={}{}",
+            i, t.name_str(), t.runs, t.preempts, t.yields, t.echoes,
+            if t.parked { " (parked)" } else { "" }
+        );
+    }
+    unsafe {
+        arch::aarch64::timer::disarm();
+        arch::aarch64::gic::disable_irq(30);
+    }
+    log::info!("phase 21: co-tenant RTOS demo complete");
 
     // ── Phase 4: Minix-style server processes ─────────────────────────────────
     //

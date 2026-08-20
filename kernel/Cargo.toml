@@ -9,6 +9,10 @@ description = "Tanix microkernel — Phase 3"
 # Requires: cargo build --package tanix-zephyr-stub first.
 embed-zephyr-stub = []
 
+# Phase 21: build the co-tenant RTOS guest binary into the kernel image.
+# Requires: cargo build --package tanix-rtos-guest first.
+embed-rtos = []
+
 # Build the Phase-4 server binaries (init/pm/mem/dev/worker) into the kernel.
 # Requires: cargo build --package tanix-init --package tanix-pm --package
 # tanix-mem --package tanix-dev --package tanix-worker first.

@@ -1,0 +1,7 @@
+[package]
+name = "tanix-rtos-guest"
+version.workspace = true
+edition.workspace = true
+description = "Phase 21: Zephyr-style RTOS guest (threads, k_sem, k_msgq, k_sleep) running as a co-tenant VM"
+
+[dependencies]

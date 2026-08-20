@@ -4,6 +4,7 @@
 TARGET      := "aarch64-unknown-none"
 KERNEL_PKG  := "tanix-kernel"
 STUB_PKG    := "tanix-zephyr-stub"
+RTOS_PKG    := "tanix-rtos-guest"
 
 # Default: build kernel (debug)
 default: kernel
@@ -244,4 +245,26 @@ kernel-sbsa: servers-sbsa
 # EL3 monitor, phase-16 TCB-measurement + world-switch demos, then the
 # machine-agnostic servers (init/pm/mem/dev/worker/net/hog/ping/pong).
 qemu-sbsa: kernel-sbsa
+    ./scripts/qemu-sbsa.sh
+
+# ── Phase 21: co-tenant RTOS guests ────────────────────────────────────────────
+
+# Build the Phase-21 RTOS guest binary (base-0 linked, loaded into allocated
+# guest RAM like zephyr-stub — no TANIX_LINK_SHIFT needed).
+rtos-guest:
+    cargo build --package {{RTOS_PKG}} --target {{TARGET}}
+
+# Build the RTOS guest into the sbsa target dir (for kernel-sbsa-rtos).
+rtos-guest-sbsa:
+    CARGO_TARGET_DIR=target-sbsa cargo build --package {{RTOS_PKG}} --target {{TARGET}}
+
+# sbsa kernel with the real Zephyr stub (phases 3/14) AND the Phase-21 RTOS
+# guest (co-tenant demo) embedded.
+kernel-sbsa-rtos: servers-sbsa rtos-guest-sbsa
+    CARGO_TARGET_DIR=target-sbsa TANIX_SERVER_TARGET_DIR=target-sbsa \
+        cargo build --package {{KERNEL_PKG}} --target {{TARGET}} \
+        --features sbsa-ref,embed-servers,embed-zephyr-stub,embed-rtos
+
+# Boot the full Phase-21 demo on the sbsa-ref machine.
+qemu-sbsa-rtos: kernel-sbsa-rtos
     ./scripts/qemu-sbsa.sh

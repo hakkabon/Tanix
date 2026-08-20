@@ -4,6 +4,7 @@ members = [
     "kernel",
     "servers/init",
     "servers/zephyr-stub",
+    "servers/rtos-guest",
     "servers/libtanix-sys",
     "servers/pm",
     "servers/mem",

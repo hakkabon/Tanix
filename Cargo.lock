@@ -140,6 +140,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tanix-rtos-guest"
+version = "0.1.0"
+
+[[package]]
 name = "tanix-sec"
 version = "0.1.0"
 dependencies = [

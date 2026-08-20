@@ -26,18 +26,35 @@
 
 use core::panic::PanicInfo;
 
-// ── UART (PL011 at QEMU virt) ────────────────────────────────────────────────
+// ── UART ──────────────────────────────────────────────────────────────────────
+//
+// The kernel hands the machine console base in boot register x7 (set on
+// every entry), so the same binary runs on `virt` (0x0900_0000) and
+// `sbsa-ref` (0x6000_0000).  Falls back to the original virt address if x7
+// is missing.
 
-const UART_DR: *mut u32 = 0x0900_0000 as *mut u32;
-const UART_FR: *const u32 = 0x0900_0018 as *const u32;
+static mut UART_BASE: usize = 0x0900_0000;
+
+fn set_uart_base(uart: u64) {
+    if uart != 0 {
+        unsafe { UART_BASE = uart as usize; }
+    }
+}
+
+fn uart_dr() -> *mut u32 {
+    unsafe { (UART_BASE + 0x0000) as *mut u32 }
+}
+fn uart_fr() -> *const u32 {
+    unsafe { (UART_BASE + 0x0018) as *const u32 }
+}
 const FR_TXFF: u32 = 1 << 5;
 
 fn putc(b: u8) {
     unsafe {
-        while core::ptr::read_volatile(UART_FR) & FR_TXFF != 0 {
+        while core::ptr::read_volatile(uart_fr()) & FR_TXFF != 0 {
             core::hint::spin_loop();
         }
-        core::ptr::write_volatile(UART_DR, b as u32);
+        core::ptr::write_volatile(uart_dr(), b as u32);
     }
 }
 
@@ -136,15 +153,18 @@ type YieldFn = unsafe extern "C" fn(guest_ctx: usize);
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     // Boot arguments set by vm::Manager::start immediately before the
-    // context switch (x4/x5/x6 are untouched by the switch stub).
+    // context switch (x4/x5/x6/x7 are untouched by the switch stub).
     let shmem_phys: u64;
     let yield_addr: u64;
     let guest_ctx: u64;
+    let uart: u64;
     unsafe {
         core::arch::asm!("mov {}, x4", out(reg) shmem_phys, options(nomem, nostack));
         core::arch::asm!("mov {}, x5", out(reg) yield_addr, options(nomem, nostack));
         core::arch::asm!("mov {}, x6", out(reg) guest_ctx, options(nomem, nostack));
+        core::arch::asm!("mov {}, x7", out(reg) uart, options(nomem, nostack));
     }
+    set_uart_base(uart);
 
     puts("\n[Zephyr-stub] guest booted, shmem=");
     put_u32_hex(shmem_phys as u32);

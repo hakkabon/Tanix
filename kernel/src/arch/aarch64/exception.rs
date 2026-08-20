@@ -271,6 +271,22 @@ pub extern "C" fn sync_handler(esr: u64, elr: u64, _far: u64, sp: u64) {
                     return;
                 }
                 unsafe { kill_faulting_task(esr, elr, _far) }
+            } else if crate::hypervisor::backend::guest_tick_active() {
+                // Phase 21: a co-tenant guest (EL1, same-level as the kernel)
+                // dereferenced a bad address — the fault lands in OUR sync
+                // vector with (ELR, FAR) = the guest's faulting state.  The
+                // kernel must not die with the tenant: park the guest in its
+                // info block (PARKED → the scheduler drops it) and park this
+                // CPU until then.  Report the fault once, raw-atomic.
+                raw_uart_line("GUESTfault ESR=", esr);
+                raw_uart_line("GUESTfault ELR=", elr);
+                raw_uart_line("GUESTfault FAR=", _far);
+                unsafe {
+                    crate::hypervisor::backend::park_active_tenant();
+                    loop {
+                        core::arch::asm!("wfi", options(nomem, nostack));
+                    }
+                }
             }
             panic!(
                 "guest abort EC={:#x} ESR={:#010x} ELR={:#018x} FAR={:#018x}",
@@ -298,34 +314,132 @@ pub extern "C" fn sync_handler(esr: u64, elr: u64, _far: u64, sp: u64) {
 // ── Fatal exception handler ───────────────────────────────────────────────────
 
 /// Called for all unexpected / fatal exception slots.
+///
+/// Guards against recursive panics (see the WFI re-entry park at the top).
+static mut PANICKING: bool = false;
+
+/// Raw UART dump helper — no fmt, no log, no stack machinery.  Writes to
+/// the machine EL1 console directly so a faulting page or a broken panic
+/// path can still report the (ESR, ELR, FAR, descriptor) quadruple.
+fn raw_uart_hex(v: u64) {
+    let dr = crate::arch::aarch64::machine().uart_base as *mut u32;
+    let fr = (crate::arch::aarch64::machine().uart_base + 0x18) as *const u32;
+    let hex = b"0123456789abcdef";
+    unsafe {
+        for i in (0..16).rev() {
+            while core::ptr::read_volatile(fr) & (1 << 5) != 0 {
+                core::hint::spin_loop();
+            }
+            core::ptr::write_volatile(dr, hex[((v >> (i * 4)) & 0xf) as usize] as u32);
+        }
+    }
+}
+
+fn raw_uart_str(s: &str) {
+    let dr = crate::arch::aarch64::machine().uart_base as *mut u32;
+    let fr = (crate::arch::aarch64::machine().uart_base + 0x18) as *const u32;
+    unsafe {
+        for &b in s.as_bytes() {
+            while core::ptr::read_volatile(fr) & (1 << 5) != 0 {
+                core::hint::spin_loop();
+            }
+            core::ptr::write_volatile(dr, b as u32);
+        }
+    }
+}
+
+fn raw_uart_line(tag: &str, v: u64) {
+    raw_uart_str(tag);
+    raw_uart_hex(v);
+    raw_uart_str("\n");
+}
+
 #[no_mangle]
-pub extern "C" fn exception_handler(kind: u64, esr: u64, elr: u64, far: u64) -> ! {
-    let (ttbr0, tcr, sctlr): (u64, u64, u64);
+pub extern "C" fn exception_handler(kind: u64, esr: u64, elr: u64, far: u64, frame: u64) -> ! {
+    // Re-entry guard FIRST: a faulting panic path (or this dump's own
+    // table walk on a garbage FAR) must park instead of flooding.
+    unsafe {
+        if *core::ptr::addr_of!(PANICKING) {
+            loop {
+                core::arch::asm!("wfi", options(nomem, nostack));
+            }
+        }
+        core::ptr::write_volatile(&mut PANICKING, true);
+    }
+    raw_uart_str("\n!!EXC ");
+    raw_uart_str(match kind {
+        4 => "cur-sync",
+        5 => "cur-irq",
+        9 => "low-irq",
+        k => {
+            raw_uart_line("k=", k);
+            "?"
+        }
+    });
+    raw_uart_line("ESR=", esr);
+    raw_uart_line("ELR=", elr);
+    raw_uart_line("FAR=", far);
+    let (ttbr0, tcr, sctlr, cur, spsr_el1): (u64, u64, u64, u64, u64);
     unsafe {
         core::arch::asm!(
             "mrs {a}, TTBR0_EL1",
             "mrs {b}, TCR_EL1",
             "mrs {c}, SCTLR_EL1",
+            "mrs {d}, CurrentEL",
+            "mrs {e}, SPSR_EL1",
             a = out(reg) ttbr0,
             b = out(reg) tcr,
             c = out(reg) sctlr,
+            d = out(reg) cur,
+            e = out(reg) spsr_el1,
             options(nomem, nostack)
         );
+    }
+    raw_uart_line("EL=", cur >> 2);
+    raw_uart_line("TTBR0=", ttbr0);
+    // The 272-byte exception frame (`EXCEPTION_ENTRY` in vectors.s) holds
+    // the faulting context's register file: x10@80, x30@152, ELR@160,
+    // SPSR@168.  For a co-tenant guest fault this is the guest's own file —
+    // the only way to see why its data pointer went bad.
+    unsafe {
+        let fr = frame as *const u64;
+        raw_uart_line("gX10=", core::ptr::read_volatile(fr.add(10)));
+        raw_uart_line("gX12=", core::ptr::read_volatile(fr.add(12)));
+        raw_uart_line("gX13=", core::ptr::read_volatile(fr.add(13)));
+        raw_uart_line("gX30=", core::ptr::read_volatile(fr.add(19)));
+        raw_uart_line("gELR=", core::ptr::read_volatile(fr.add(20)));
+        raw_uart_line("gSPSR=", core::ptr::read_volatile(fr.add(21)));
     }
     let l0 = (ttbr0 & 0x0000_FFFF_FFFF_F000) as *const u64;
     let (l0e, l1e, l2e, l3e): (u64, u64, u64, u64);
     unsafe {
         l0e = core::ptr::read_volatile(l0.add(((far >> 39) & 0x1FF) as usize));
         let l1 = (l0e & 0x0000_FFFF_FFFF_F000) as *const u64;
-        l1e = core::ptr::read_volatile(l1.add(((far >> 30) & 0x1FF) as usize));
+        l1e = if l0e & 3 == 3 {
+            core::ptr::read_volatile(l1.add(((far >> 30) & 0x1FF) as usize))
+        } else {
+            0
+        };
         let l2 = (l1e & 0x0000_FFFF_FFFF_F000) as *const u64;
-        l2e = core::ptr::read_volatile(l2.add(((far >> 21) & 0x1FF) as usize));
+        l2e = if l1e & 3 == 3 {
+            core::ptr::read_volatile(l2.add(((far >> 21) & 0x1FF) as usize))
+        } else {
+            0
+        };
         let l3 = (l2e & 0x0000_FFFF_FFFF_F000) as *const u64;
-        l3e = core::ptr::read_volatile(l3.add(((far >> 12) & 0x1FF) as usize));
+        l3e = if l2e & 3 == 3 {
+            core::ptr::read_volatile(l3.add(((far >> 12) & 0x1FF) as usize))
+        } else {
+            0
+        };
     }
+    raw_uart_line("L0=", l0e);
+    raw_uart_line("L1=", l1e);
+    raw_uart_line("L2=", l2e);
+    raw_uart_line("L3=", l3e);
+    raw_uart_line("SCTLR=", sctlr);
     panic!(
-        "fatal exception kind={} ESR={:#010x} ELR={:#018x} FAR={:#018x} \
-         TTBR0={:#x} L0={:#x} L1={:#x} L2={:#x} L3={:#x}",
-        kind, esr, elr, far, ttbr0, l0e, l1e, l2e, l3e
+        "fatal exception kind={} ESR={:#010x} ELR={:#018x} FAR={:#018x}",
+        kind, esr, elr, far
     );
 }

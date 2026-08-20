@@ -26,13 +26,35 @@ __vectors:
 // ── Macro: full save + call exception_handler(kind, esr, elr, far) → panic ──
 
 .macro EXCEPTION_ENTRY kind
-    sub  sp, sp, #32
-    stp  x0, x1, [sp, #0]
-    stp  x2, x3, [sp, #16]
+    // Save the full 272-byte register file (same layout as IRQ_ENTRY) so
+    // `exception_handler` can dump the *faulting* register state — for
+    // Phase-21 co-tenant guests this is the guest's own file (a guest
+    // fault at EL1h lands in THIS vector, not in sync_handler's).
+    sub  sp, sp, #272
+    stp  x0,  x1,  [sp,   #0]
+    stp  x2,  x3,  [sp,  #16]
+    stp  x4,  x5,  [sp,  #32]
+    stp  x6,  x7,  [sp,  #48]
+    stp  x8,  x9,  [sp,  #64]
+    stp  x10, x11, [sp,  #80]
+    stp  x12, x13, [sp,  #96]
+    stp  x14, x15, [sp, #112]
+    stp  x16, x17, [sp, #128]
+    stp  x18, x30, [sp, #144]
+    mrs  x9,  ELR_EL1
+    mrs  x10, SPSR_EL1
+    stp  x9,  x10, [sp, #160]
+    stp  x19, x20, [sp, #176]
+    stp  x21, x22, [sp, #192]
+    stp  x23, x24, [sp, #208]
+    stp  x25, x26, [sp, #224]
+    stp  x27, x28, [sp, #240]
+    str  x29,      [sp, #256]
     mrs  x1, ESR_EL1
     mrs  x2, ELR_EL1
     mrs  x3, FAR_EL1
     mov  x0, #\kind
+    mov  x4, sp
     bl   exception_handler
 1:  b    1b
 .endm

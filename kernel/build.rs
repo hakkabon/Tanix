@@ -38,6 +38,16 @@ fn main() {
     println!("cargo:rerun-if-changed={}", stub_path);
     println!("cargo:rustc-env=TANIX_STUB_BIN_PATH={}", stub_path);
 
+    // Phase 21: the co-tenant RTOS guest (a real no-IRQ RTOS with its own
+    // threads).  Built like the stub — linked base-0, loaded into allocated
+    // guest RAM — under the `embed-rtos` feature.
+    let rtos_path = format!(
+        "../../{}/aarch64-unknown-none/{}/tanix-rtos-guest",
+        server_dir, profile
+    );
+    println!("cargo:rerun-if-changed={}", rtos_path);
+    println!("cargo:rustc-env=TANIX_RTOS_BIN_PATH={}", rtos_path);
+
     // Same for the Phase-4/5/7/8/9/10/12/17 server binaries (init, pm,
     // mem, dev, worker, display, ui-demo, hog, wm, counter, clock, ramfs,
     // shell, net, ping, pong, sec).

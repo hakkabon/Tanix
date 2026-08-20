@@ -256,7 +256,7 @@ impl Hypervisor for BareMetalBackend {
             // is saved, so re-prime it on every entry.
             vm_rec.guest_ctx.spsr = SPSR_GUEST;
             // Fresh time slice for the upcoming run.
-            vm_rec.budget_ticks = QUANTUM_TICKS;
+            vm_rec.budget_ticks = unsafe { QUANTUM_TICKS };
         }
 
         // The actual CPU transfer into the guest.  `enter_guest` returns
@@ -272,7 +272,8 @@ impl Hypervisor for BareMetalBackend {
             vm_rec.in_guest = true;
             ACTIVE_VM = Some(vm);
             ACTIVE_CPU = crate::smp::cpu_index();
-            enter_guest(&mut vm_rec.kernel_ctx, &mut vm_rec.guest_ctx, boot);
+            let uart = crate::arch::aarch64::machine().uart_base as u64;
+            enter_guest(&mut vm_rec.kernel_ctx, &mut vm_rec.guest_ctx, boot, uart);
             vm_rec.in_guest = false;
             vm_rec.running = false;
             ACTIVE_VM = None;
@@ -510,6 +511,12 @@ pub unsafe fn tick_guest(frame: *mut u64) {
     rec.guest_ctx.spsr = crate::sched::task::SPSR_KERNEL;
     rec.guest_ctx.ttbr0 = crate::mem::page_table::kernel_l0_phys() as u64;
     rec.preempted = true;
+    log::info!(
+        "tick: preempting tenant @ guest_PC={:#x} gX10={:#x} gX30={:#x}",
+        core::ptr::read_volatile(f.add(20)),
+        core::ptr::read_volatile(f.add(10)),
+        core::ptr::read_volatile(f.add(19))
+    );
 
     log::trace!(
         "phase 21: preempting guest {:?} (frame={:#x} elr={:#x})",
@@ -552,7 +559,12 @@ extern "C" {
 /// # Safety
 /// `kernel_ctx` must belong to the calling task and `guest_ctx` to the
 /// guest being entered.
-unsafe fn enter_guest(kernel_ctx: &mut Context, guest_ctx: &mut Context, boot: [u64; 2]) {
+unsafe fn enter_guest(
+    kernel_ctx: &mut Context,
+    guest_ctx: &mut Context,
+    boot: [u64; 2],
+    uart: u64,
+) {
     guest_ctx.spsr = SPSR_GUEST;
     core::arch::asm!(
         "mov x4, {s}",
@@ -564,6 +576,12 @@ unsafe fn enter_guest(kernel_ctx: &mut Context, guest_ctx: &mut Context, boot: [
         s = in(reg) boot[0],
         y = in(reg) boot[1],
         c = in(reg) core::ptr::addr_of!(*guest_ctx) as u64,
+        // The UART base rides in x7 (guests read it in `_start`).  Bind it
+        // to the concrete register instead of `in(reg)`: a generic-allocated
+        // input could land on x7, and the template's own `mov x7, {u}` would
+        // then clobber a DIFFERENT `in(reg)` operand that LLVM placed there
+        // earlier (e.g. `{k}`) — sending the save target to 0x60000000.
+        in("x7") uart,
         k = in(reg) core::ptr::addr_of_mut!(*kernel_ctx) as u64,
         // `bl` lets the guest run arbitrary code, which clobbers every
         // caller-saved register (x0–x18) — declare them all.  x19–x28,
@@ -571,7 +589,7 @@ unsafe fn enter_guest(kernel_ctx: &mut Context, guest_ctx: &mut Context, boot: [
         // `kernel_ctx` before the guest runs and restores them on yield.
         // (x19 is additionally reserved by LLVM and kept alive on its own.)
         out("x0") _, out("x1") _, out("x2") _, out("x3") _,
-        out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+        out("x4") _, out("x5") _, out("x6") _,
         out("x8") _, out("x9") _, out("x10") _, out("x11") _,
         out("x12") _, out("x13") _, out("x14") _, out("x15") _,
         out("x16") _, out("x17") _, out("x18") _,
@@ -601,7 +619,40 @@ pub extern "C" fn vm_yield_entry_masked(guest_ctx: *mut Context) {
             log::error!("vm_yield_entry_masked: no running VM");
             return;
         };
+        log::info!("yield: entering context_switch (gctx={:#x} kctx={:#x} pc={:#x} k_lr={:#x} k_sp={:#x} k_spsr={:#x})", guest_ctx as u64, &vm.kernel_ctx as *const Context as u64, guest_ctx_pc(guest_ctx), ctx_lr(&vm.kernel_ctx), ctx_sp(&vm.kernel_ctx), ctx_spsr(&vm.kernel_ctx));
         context_switch(guest_ctx, &vm.kernel_ctx as *const Context);
+        log::info!("yield: context_switch RETURNED (resumed guest)");
+    }
+}
+
+fn guest_ctx_pc(ctx: *mut Context) -> u64 {
+    unsafe { core::ptr::read_volatile((ctx as *const u64).add(11)) }
+}
+fn ctx_lr(ctx: &Context) -> u64 {
+    unsafe { core::ptr::read_volatile((core::ptr::addr_of!(*ctx) as *const u64).add(11)) }
+}
+fn ctx_sp(ctx: &Context) -> u64 {
+    unsafe { core::ptr::read_volatile((core::ptr::addr_of!(*ctx) as *const u64).add(12)) }
+}
+fn ctx_spsr(ctx: &Context) -> u64 {
+    unsafe { core::ptr::read_volatile((core::ptr::addr_of!(*ctx) as *const u64).add(14)) }
+}
+
+/// Park the currently-in-guest tenant in its shmem info block (GUEST_PARKED)
+/// so the co-tenant scheduler drops it.  Called from `sync_handler` when a
+/// guest's own address fault lands in the kernel's EL1 vectors.
+pub unsafe fn park_active_tenant() {
+    let Some(handle) = ACTIVE_VM else {
+        return;
+    };
+    let backend = &mut *core::ptr::addr_of_mut!(BARE);
+    if let Some(vm) = backend.find_vm(handle) {
+        if vm.in_guest {
+            crate::vm::sched::set_tenant_state(
+                vm.boot[0] as usize,
+                crate::vm::sched::GUEST_PARKED,
+            );
+        }
     }
 }
 

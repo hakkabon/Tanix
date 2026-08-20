@@ -25,6 +25,7 @@
 //! backend; `yield_fn_addr()` publishes it as a boot argument.
 
 pub mod loader;
+pub mod sched;
 pub mod shmem;
 
 use crate::hypervisor::{Hypervisor, HvError, VmConfig, VmHandle};
@@ -195,8 +196,14 @@ pub unsafe fn resume_vm(handle: VmHandle, hv: &mut dyn Hypervisor) -> Result<(),
 
 /// Address of the guest-facing yield entry point (bare-metal backend).
 ///
-/// The guest receives this in `x5` at launch and calls it as
-/// `fn(guest_ctx: usize)` to hand control back to the kernel.
+/// The address is the assembly `vm_yield_entry` prologue in vectors.s —
+/// it masks IRQ (guests run with IRQ enabled under Phase 21 co-tenancy;
+/// the kernel-side switch must never be interrupted by a preemption tick)
+/// and branches into `backend::vm_yield_entry_masked`.  The guest receives
+/// this in `x5` at launch and calls it as `fn(guest_ctx: usize)`.
 pub fn yield_fn_addr() -> usize {
-    crate::hypervisor::backend::vm_yield_entry as *const () as usize
+    extern "C" {
+        fn vm_yield_entry();
+    }
+    vm_yield_entry as *const () as usize
 }
