@@ -8,4 +8,5 @@ fn main() {
     println!("cargo:rustc-link-arg=-T{}", linker_script.display());
     println!("cargo:rustc-link-arg=--entry=_start");
     println!("cargo:rustc-link-arg=--no-dynamic-linker");
+    println!("cargo:rustc-link-arg=--emit-relocs");
 }

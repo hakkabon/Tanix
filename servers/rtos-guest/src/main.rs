@@ -101,6 +101,18 @@ fn put_u32_hex(v: u32) {
     }
 }
 
+fn put_u64_hex(v: u64) {
+    let nybbles = [
+        (v >> 60) & 0xF, (v >> 56) & 0xF, (v >> 52) & 0xF, (v >> 48) & 0xF,
+        (v >> 44) & 0xF, (v >> 40) & 0xF, (v >> 36) & 0xF, (v >> 32) & 0xF,
+    ];
+    puts("0x");
+    for n in nybbles {
+        putc(if n < 10 { b'0' + n as u8 } else { b'a' + (n - 10) as u8 });
+    }
+    put_u32_hex(v as u32);
+}
+
 /// Register dump used by the panic handler.  Reads every register with
 /// `mov`/`mrs` only (no stack, no memory) into a static, then prints them.
 /// The values are the register file AT THE PANIC, before any handler
@@ -114,8 +126,8 @@ let regs = unsafe { PANIC_REGS.as_mut_ptr() };
         core::arch::asm!(
             // Slots: [0]SPSR [1]ELR [2]ESR [3..21]x0..x18 [22]x30
             //        [23]sp [24]x29.  x13 holds the buffer across the
-            //        dump; x19/x20 are scratch (the compiler preserves
-            //        them around the asm) and never appear as operands.
+            //        dump (inout); x9 is scratch (declared out so the
+            //        compiler keeps its own values elsewhere).
             "stp x0,  x1,  [x13, #24]",
             "stp x2,  x3,  [x13, #40]",
             "stp x4,  x5,  [x13, #56]",
@@ -126,22 +138,23 @@ let regs = unsafe { PANIC_REGS.as_mut_ptr() };
             "stp x14, x15, [x13, #136]",
             "stp x16, x17, [x13, #152]",
             "stp x18, x30, [x13, #168]",
-            "mov x19, sp",
-            "str x19, [x13, #184]",
-            "mov x19, x29",
-            "str x19, [x13, #192]",
-            "mrs x19, SPSR_EL1",
-            "str x19, [x13, #0]",
-            "mrs x19, ESR_EL1",
-            "str x19, [x13, #16]",
-            "mrs x19, ELR_EL1",
-            "str x19, [x13, #8]",
-            inout("x13") regs => _
+            "mov x9, sp",
+            "str x9, [x13, #184]",
+            "mov x9, x29",
+            "str x9, [x13, #192]",
+            "mrs x9, SPSR_EL1",
+            "str x9, [x13, #0]",
+            "mrs x9, ESR_EL1",
+            "str x9, [x13, #16]",
+            "mrs x9, ELR_EL1",
+            "str x9, [x13, #8]",
+            inout("x13") regs => _,
+            out("x9") _,
         );
     }
     for i in 0..25 {
         puts("\n gR");
-        put_u32_hex(unsafe { core::ptr::read_volatile(regs.add(i)) } as u32);
+        put_u64_hex(unsafe { core::ptr::read_volatile(regs.add(i)) });
     }
     puts("\n");
 }
@@ -903,11 +916,23 @@ fn panic(info: &PanicInfo) -> ! {
         Some(s) => puts(s),
         None => puts("(formatted msg)"),
     }
+    // Raw PanicInfo words: [0]=&Arguments, [8]=&Location.  The Arguments
+    // struct's pieces/data pointers are absolute (base-0) addresses from the
+    // link, so never dereference them; print the raw words instead.
+    let p = info as *const PanicInfo as *const u64;
+    for i in 0..4 {
+        puts(" I");
+        put_u32(i);
+        puts("x");
+        put_u64_hex(unsafe { *p.add(i as usize) });
+    }
     if let Some(loc) = info.location() {
-        puts(" ");
-        puts(loc.file());
-        puts(":");
+        puts(" Lfile=");
+        put_u64_hex(loc.file().as_ptr() as usize as u64);
+        puts(" Lline=");
         put_u32(loc.line() as u32);
+        puts(" Lcol=");
+        put_u32(loc.column() as u32);
     }
     puts(" CUR=");
     unsafe { put_u32(CUR as u32) };

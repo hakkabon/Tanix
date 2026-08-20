@@ -21,6 +21,57 @@ const ELFDATA2LSB: u8 = 1; // little-endian
 const EM_AARCH64: u16 = 183;
 const PT_LOAD: u32 = 1;
 
+// ── ELF64 section-header constants (needed to find relocation tables) ────────
+
+const SHT_PROGBITS: u32 = 1;
+const SHT_SYMTAB: u32 = 2;
+const SHT_STRTAB: u32 = 3;
+const SHT_RELA: u32 = 4;
+const SHT_NOBITS: u32 = 8;
+
+const SHF_ALLOC: u64 = 0x2;
+
+/// R_AARCH64_ABS64: the 8-byte word holds an absolute link-time address;
+/// the loader must add the load-base delta (this image links at VMA 0).
+const R_AARCH64_ABS64: u32 = 257;
+/// R_AARCH64_RELATIVE: the word holds S + A; add the load-base delta.
+const R_AARCH64_RELATIVE: u32 = 1027;
+
+/// ELF64 section header.
+#[repr(C, packed)]
+struct Elf64Shdr {
+    sh_name: u32,
+    sh_type: u32,
+    sh_flags: u64,
+    sh_addr: u64,
+    sh_offset: u64,
+    sh_size: u64,
+    sh_link: u32,
+    sh_info: u32,
+    sh_addralign: u64,
+    sh_entsize: u64,
+}
+
+/// ELF64 symbol table entry.
+#[repr(C, packed)]
+struct Elf64Sym {
+    st_name: u32,
+    st_info: u8,
+    st_other: u8,
+    st_shndx: u16,
+    st_value: u64,
+    st_size: u64,
+}
+
+/// ELF64 rela relocation entry (addend is explicit; the linked word already
+/// contains the resolved S+A for ABS64, so only the base delta is applied).
+#[repr(C, packed)]
+struct Elf64Rela {
+    r_offset: u64,
+    r_info: u64,
+    r_addend: i64,
+}
+
 /// ELF64 header (52 bytes of interest, AArch64 LE).
 #[repr(C, packed)]
 struct Elf64Hdr {
@@ -30,12 +81,15 @@ struct Elf64Hdr {
     e_version: u32,
     e_entry: u64,
     e_phoff: u64,
-    _e_shoff: u64,
+    e_shoff: u64,
     _e_flags: u32,
     _e_ehsize: u16,
     e_phentsize: u16,
     e_phnum: u16,
-    _rest: [u8; 14],
+    e_shentsize: u16,
+    e_shnum: u16,
+    e_shstrndx: u16,
+    _rest: [u8; 12],
 }
 
 /// ELF64 program header.
@@ -226,5 +280,95 @@ fn load_elf64(
         );
     }
 
+    // The image links at VMA 0 and the code is position-independent
+    // (adrp/ldr), so it runs correctly at any load base — but absolute
+    // pointers embedded in .data/.rodata (e.g. core's panic-message format
+    // pieces and Location file pointers) were resolved by the linker to
+    // *link-time* addresses.  Apply the load-base delta to those words now,
+    // mirroring how a dynamic loader processes R_AARCH64_ABS64/RELATIVE.
+    apply_relocations(image, ram_base, footprint);
+
     Ok((entry, footprint))
+}
+
+/// Apply base-0 relocations: for every relocation record targeting an
+/// allocated non-text section, add `ram_base` to the referenced 8-byte word.
+/// The word already holds the resolved link-time value (S + A for ABS64), so
+/// only the `ram_base` delta is needed.
+fn apply_relocations(image: &[u8], ram_base: PhysAddr, footprint: usize) {
+    let hdr = unsafe { &*(image.as_ptr() as *const Elf64Hdr) };
+
+    let shoff = { hdr.e_shoff } as usize;
+    let shentsize = { hdr.e_shentsize } as usize;
+    let shnum = { hdr.e_shnum } as usize;
+    let shstrndx = { hdr.e_shstrndx } as usize;
+
+    if shoff == 0 || shstrndx == 0 || shnum == 0 || shentsize < 64 {
+        return; // no section headers (stripped) → nothing to relocate
+    }
+
+    let shstr_off = {
+        let s = shoff + shstrndx * shentsize;
+        if s + 64 > image.len() {
+            return;
+        }
+        let shdr = unsafe { &*(image[s..].as_ptr() as *const Elf64Shdr) };
+        let off = shdr.sh_offset;
+        off as usize
+    };
+    if shstr_off >= image.len() {
+        return;
+    }
+
+    let mut applied = 0;
+    for i in 0..shnum {
+        let s = shoff + i * shentsize;
+        if s + 64 > image.len() {
+            continue;
+        }
+let shdr = unsafe { &*(image[s..].as_ptr() as *const Elf64Shdr) };
+        // Skip relocation sections whose target is not an allocated,
+        // writable/read-only DATA section (text relocations are already
+        // resolved and position-independent; debug relocations are not in
+        // the loaded image).
+        let info_idx = { shdr.sh_info } as usize;
+        if info_idx >= shnum {
+            continue;
+        }
+        let info = info_idx * shentsize;
+        let target = unsafe { &*(image[shoff + info..].as_ptr() as *const Elf64Shdr) };
+        if ({ target.sh_flags } & SHF_ALLOC) == 0
+            || { target.sh_addr } == 0
+            || { target.sh_addr } >= footprint as u64
+        {
+            continue;
+        }
+
+        let rel_off = { shdr.sh_offset } as usize;
+        let rel_size = { shdr.sh_size } as usize;
+        let entsize = { shdr.sh_entsize } as usize;
+        if entsize == 0 || rel_off + rel_size > image.len() {
+            continue;
+        }
+
+        let count = rel_size / entsize;
+        for k in 0..count {
+            let r = unsafe { &*(image[rel_off + k * entsize..].as_ptr() as *const Elf64Rela) };
+            let r_type = ({ r.r_info } & 0xffff_ffff) as u32;
+            if r_type != R_AARCH64_ABS64 && r_type != R_AARCH64_RELATIVE {
+                continue;
+            }
+            // r_offset is a guest VMA (link-time address in the image);
+            // the word lives at ram_base + r_offset already (segments were
+            // copied there) and holds the resolved link-time value.
+            let dst = (ram_base + { r.r_offset } as usize) as *mut u64;
+            let val = unsafe { core::ptr::read_volatile(dst) };
+            let corrected = val.wrapping_add(ram_base as u64);
+            unsafe { core::ptr::write_volatile(dst, corrected) };
+            applied += 1;
+        }
+    }
+    if applied > 0 {
+        log::debug!("loader: applied {} base-0 relocations", applied);
+    }
 }
