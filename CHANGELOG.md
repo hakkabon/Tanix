@@ -6,6 +6,28 @@ commit(s) that landed it. It is a retrospective reconstruction from
 `git log`, written as part of Phase 22; entries before that point were
 not tracked contemporaneously, so dates/groupings are best-effort.
 
+## [Unreleased] — Phase 23: hardware spike (Dragon Q6A)
+
+- Added `docs/PHASE23_CHECKLIST.md`: a concrete week-one plan for
+  determining whether Tanix can boot on Dragon Q6A bare-metal via UEFI,
+  as a Gunyah guest, or neither — before committing engineering time to
+  either story.
+- Desk research folded into the checklist (not yet hardware-verified):
+  Dragon Q6A's boot chain is `PBL → XBL → TZ/HYP → UEFI/EDK2`, a
+  first-hand community boot log shows stock firmware already runs Linux
+  as a Gunyah EL1 App by default (`Gunyah based bootup`), the ESP uses a
+  standard systemd-boot layout that plausibly permits adding a Tanix
+  entry without touching the vendor OS, and the console is Qualcomm's
+  own `ttyMSM0` UART rather than the `sbsa-ref` PL011.
+- Recorded three standing architecture decisions in `README.md`'s
+  known-limitations section: modern VirtIO 1.0 is now the default for
+  new device work (legacy virtio-gpu/tablet is a migration candidate,
+  not a peer style to keep indefinitely); EL2 stage-2 translation is a
+  hard prerequisite for a real `GunyahBackend`, not optional hardening;
+  and the real-hardware display stack is designed up front around the
+  target boards' actual Adreno GPU / MDSS display controller rather than
+  virtio-gpu, which doesn't exist on that silicon.
+
 ## [Unreleased] — Phase 22: CI harness, docs, syscall coverage
 
 - Added `.github/workflows/ci.yml`: lint (clippy, whole workspace) +

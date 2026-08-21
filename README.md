@@ -71,6 +71,32 @@ doorbells, message queues) but implemented as a cooperative/preemptive
 in-kernel scheduler rather than a second exception level — see
 [Hypervisor backend](#hypervisor-backend--co-tenant-scheduler) below.
 
+### Real-hardware roadmap (Phase 23 onward)
+
+The QEMU-based PoC is done; the next stretch targets real Qualcomm
+Dragonwing silicon, in priority order **Radxa Dragon Q6A** first, then
+**RUBIK Pi 3** (both QCS6490). Two open questions decide the shape of
+this whole stretch and are deliberately front-loaded as spikes rather
+than assumed:
+
+| Phase | Goal | Status |
+|-------|------|--------|
+| 23 | Hardware spike: does Tanix boot at all, bare-metal or as a Gunyah guest, on Dragon Q6A? | 🚧 in progress — see [checklist](docs/PHASE23_CHECKLIST.md) |
+| 24 | Bring-up hardening: real MMU/GIC/timer/UART/PSCI against Dragon Q6A silicon | ⏳ |
+| 25 | Restore the demo stack on hardware; real eMMC/UFS + NIC drivers (largest phase in the plan) | ⏳ |
+| 26 | CAN-FD, most likely via an MCU companion (Arduino UNO Q's STM32) rather than a native driver | ⏳ |
+| 27 | Real `GunyahBackend` (requires EL2 stage-2 first) or a Linux/KVM co-tenancy fallback | ⏳ |
+| 28 | Real Zephyr guest + Tanix HMI/compositor on the real Adreno GPU, wired to CAN-FD data | ⏳ |
+| 29 | Real TrustZone/QSEE coexistence spike for the Phase 16/17 secure-services story | ⏳ |
+
+Phase 23's finding (bare-metal-only vs. Gunyah-reachable) determines
+Phase 27; a locked-down Gunyah boot chain routes the project to the
+KVM fallback instead of a real `GunyahBackend`. Phase 27 additionally
+requires EL2 stage-2 translation as a hard prerequisite, not an
+optional hardening step — Gunyah's isolation model depends on it, so
+"no stage-2" (today's state, see [Known limitations](#known-limitations))
+blocks Phase 27 outright rather than merely weakening it.
+
 ---
 
 ## Repository layout
@@ -322,11 +348,16 @@ view instead of the roadmap table above.
   every `just qemu-phaseN` recipe (phases 5, 7, 8, 9's display/UI path
   has no CI coverage yet — QEMU's virtio-gpu/tablet path is harder to
   assert on than a serial-console marker).
-- **The hypervisor backend has no hardware isolation.** Tenants
+- **The hypervisor backend has no hardware isolation — and this is a
+  hard blocker for real Gunyah, not a nice-to-have.** Tenants
   (`zephyr-stub`, `rtos-guest`) share the kernel's own EL1 address space
-  and page tables; there is no EL2 stage-2 translation. A "real Gunyah"
-  or "real EL2 world" story is future work, documented as a platform
-  constraint in `vm/sched.rs`.
+  and page tables; there is no EL2 stage-2 translation. Gunyah's whole
+  security model is built on stage-2 as the isolation boundary between
+  VMs, so a `GunyahBackend` implementation of the `Hypervisor` trait
+  (Phase 27) is not meaningful without it — stage-2 page tables and a
+  genuine EL2 world are prerequisite work, not optional hardening to
+  layer on afterward. Tracked as a required precursor in the
+  [roadmap](#roadmap), not deferred future work.
 - **`rtos-guest` (Phase 21) is freshly stabilized.** The most recent
   commit fixed a guest panic-in-panic-handler crash; the co-tenant
   scheduler has not had extensive soak time.
@@ -338,14 +369,26 @@ view instead of the roadmap table above.
   milestones (phases 5, 7, 8, 9); SMP (Phase 11) is exercised on the
   socket-stack and later builds but the two aren't currently combined
   in one demo image.
-- **VirtIO transports mix legacy and modern.** The Phase 3 kernel↔guest
-  channel and early virtio-mmio devices (gpu/tablet/keyboard) are
-  legacy (pre-1.0), single-queue; Phase 10+ (`net`, `fs`) moved to
-  modern VirtIO 1.0 over PCI. Both styles coexist depending on which
-  server you're looking at.
+- **VirtIO transports mix legacy and modern — modern is now the
+  standing decision.** The Phase 3 kernel↔guest channel and the Phase
+  5 virtio-gpu/virtio-tablet devices are legacy (pre-1.0), single-queue;
+  Phase 10+ (`net`, `fs`) already moved to modern VirtIO 1.0 over PCI.
+  Going forward, new device work standardizes on modern VirtIO 1.0 —
+  the legacy display/tablet path is a migration candidate (folded into
+  the real-GPU work below rather than kept as legacy virtio-gpu, since
+  target hardware has no virtio-gpu device at all).
 - **MSI-X/ITS and NVMe were dropped from scope.** The Phase 18 UEFI/ACPI
   work landed via MADT/SPCR/MCFG discovery; storage stayed on
   virtio-blk with a FAT16 server rather than moving to NVMe.
+- **The display stack is designed against an emulated GPU and needs to
+  change for real hardware.** `servers/display` speaks virtio-gpu,
+  which doesn't exist on QCS6490 silicon — Dragon Q6A / RUBIK Pi 3 both
+  carry a real Adreno 6xx GPU behind Qualcomm's MDSS/DPU display
+  controller. Real-hardware bring-up (Phase 25/28) is designed
+  up front around a native display-controller driver (or, on the
+  KVM-fallback path, DRM/KMS through the kernel), not an emulation
+  shim — see [Phase 23](docs/PHASE23_CHECKLIST.md) for the first step
+  of scoping that.
 
 ## License
 
