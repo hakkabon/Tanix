@@ -188,6 +188,20 @@ check:
 clean:
     cargo clean
 
+# Regenerate the syscall-coverage caller list (Phase 22, docs/SYSCALLS.md)
+syscall-coverage:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for fn in send receive spawn who exit_task exit alloc_frames free_frames \
+        log wait_irq yield_cpu share_frames unshare_frames sleep exec \
+        map_device irq_pending cache_sync sec_storage_put sec_storage_get \
+        keybox_gen keybox_seal keybox_unseal attest map_demand map_cow map_cap; do
+      callers=$(grep -rl "sys::${fn}(" servers --include=*.rs \
+          | grep -v libtanix-sys/src/sys.rs \
+          | sed -E 's#servers/([^/]+)/.*#\1#' | sort -u | tr '\n' ',')
+      echo "${fn}: ${callers%,}"
+    done
+
 # Build the Phase-11 socket layer (libtanix-net + net server)
 servers-phase11: servers-phase10
     cargo build --package tanix-libnet --package tanix-net --target {{TARGET}}

@@ -1,0 +1,156 @@
+name: CI
+
+# Phase 22 — QEMU CI harness: build + lint the workspace, then boot the
+# two machine targets (virt, sbsa-ref) under QEMU and assert on serial
+# console markers that each milestone actually ran, not just that it
+# compiled. Mirrors the recipes in `justfile` / `scripts/*.sh` so a
+# green run here means `just qemu-phase11` / `just qemu-sbsa-rtos` /
+# `just net-test` will behave the same locally.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Lint & typecheck (fast fail before any QEMU jobs run) ──────────────────
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-07-01
+          targets: aarch64-unknown-none
+          components: clippy
+      - uses: extractions/setup-just@v2
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check (kernel)
+        run: just check
+      - name: clippy (whole workspace, warnings as errors)
+        run: just lint-all
+
+  # ── virt: build every phase-11 server set + kernel, boot, assert ───────────
+  virt-phase11-boot:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-07-01
+          targets: aarch64-unknown-none
+      - uses: extractions/setup-just@v2
+      - uses: Swatinem/rust-cache@v2
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-arm netcat-openbsd
+      - name: Build kernel-phase11 (SMP-capable socket stack)
+        run: just kernel-phase11
+      - name: Boot-test — Minix-style server set + socket stack came up
+        run: |
+          chmod +x scripts/boot-test.sh
+          scripts/boot-test.sh --machine virt \
+            --kernel target/aarch64-unknown-none/debug/tanix-kernel \
+            --timeout 90 \
+            --expect "phase 4: Minix-style server demo complete" \
+            --expect "net: gateway resolved"
+
+  # ── virt: SMP secondary bring-up (PSCI CPU_ON x3) ───────────────────────────
+  virt-smp-boot:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-07-01
+          targets: aarch64-unknown-none
+      - uses: extractions/setup-just@v2
+      - uses: Swatinem/rust-cache@v2
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-arm
+      - name: Build kernel-phase11
+        run: just kernel-phase11
+      - name: Boot-test — 3 secondary CPUs come online (-smp 4)
+        run: |
+          chmod +x scripts/boot-test.sh
+          scripts/boot-test.sh --machine virt \
+            --kernel target/aarch64-unknown-none/debug/tanix-kernel \
+            --smp 4 --timeout 90 \
+            --expect "smp: PSCI CPU_ON(cpu 1)" \
+            --expect "smp: PSCI CPU_ON(cpu 2)" \
+            --expect "smp: PSCI CPU_ON(cpu 3)"
+
+  # ── virt: full network regression (existing scripted e2e) ──────────────────
+  virt-net-e2e:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-07-01
+          targets: aarch64-unknown-none
+      - uses: extractions/setup-just@v2
+      - uses: Swatinem/rust-cache@v2
+      - name: Install QEMU + netcat
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-arm netcat-openbsd
+      - name: Build kernel-phase11
+        run: just kernel-phase11
+      - name: Run net-test.sh (UDP in/out, TCP echo, TCP out)
+        run: just net-test
+
+  # ── sbsa-ref: EL3 monitor / TrustZone + all machine-agnostic servers ───────
+  sbsa-boot:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-07-01
+          targets: aarch64-unknown-none
+      - uses: extractions/setup-just@v2
+      - uses: Swatinem/rust-cache@v2
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-arm
+      - name: Build kernel-sbsa
+        run: just kernel-sbsa
+      - name: Boot-test — EL3 monitor + secure world + fs server
+        run: |
+          chmod +x scripts/boot-test.sh
+          scripts/boot-test.sh --machine sbsa-ref \
+            --kernel target-sbsa/aarch64-unknown-none/debug/tanix-kernel \
+            --sec-log target-sbsa/sec.log --timeout 120 \
+            --expect "phase 16: secure world ran and counted" \
+            --expect "phase 20: filesystem server spawned" \
+            --expect-sec "armed — secure world alive"
+
+  # ── sbsa-ref: Phase 21 co-tenant RTOS guest (current head-of-line demo) ────
+  sbsa-rtos-boot:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-07-01
+          targets: aarch64-unknown-none
+      - uses: extractions/setup-just@v2
+      - uses: Swatinem/rust-cache@v2
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-arm
+      - name: Build kernel-sbsa-rtos
+        run: just kernel-sbsa-rtos
+      - name: Boot-test — co-tenant RTOS guest completes its demo
+        run: |
+          chmod +x scripts/boot-test.sh
+          scripts/boot-test.sh --machine sbsa-ref \
+            --kernel target-sbsa/aarch64-unknown-none/debug/tanix-kernel \
+            --timeout 150 \
+            --expect "phase 21: co-tenant RTOS demo complete"
