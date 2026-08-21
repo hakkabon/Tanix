@@ -369,6 +369,6 @@ let shdr = unsafe { &*(image[s..].as_ptr() as *const Elf64Shdr) };
         }
     }
     if applied > 0 {
-        log::debug!("loader: applied {} base-0 relocations", applied);
+        log::info!("loader: applied {} base-0 relocations", applied);
     }
 }

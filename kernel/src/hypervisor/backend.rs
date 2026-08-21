@@ -253,8 +253,16 @@ impl Hypervisor for BareMetalBackend {
             // Phase 21: guests run with IRQ *enabled* so the tick can
             // preempt them (co-tenancy time-slicing).  `context_switch`
             // stores a constant masked SPSR every time the guest context
-            // is saved, so re-prime it on every entry.
-            vm_rec.guest_ctx.spsr = SPSR_GUEST;
+            // is saved, so re-prime it on every entry — EXCEPT when the
+            // context resumes through `restore_preempted_guest`: that stub
+            // rebuilds the vCPU from the captured frame and must run
+            // interrupt-masked until its final `eret` (a tick mid-stub
+            // would capture a half-restored file — x9/x10 still holding
+            // the ELR/SPSR values — as the new vCPU state).  The stub
+            // reinstates the guest's own PSTATE from the frame itself.
+            if vm_rec.guest_ctx.lr != restore_preempted_guest as *const () as u64 {
+                vm_rec.guest_ctx.spsr = SPSR_GUEST;
+            }
             // Fresh time slice for the upcoming run.
             vm_rec.budget_ticks = unsafe { QUANTUM_TICKS };
         }
@@ -565,7 +573,12 @@ unsafe fn enter_guest(
     boot: [u64; 2],
     uart: u64,
 ) {
-    guest_ctx.spsr = SPSR_GUEST;
+    // Prime the guest PSTATE for a direct entry (see `vcpu_run`: a
+    // stub-resumed context keeps its masked SPSR_KERNEL so
+    // `restore_preempted_guest` runs with IRQs masked).
+    if guest_ctx.lr != restore_preempted_guest as *const () as u64 {
+        guest_ctx.spsr = SPSR_GUEST;
+    }
     core::arch::asm!(
         "mov x4, {s}",
         "mov x5, {y}",

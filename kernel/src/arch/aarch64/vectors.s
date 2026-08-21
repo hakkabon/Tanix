@@ -296,13 +296,19 @@ lower_sync_full:
 .global restore_preempted_guest
 .type restore_preempted_guest, %function
 restore_preempted_guest:
+    // ELR/SPSR first, into scratch regs — reloading them LAST would
+    // clobber the just-restored x9/x10 (they would eret back into the
+    // guest holding the ELR/SPSR values instead of the guest's own).
+    ldp  x9,  x10, [sp, #160]
+    msr  ELR_EL1,  x9
+    msr  SPSR_EL1, x10
     ldp  x0,  x1,  [sp,   #0]
     ldp  x2,  x3,  [sp,  #16]
     ldp  x4,  x5,  [sp,  #32]
     ldp  x6,  x7,  [sp,  #48]
-    ldp  x8,  x9,  [sp,  #64]
-    ldp  x10, x11, [sp,  #80]
-    ldp  x12, x13, [sp,  #96]
+    ldp  x8,  x9,  [sp, #64]
+    ldp  x10, x11, [sp, #80]
+    ldp  x12, x13, [sp, #96]
     ldp  x14, x15, [sp, #112]
     ldp  x16, x17, [sp, #128]
     ldp  x18, x30, [sp, #144]
@@ -312,9 +318,6 @@ restore_preempted_guest:
     ldp  x25, x26, [sp, #224]
     ldp  x27, x28, [sp, #240]
     ldr  x29,      [sp, #256]
-    ldp  x9,  x10, [sp, #160]
-    msr  ELR_EL1,  x9
-    msr  SPSR_EL1, x10
     add  sp, sp, #272
     eret
 
