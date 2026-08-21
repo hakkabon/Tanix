@@ -1,348 +1,223 @@
 # Tanix
 
 A Rust microkernel for AArch64 — a research PoC inspired by the Minix
-philosophy (a tiny kernel, most OS services in unprivileged processes) with
-an eye on automotive/embedded hypervisor use cases (Qualcomm Gunyah, Zephyr
-guest RTOS, display-oriented UI).
+philosophy (a tiny trusted core, most OS services in unprivileged
+processes) with an eye on automotive/embedded hypervisor use cases
+(Gunyah-style VM management, a Zephyr-like RTOS co-tenant, TrustZone
+secure services, and a display/UI stack).
 
-Current state: **Phase 5 complete** — the kernel boots on QEMU's `virt`
-machine, drops from EL2 to EL1, turns on the MMU, runs a full VirtIO
-message ping-pong with a guest "Zephyr-stub" VM, boots a set of
-Minix-style server processes (init, pm, mem, dev, worker) that talk to
-each other over synchronous kernel IPC, and drives a display stack
-end-to-end: a `display` server drives virtio-gpu (framebuffer) and
-virtio-tablet (pointer) over the QEMU virtio-mmio transport, and a
-`ui-demo` app draws a button + paint-canvas UI that reacts to real mouse
-input injected through QEMU's QMP monitor.
+**Current state: Phase 21 complete** (~23.6K lines of Rust across the
+kernel and 25 workspace crates). The kernel boots on two QEMU machines —
+`virt` (EL2→EL1 drop, PSCI from QEMU's fake EL3 firmware) and `sbsa-ref`
+(true EL3 reset, with Tanix's own EL3 monitor supplying PSCI and
+TrustZone secure services) — brings up SMP, a preemptive priority
+scheduler, demand paging/COW, a capability-gated MMIO path for
+userspace drivers, a socket layer (TCP/UDP over virtio-net), a FAT16
+filesystem server over virtio-blk, a composited display/window-manager
+stack, a shell over a ramdisk, and a co-tenant VM scheduler running a
+Zephyr-style RTOS guest alongside the native servers. Phase 22 (CI
+harness, docs, syscall-coverage pass) is the next open item — see
+[Known limitations](#known-limitations).
 
 ---
 
-## Phase roadmap
+## Roadmap
+
+The original 5-phase sketch (bootstrap → Gunyah port → VirtIO → Minix
+servers → display) was superseded early on by a longer, more granular
+plan once the project outgrew the PoC stage. Phases actually implemented
+in this repository:
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| 1 | AArch64 bare-metal bootstrap: UART, exception vectors, GICv3, timer | ✅ done |
-| 2 | Memory (frame allocator, MMU) + hypervisor backend abstraction | ✅ done |
-| 3 | VirtIO transport between kernel and guest VM (shmem + virtqueue) | ✅ done |
-| 4 | Minix-style server processes (init, pm, mem, dev, worker) | ✅ done |
-| 5 | Display/UI stack: virtio-gpu framebuffer + virtio-tablet pointer, driven by a Minix-style display server | ✅ done |
-| 6 | Hypervisor assist (Gunyah-style): message queues, doorbell-wakeup blocking, SGI delivery tracking | ✅ done |
-| 7 | Preemptive priority scheduler + device IRQs (timer tick, GIC PPIs/SPIs, `SYS_WAIT_IRQ` for virtio devices) | ✅ done |
+| 1 | AArch64 bare-metal bootstrap: UART, exception vectors, GICv3, timer | ✅ |
+| 2 | Memory (frame allocator, MMU) + hypervisor backend abstraction | ✅ |
+| 3 | VirtIO transport between kernel and a guest VM (shmem + virtqueue) | ✅ |
+| 4 | Minix-style server processes (init, pm, mem, dev, worker) over kernel IPC | ✅ |
+| 5 | Display/UI stack: virtio-gpu framebuffer + virtio-tablet pointer | ✅ |
+| 6 | Hypervisor-assist primitives (Gunyah-style message queues, doorbells) | ✅ |
+| 7 | Preemptive priority scheduler + device IRQs (`SYS_WAIT_IRQ`, GIC PPIs/SPIs) | ✅ |
+| 8 | EL0 servers with per-task address spaces; window/compositor service | ✅ |
+| 9 | RAMFS + shell + keyboard input; apps `exec`'d from embedded images | ✅ |
+| 10 | VirtIO 1.0 / PCI transport + virtio-net; IRQ-driven I/O stack | ✅ |
+| 11 | SMP (PSCI `CPU_ON`, per-CPU state, shared runqueue); TCP/UDP socket layer | ✅ |
+| 12–13 | Hypervisor-assist hardening; message-queue ping demo over the `Hypervisor` trait | ✅ |
+| 14 | Doorbell-wakeup message queues (decoupled send/resume, no polling) | ✅ |
+| 15 | Real hardware target groundwork: cache maintenance, barriers, EL3 monitor for TrustZone | ✅ |
+| 16 | `sbsa-ref` boot (EL3 reset → monitor → EL2 → EL1); TrustZone secure payload | ✅ |
+| 17 | Secure services over SMC (secure storage, keybox, attestation); server attestation | ✅ |
+| 18 | UEFI/ACPI boot path (RSDP → MADT/SPCR/MCFG); EFI handoff | ✅ |
+| 19 | Demand paging, copy-on-write, lazy stack growth; capability-gated MMIO for drivers | ✅ |
+| 20 | FAT16 filesystem server over virtio-blk; full TCP; multi-threading groundwork | ✅ |
+| 21 | Co-tenant vCPU scheduler running a Zephyr-style RTOS guest alongside native servers | ✅ (fresh — see below) |
+| 22 | QEMU CI harness (`virt` + `sbsa-ref`, SMP + net regression boots), docs pass, syscall coverage | ⏳ open |
+
+Phase 21 is functionally complete but young: the most recent commit
+(`a794802`) fixes a guest-panic-inside-panic-handler crash in
+`rtos-guest`, so treat the co-tenant scheduler as freshly stabilized
+rather than long-soaked. MSI-X/ITS and NVMe (mentioned in early phase-18
+notes) were not pursued — ACPI/UEFI landed via the MADT/SPCR/MCFG path
+instead, and storage stayed on virtio-blk.
+
+Two originally-separate tracks converged during the project: the
+Phase-2/3 idea of "port to Gunyah" became, in practice, a from-scratch
+`Hypervisor` trait (`kernel/src/hypervisor/`) modelled closely on
+Gunyah's API shape (VM create/start/resume, shared-memory registration,
+doorbells, message queues) but implemented as a cooperative/preemptive
+in-kernel scheduler rather than a second exception level — see
+[Hypervisor backend](#hypervisor-backend--co-tenant-scheduler) below.
 
 ---
 
 ## Repository layout
 
 ```
-kernel/                  the microkernel itself (no_std, freestanding binary)
-  src/main.rs            boot entry (_start asm stub), kmain, demo loops
-  src/arch/aarch64/      CPU-level code
-    uart.rs              PL011 driver + log backend
-    exception.rs         VBAR_EL1 install, irq/sync dispatchers (vectors.s)
-    vectors.s            exception vector table (16 slots, 128 B each)
-    gic.rs               GICv3 distributor + redistributor init
-    timer.rs             EL1 physical timer
-    mmu.rs               TCR/MAIR configuration (MMU itself enabled later)
-    boot.rs              CurrentEL / MPIDR helpers
+kernel/                    the microkernel itself (no_std, freestanding binary)
+  src/main.rs               boot entry (_start asm stub), kmain, per-phase demo wiring
+  src/arch/aarch64/
+    uart.rs                 PL011 driver + log backend
+    exception.rs             VBAR_EL1 install, sync/irq dispatch, user-fault triage
+    vectors.s                exception vector table
+    gic.rs                   GICv3 distributor + redistributor
+    timer.rs                 EL1 physical timer (1 kHz preemption tick)
+    mmu.rs                    TCR/MAIR configuration, page-table enable
+    boot.rs                   CurrentEL / MPIDR helpers
+    cache.rs                  cache maintenance + barriers (DMA ownership transfer)
+    psci.rs                   PSCI over SMC (CPU_ON secondary bring-up)
+    monitor.rs                Phase 16: EL3 monitor — TrustZone, secure services, PSCI
+    fdt.rs / acpi.rs / efi.rs Phase 18: device-tree and ACPI/UEFI machine discovery
+    machine.rs                Phase 16: `virt` vs `sbsa-ref` board abstraction
   src/mem/
-    frame.rs             bitmap frame allocator over the 256 MiB DDR (+ reserved zones)
-    page_table.rs        4-level page tables; pre-map + MMU enable
+    frame.rs                  bitmap frame allocator
+    page_table.rs             4-level page tables; identity map + MMU enable
+    vm_fault.rs                Phase 19: demand paging / COW / stack-growth fault resolver
   src/hypervisor/
-    mod.rs               backend selection (BareMetal vs Gunyah)
-    backend.rs           Hypervisor trait (vm_create/start/resume, shmem, doorbell)
-    doorbell.rs          SGI doorbell register/dispatch; ring-vs-delivery tracking
-    gunyah.rs            Gunyah backend: real `hvc #0` hypercall ABI (capabilities,
-                         msgq_create/send/recv, vcpu_run)
-    message_queue.rs     Gunyah-style message-queue object (primary VM side)
-    msgq_abi.rs          queue in-memory layout shared with the guest
-  src/virtio/            shared-memory transport
-    channel.rs           Print/Echo message format (opcodes, framing)
-    transport.rs         kernel-side virtqueue driver (send/poll)
+    mod.rs / backend.rs       `Hypervisor` trait: vm_create/start/resume, shmem, doorbell
+    doorbell.rs                SGI doorbell register/dispatch
+    message_queue.rs / msgq_abi.rs   Gunyah-style message-queue object + shared layout
+  src/virtio/                shared-memory VirtIO transport (kernel side)
   src/vm/
-    mod.rs               VmRuntime: cooperative vCPU pair (kernel ↔ guest)
-    loader.rs            ELF64 + raw-binary loader
-    shmem.rs             shared-memory allocator
-  src/ipc/               synchronous send/receive channels + syscall table
-  src/sched/             cooperative scheduler; register-frame context switch
-    task.rs              Task / Context (switch.s asm), spawn_server
-  src/server.rs          server registry: embed + spawn by name, region reservation
-  link.ld                kernel image layout (load at 0x4008_0000)
-  build.rs               linker args; emits embedded-binary paths
-servers/zephyr-stub/     the Phase-3 guest: a tiny Zephyr-like RTOS PoC
-  src/main.rs            cooperative device loop, VirtIO device side,
-                         Phase-14 doorbell-blocked message-queue consumer
-servers/libtanix-sys/    shared no_std crate: syscall table, Message/ABI (BootInfo)
-servers/init/            root server: spawns pm/mem/dev, drives the demo
-servers/pm/              process manager (spawn/exec via syscall)
-servers/mem/             memory service (grant/query)
-servers/dev/             device service (text I/O)
-servers/worker/          worker binary, exec'd by pm at runtime
-servers/display/         Phase-5 display server: virtio-mmio transport (virtio.rs),
-                         virtio-gpu driver (gpu.rs), virtio-tablet driver (input.rs)
-servers/libtanix-ui/     shared UI helpers for the demo apps
-servers/ui-demo/         Phase-5 demo app: button + paint canvas, pointer-reactive
-servers/link.ld          server link script (fixed LINK_BASE layout)
-scripts/qemu.sh          QEMU runner (debug/release, embed or fallback)
-scripts/gdb.sh           QEMU + GDB server attach
-justfile                 build/run/lint recipes
+    mod.rs                     VmRuntime: vCPU pair (kernel ↔ guest) context switch
+    sched.rs                   Phase 21: co-tenant vCPU scheduler (multi-VM round robin)
+    loader.rs                  ELF64 + raw-binary loader
+    shmem.rs                   shared-memory allocator
+  src/ipc/                    synchronous send/receive channels + the syscall table (27 calls)
+  src/sched/                  preemptive priority scheduler; register-frame context switch
+  src/smp.rs                  Phase 11: per-CPU state, secondary bring-up
+  src/irq.rs                  IRQ dispatch, pending bitmap, SYS_WAIT_IRQ wake path
+  src/server.rs               server registry: embed + spawn by name, region reservation
+  link.ld / link-sbsa.ld      kernel image layout for `virt` and `sbsa-ref`
+  build.rs                    linker args; emits embedded-binary paths (TANIX_LINK_SHIFT aware)
+
+servers/
+  libtanix-sys/               shared no_std crate: syscall table, Message/ABI, BootInfo
+  libtanix-drv/                shared userspace driver library: PCI, virtio-pci, vring, blk, net
+  libtanix-net/                TCP/UDP protocol stack (Phase 11/20)
+  libtanix-fs/                 FAT16 filesystem library (Phase 20)
+  libtanix-ui/                 shared UI helpers for display apps
+
+  init/ pm/ mem/ dev/ worker/  Phase 4 Minix-style core: process mgmt, memory grants, device I/O
+  display/                     Phase 5: virtio-gpu + virtio-tablet driver server
+  wm/                          Phase 8: window manager / compositor
+  ui-demo/ counter/ clock/     demo GUI apps (button+canvas, counter, clock) over the wm
+  hog/                         CPU-bound demo server exercising preemption
+  ramfs/ shell/                Phase 9: ramdisk-backed fs + interactive shell
+  net/                         Phase 10/11: virtio-net server, ARP/ICMP + TCP/UDP sockets
+  fs/                          Phase 20: FAT16-over-virtio-blk file server
+  sec/                         Phase 17: secure-storage/keybox/attestation demo (sbsa-ref only)
+  ping/ pong/                  minimal IPC ping-pong demo servers
+  zephyr-stub/                 Phase 3 guest: minimal VirtIO-speaking RTOS stub
+  rtos-guest/                  Phase 21 guest: Zephyr-modelled RTOS (k_thread/k_sem/k_msgq/k_timer)
+
+scripts/
+  qemu.sh / qemu-sbsa.sh       QEMU runners for `virt` / `sbsa-ref`
+  gdb.sh                       QEMU + GDB attach
+  keyboard-demo.sh / mouse-demo.sh / net-test.sh   scripted QMP-driven demos + assertions
+  mkfat16.py / elf2efi.py      FAT16 demo-volume builder / ELF→PE-COFF (EFI) converter
+
+justfile                    build/run/lint recipes, one per phase milestone
 ```
 
 ---
 
 ## Boot sequence
 
-1. QEMU starts the `-kernel` image at **EL2** (`virt` machine with
-   `virtualization=on` and no EL3 firmware). The kernel, however, is written
-   for EL1 — so `_start` is a tiny assembly stub (`main.rs`, `global_asm!`)
-   that:
-   - reads `CurrentEL`;
-   - from EL3: configures `SCR_EL3` (RW/HCE/NS) and erets to EL2;
-   - from EL2: configures `HCR_EL2.RW` (AArch64 at EL1), zeroes `SCTLR_EL2`,
-     and erets to EL1h (`SPSR_EL2` = 0x3C5);
-   - sets SP to `__stack_top` **before any stack use** — the compiler
-     prologue of the Rust entry would otherwise store through SP=0 and abort
-     on the very first instruction;
-   - branches to `kmain_entry` (zeroes BSS, calls `kmain`).
-2. `kmain` runs: UART + log → exception vectors → TCR/MAIR → GICv3 →
-   timer → frame allocator → **MMU enable** → hypervisor backend →
-   Phase-3 VirtIO demo → Phase-4 server demo → Phase-5 display stack.
+Two independent boot paths share almost all of the kernel above the
+entry stub:
 
-## Memory map (QEMU virt)
+**`virt`** (default): QEMU starts the `-kernel` image at EL2 (fake EL3
+firmware supplies PSCI). `_start` reads `CurrentEL`, configures
+`HCR_EL2.RW`, and erets to EL1h before any Rust code runs (SP must be
+set before the compiler prologue touches the stack). `kmain` then brings
+up UART → exception vectors → TCR/MAIR → GICv3 → timer → frame allocator
+→ MMU enable → hypervisor backend → the embedded demo for whichever
+`just qemu-phaseN` recipe built the image.
 
-| Region | Address | Notes |
-|--------|---------|-------|
-| DDR | `0x4000_0000 .. 0x5000_0000` | 256 MiB; kernel loaded at `0x4008_0000` |
-| Stack | just below `0x4008_0000` | 64 KiB window below the kernel image |
-| Server regions | `0x4070_0000 .. 0x4080_0000` | 512 KiB reserved for embedded servers |
-| Framebuffer | `0x407e_2000` | virtio-gpu scanout surface (1280×800×4) |
-| GICv3 distributor | `0x0800_0000` | |
-| GICv3 redistributors | `0x080A_0000` | per-CPU frames |
-| PL011 UART | `0x0900_0000` | |
-| virtio-mmio | `0x0A00_0000 .. 0x0C00_0000` | 32 slots × 0x200; gpu at slot 31, tablet at slot 30 |
-
-When the MMU is enabled (`mem::page_table::enable`), the **entire DDR** plus
-the GIC and UART windows are pre-mapped as 2 MiB block descriptors *before*
-the MMU bit is set. Every frame later handed out by the allocator (shared
-memory, guest RAM, page tables) is therefore already mapped — this avoids
-the classic "who maps the page-table pages?" chicken-and-egg problem.
+**`sbsa-ref`** (feature `sbsa-ref`, Phase 16+): CPUs reset at EL3
+because `sbsa-ref` has no working PSCI of its own. Tanix's own
+`monitor_el3_init` runs first: installs EL3 vectors, sets up the secure
+payload in secure RAM, and only then drops the primary CPU to EL1
+(secondaries park at EL3 until PSCI `CPU_ON` wakes them). From EL1
+onward the boot converges with the `virt` path. This machine can also be
+entered through UEFI (Phase 18): an EFI stub stashes the system-table
+pointer, and `acpi.rs`/`fdt.rs` read the real hardware topology (GIC,
+UART, PCIe ECAM) from firmware tables instead of compiled-in constants.
 
 ---
 
-## Hypervisor backend
+## Hypervisor backend & co-tenant scheduler
 
-`kernel/src/hypervisor/` defines a `Hypervisor` trait with `vm_create`,
-`vm_start`, `vm_resume`, `mem_share`-style shmem allocation, and doorbell
-primitives — a 1:1 sketch of the Qualcomm Gunyah API.
+`kernel/src/hypervisor/` defines a `Hypervisor` trait shaped after
+Gunyah's API (`vm_create`, `vm_start`, `vm_resume`, shared-memory
+registration, doorbells, message queues). The shipped backend is a
+**software vCPU scheduler**, not a second hardware exception level:
+guest and kernel are register-frame contexts that hand control to each
+other via context switches (`vm/mod.rs`), with no stage-2 translation or
+EL2 guest isolation. This was a deliberate scope cut from the original
+"port to real Gunyah" plan — the trait boundary is real, but a
+hardware-backed implementation (stage-2 page tables, a genuine EL2
+world) is future work.
 
-- `BareMetalBackend` (default): a cooperative "hypervisor" for the PoC —
-  guest and kernel are a single vCPU pair that hand control to each other
-  via register-frame context switches. No hardware virtualisation is needed.
-- `GunhyBackend`: probed via an SMCCC-style HVC at boot, **gated behind the
-  `gunyah` cargo feature** — on bare metal an HVC at EL1 is UNDEFINED and
-  would crash the boot, so it must only be enabled when actually running
-  under Gunyah.
-
-## VM manager: cooperative vCPU pair
-
-`kernel/src/vm/mod.rs` runs the guest without `eret`/HVC:
-
-- `create_vm` allocates guest RAM (1 MiB), zeroes it, loads the stub image,
-  and builds a `VmRuntime` holding two register contexts: the kernel's and
-  the guest's.
-- `start_vm` fills the guest context (`entry`, `sp = ram_top`) with boot
-  arguments in registers, then context-switches into the guest:
-  - `x4` — shared-memory (VirtQueue) physical base
-  - `x5` — the kernel's `vm_yield_entry` function address
-  - `x6` — the guest-context pointer
-- The guest processes virtqueue entries and hands control back with
-  `br x5` (`vm_yield_entry`), which saves the guest context and restores the
-  kernel context. `resume_vm` switches back into the guest context.
-
-The boot arguments are caller-saved registers, so the kernel re-establishes
-them on *every* entry — first launch and each resume — because the kernel's
-own execution between a yield and its resume clobbers them. The switch
-itself (`enter_guest`) is a single fused `asm!` block: it loads x4/x5/x6,
-prepares x0/x1, and `bl`s `context_switch`, so no compiler-generated
-instruction can sit between the register loads and the switch.
-
-Because the two contexts live on the same CPU, the exchange is fully
-synchronous and race-free: the guest cannot run while the kernel prepares
-the next message, and vice versa.
+Phase 21 extends the single kernel↔guest vCPU pair into an N-way
+**co-tenant scheduler** (`vm/sched.rs`): the kernel round-robins over a
+tenant table, and the EL1 tick preempts a tenant mid-guest (full frame
+capture) exactly like it preempts a native task, resuming it later where
+it stopped. The current guest is `rtos-guest`, a Zephyr-modelled RTOS
+with `k_thread`/`k_sem`/`k_msgq`/`k_sleep`/`k_timer` primitives and its
+own cooperative scheduler inside each time slice.
 
 ---
 
-## VirtIO transport (Phase 3)
+## Syscall surface
 
-Shared-memory layout (4 pages = 16 KiB, allocated by `vm::shmem`):
-
-| Offset | Size | Content |
-|--------|------|---------|
-| `0x000` | 48 B | `VirtqueueConfig` header (queue size, ring/buffer phys addrs, magic) |
-| `0x040` | 256 B | descriptor table (16 × 16 B) |
-| `0x140` | 32 B | avail ring (16 × 2 B) |
-| `0x1000` | 256 B | used ring (16 × 16 B) |
-| `0x1100` | 4 KiB | data buffers (16 × 256 B) |
-
-Protocol (`virtio/channel.rs`): the kernel is the *driver* side, the guest
-stub the *device* side.
-
-- **Print** (opcode `0x01`): kernel → guest, text payload in a data buffer.
-- **Echo** (opcode `0x02`): guest → kernel, reports the printed byte count.
-
-Demo flow in `kmain` (3 rounds): `send_print` (posts to avail ring,
-"doorbell" SGI for the future Gunyah path) → `resume_vm` (guest processes
-the entry, prints, writes an Echo into the used ring, yields) →
-`poll_replies` (kernel reads the used ring). Every round logs
-`phase 3: round N — Echo received`.
-
-The guest (`servers/zephyr-stub`) is a no_std freestanding binary built to
-the same `aarch64-unknown-none` target and **embedded into the kernel image**
-at compile time via `include_bytes!` (path emitted by `kernel/build.rs`).
-Without the `embed-zephyr-stub` feature, a tiny fallback stub is used that
-resets SP to the top of the guest RAM and loops `br x5` forever, yielding
-control back to the kernel on every resume — the demo then completes with
-warnings instead of hanging.
+27 syscalls, added incrementally per phase (`kernel/src/ipc/syscall.rs`):
+IPC (`SEND`/`RECEIVE`), process control (`SPAWN`/`EXEC`/`EXIT`/`WHO`),
+memory (`ALLOC_FRAMES`/`FREE_FRAMES`/`SHARE_FRAMES`/`UNSHARE_FRAMES`,
+Phase 19's `MAP_DEMAND`/`MAP_COW`/`MAP_CAP`), scheduling
+(`YIELD`/`SLEEP`/`WAIT_IRQ`/`IRQ_PENDING`), device access
+(`MAP_DEVICE`, `CACHE_SYNC`), and — `sbsa-ref` only — the Phase 17
+secure-service quintet (`SEC_STORAGE_PUT/GET`, `KEYBOX_GEN/SEAL/UNSEAL`,
+`ATTEST`), which round-trip through the EL3 monitor over SMC and return
+`-1` on `virt` where no monitor exists.
 
 ---
 
-## Minix-style servers (Phase 4)
+## Machine targets
 
-The kernel boots a set of independent server binaries — `init`, `pm`
-(process manager), `mem` (memory service), `dev` (device service), and
-`worker` — as cooperative scheduler tasks, each in its own private 128 KiB
-memory region with its own stack.
+| | `virt` (default) | `sbsa-ref` (`--features sbsa-ref`) |
+|---|---|---|
+| Boot | `-kernel`, EL2 start, fake-firmware PSCI | EL3 reset, Tanix's own EL3 monitor + PSCI |
+| RAM | 256 MiB @ `0x4000_0000` | window @ `0x100_0000_0000` (1 TiB) + 512 MiB secure-only @ `0x2000_0000` |
+| GIC | GICv3 @ `0x0800_0000` | GICv3 @ `0x4006_0000` / `0x4008_0000` |
+| Console | PL011 @ `0x0900_0000` | PL011 @ `0x6000_0000`, secure PL011 @ `0x6003_0000` |
+| PCIe ECAM | `0x3F00_0000` | `0xF000_0000` |
+| TrustZone | not modelled | EL3 monitor, secure payload, `sec` server demo |
+| Firmware | none (or EFI, Phase 18) | EFI/ACPI (Phase 18) or DT |
 
-- Servers are separate no_std crates under `servers/`, **embedded into the
-  kernel image** at compile time (`embed-servers` feature, paths emitted by
-  each crate's `build.rs`). They are plain statically-linked executables
-  linked at **fixed** physical bases (`SERVER_BASES` in `kernel/src/server.rs`,
-  clear of the kernel image and Phase-3 guest RAM).
-- At spawn, the kernel zeroes the region, loads the ELF, creates the task,
-  and hands it a `BootInfo` block (syscall table + own task id) preloaded
-  into its callee-saved `x19`.
-- Servers never link against the kernel: they communicate only through the
-  syscall table and through synchronous `send`/`receive` IPC
-  (`kernel/src/ipc/`, rendezvous-style, `MSG_MAX_BYTES = 64`).
-
-Demo flow in `kmain`: spawn `init` → enter the scheduler → `init` spawns
-`pm`/`mem`/`dev` and exercises each service over IPC (dev prints, mem grants
-memory, pm execs the `worker` binary), then the demo completes when every
-server has blocked or finished.
-
----
-
-## Display stack (Phase 5)
-
-The display stack is another pair of embedded servers, spawned after the
-Phase-4 set:
-
-```
-ui-demo ── M_DISPLAY_FILL_RECT/FLUSH/TICK ──▶ display server ──▶ virtio-gpu
-                                                 │               (framebuffer)
-                                                 └──▶ virtio-tablet
-                                                      (pointer events)
-```
-
-### virtio-mmio transport
-
-`servers/display/src/virtio.rs` is a small virtio **legacy** transport
-driver for the QEMU virtio-mmio device type: it probes the 32 slots at
-`0x0A00_0000` (`REG_MAGIC`/`REG_DEVICE_ID`), resets, negotiates features,
-configures a queue, writes `DRIVER_OK`, and then moves buffers through the
-descriptor/avail/used rings — including a `submit` path that chains a
-read-only descriptor sequence and a write-only response, and a
-`drain_used` path for event buffers. In the current QEMU layout the
-virtio-gpu sits at slot 31 (`0x0A00_3E00`, device id 16) and the
-virtio-tablet at slot 30 (`0x0A00_3C00`, device id 18).
-
-### virtio-gpu driver (`gpu.rs`)
-
-- Probes and initialises the control queue, then runs
-  `VIRTIO_GPU_CMD_GET_DISPLAY_INFO` / `RESOURCE_CREATE_2D` /
-  `RESOURCE_ATTACH_BACKING` to obtain a 1280×800 BGRA framebuffer.
-- QEMU 11 keeps resource images in host memory: the guest must send
-  `VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D` (0x105) before every
-  `VIRTIO_GPU_CMD_RESOURCE_FLUSH` (0x104), or the screen stays black —
-  `flush()` does transfer-then-flush.
-- The framebuffer pages are carved out of the server region
-  (`0x407e_2000`, see above); the frame allocator reserves all server
-  regions so the GPU's attached backing pages can never collide with a
-  live server image.
-
-### virtio-tablet driver (`input.rs`)
-
-- Device id 18, one event queue (index 0); the device only starts
-  reporting after `DRIVER_OK`. `open()` fills the ring with 64 independent
-  writable 32-byte event buffers (`add_empty_buffers`).
-- Events are 8-byte LE `{u16 type; u16 code; u32 value}` records, batched
-  and terminated with `EV_SYN`/`SYN_REPORT`: `EV_ABS ABS_X/ABS_Y` carry the
-  pointer (0..0x7FFF, mapped to pixels by the display server) and
-  `EV_KEY BTN_TOUCH`/`BTN_LEFT` the button state.
-- `poll()` drains the used ring (up to 8 records per tick), updates the
-  `Pointer {x, y, buttons}`, and re-arms the consumed buffers.
-
-### M_DISPLAY protocol (`servers/libtanix-sys/src/abi.rs`)
-
-The display server serves one request per `receive` wake-up (the
-scheduler is fully cooperative; the timer tick only disarms the timer
-event, so the service loop is receive-driven):
-
-| mtype | direction | payload |
-|-------|-----------|---------|
-| `M_DISPLAY_GET_MODE` | app → display | — |
-| `M_DISPLAY_MODE_REPLY` | display → app | `data[0,1]` = width, height |
-| `M_DISPLAY_FILL_RECT` | app → display | `data[0..3]` = x, y, w, h; `data[4..6]` = r, g, b |
-| `M_DISPLAY_FLUSH` | app → display | transfer + flush the framebuffer |
-| `M_DISPLAY_TICK` | app → display | poll tablet; reply = pointer |
-| `M_DISPLAY_TICK_REPLY` | display → app | `data[0,1,2]` = px, py, buttons |
-
-`ui-demo` is a pointer-reactive app: a top-right button toggles the
-background colour, pressing or dragging elsewhere paints amber dots, and a
-white ring cursor follows the tablet. It redraws only when the pointer
-moved or the button state changed, and its TICK request/response cadence
-doubles as the input polling loop.
-
----
-
-## Preemptive scheduler + device IRQs (Phase 7)
-
-Phase 7 replaces the cooperative scheduler with a preemptive,
-priority-based one, and turns the virtio-gpu path interrupt-driven:
-
-- **Priorities** — each server gets a fixed priority (lower number runs
-  first): display `32`, ui-demo `96`, the Phase-4 servers `128`, the `hog`
-  demo `192`, idle `255`.  Equal priorities rotate round-robin on ticks.
-- **Timer tick** — `timer.rs` arms the EL1 physical timer (GIC **PPI 26**
-  = CNTPNSIRQ on QEMU `virt`; the old PPI 30 was the EL2-only CNTHP and
-  never fired) for a periodic 1 ms tick.  `CNTKCTL_EL1 = 0b111` grants EL1
-  access to the CNTP_EL0 registers.
-- **Preemption** — every tick that lands on an EL0 task runs the scheduler
-  (`tick_preempt`); ticks inside the kernel (e.g. the `SYS_WAIT_IRQ` wait
-  loop) only count.  `IRQ_ENTRY` in `vectors.s` passes `from_el0` to
-  `irq_handler`, and a preempted task resumes through its saved IRQ frame
-  (the kernel stack the frame lives on is the task's own).
-- **Syscall-tail reschedule** — every syscall return re-evaluates the run
-  queue; a strictly higher-priority task woken by the syscall runs
-  immediately (equal-priority rotation stays on the tick, which avoids
-  ping-ponging between suspended syscall tails).
-- **`SYS_WAIT_IRQ`** — a server blocks until its device interrupt arrives.
-  The kernel enables the IRQ in the GIC lazily (Group 1NS — the kernel
-  runs non-secure EL1, so Group 0 interrupts would never be delivered),
-  records the delivery in a pending bitmap, and the waiter sleeps in `wfi`
-  with IRQs unmasked.  Level-triggered virtio-mmio lines can't lose
-  completions: an IRQ that beats the wait leaves the line high.
-- **virtio-gpu interrupt-driven** — `Device::irq()` computes the SPI
-  (`48 + slot`), and `submit()` blocks on `SYS_WAIT_IRQ` then deasserts
-  the line via INT_STATUS/INT_ACK before draining the used ring.
-- **`hog`** — a lowest-priority CPU-bound server (spin + periodic log +
-  `yield_cpu`).  Under the old cooperative scheduler a spinning task would
-  starve the system forever; now the tick keeps preempting and the log
-  shows `irq: tick #N` + `sched: preempt` lines while hog spins.
-
-```sh
-# Phase 7 demo: preemptive scheduler + IRQ-driven GPU (recommended)
-just qemu-phase7 -qmp unix:/tmp/qmp.sock,server=on,wait=off
-```
+The two targets build into **separate Cargo target directories**
+(`target/` vs `target-sbsa/`, via `CARGO_TARGET_DIR` +
+`TANIX_LINK_SHIFT`) so binaries linked at different base addresses never
+collide.
 
 ---
 
@@ -350,93 +225,87 @@ just qemu-phase7 -qmp unix:/tmp/qmp.sock,server=on,wait=off
 
 Prerequisites: Rust `nightly-2026-07-01` (pinned by `rust-toolchain.toml`),
 the `aarch64-unknown-none` target, QEMU (`brew install qemu` /
-`apt install qemu-system-arm`), and optionally `just`.
+`apt install qemu-system-arm`), and `just`.
 
 ```sh
-# Phase 7 demo: preemptive scheduler + IRQ-driven GPU (recommended) — pass
-# the QMP socket to inject mouse input and take screenshots
-just qemu-phase7 -qmp unix:/tmp/qmp.sock,server=on,wait=off
+# Latest virt-machine milestone: SMP + full socket stack (Phase 11)
+just qemu-phase11
 
-# Phase 5 demo: display stack + UI (recommended) — pass the QMP socket to
-# inject mouse input and take screenshots (see "Driving the UI" below)
-just qemu-phase5 -qmp unix:/tmp/qmp.sock,server=on,wait=off
+# sbsa-ref: EL3 monitor/TrustZone + all machine-agnostic servers (Phase 16/17)
+just qemu-sbsa
 
-# Phase 4 demo: VirtIO ping-pong + Minix-style server set
-just qemu-phase4
+# sbsa-ref + Phase 21 co-tenant RTOS guest (the current head-of-line demo)
+just qemu-sbsa-rtos
 
-# Phase 3 VirtIO demo only (real stub embedded)
-just qemu-phase3
+# Display/desktop milestones on virt
+just qemu-phase5     # display server + ui-demo (virtio-gpu + virtio-tablet)
+just qemu-phase7     # + preemptive scheduler, IRQ-driven GPU
+just qemu-phase8     # + window manager, multiple composited apps
+just qemu-phase9     # + ramfs + shell (virtio-keyboard)
 
-# Fallback demo (no embedded guest/servers — builds and boots anywhere)
+# Scripted demos with QMP-injected input + assertions
+just qemu-phase9-demo   # shell over injected keyboard events, screenshots
+just qemu-phase8-mouse  # cursor-follows-injected-path screenshot
+just net-test            # boots phase-11 kernel, drives UDP/TCP wire paths, asserts replies
+
+# Fallback (no embedded guest/servers — builds and boots anywhere)
 just qemu
 
-# or manually:
-cargo build --package tanix-zephyr-stub --target aarch64-unknown-none
-cargo build --package tanix-libsys --package tanix-libtanix-ui \
-    --package tanix-init --package tanix-pm --package tanix-mem \
-    --package tanix-dev --package tanix-worker --package tanix-display \
-    --package tanix-ui-demo --package tanix-hog --target aarch64-unknown-none
-cargo build --package tanix-kernel --target aarch64-unknown-none \
-    --features embed-zephyr-stub,embed-servers
-./scripts/qemu.sh -device virtio-gpu-device -device virtio-tablet-device
+# Quality
+just lint-all   # clippy, whole workspace, warnings as errors
+just check      # cargo check, kernel only
+just debug      # QEMU + GDB attach
 ```
 
-Important QEMU flags (already in `scripts/qemu.sh` / `gdb.sh`):
+Each `just qemu-phaseN` recipe builds the exact server set that
+milestone needs and embeds it in the kernel image (`embed-servers`
+feature) — see `justfile` for the full recipe graph, since later
+phases build on the server sets of earlier ones (e.g. `servers-phase11`
+depends on `servers-phase10` depends on `servers-phase9`...).
 
-- `virtualization=on` — boots the kernel at EL2; the kernel drops itself
-  to EL1 at entry (and this is where the Gunyah HVC path will live later).
-- `gic-version=3` — the kernel's GIC driver is GICv3 (distributor +
-  redistributor at `0x080A_0000`); without this the machine defaults to
-  GICv2 and the redistributor access aborts.
-- `-device virtio-gpu-device -device virtio-tablet-device` — the Phase-5
-  display devices, required by the display server (`just qemu-phase5`).
-- `-qmp unix:...` — QMP monitor for screenshots and input injection (the
-  display server runs with no input until you inject events this way).
+### `sbsa-ref` notes
 
-### Driving the UI from QMP
-
-The guest is `-nographic`, so mouse input is injected over QMP (any QMP
-client works, e.g. `socat - UNIX-CONNECT:/tmp/qmp.sock`). Tablet abs
-values are 0..0x7FFF; convert pixels with `x × 32767 / 1280` and
-`y × 32767 / 800` (e.g. screen centre (640, 400) → (16384, 16384)):
-
-```json
-{"execute":"qmp_capabilities"}
-{"execute":"input-send-event","arguments":{"events":[
-  {"type":"abs","data":{"axis":"x","value":16384}},
-  {"type":"abs","data":{"axis":"y","value":16384}}]}}
-{"execute":"input-send-event","arguments":{"events":[
-  {"type":"btn","data":{"button":"left","down":true}}]}}
-{"execute":"input-send-event","arguments":{"events":[
-  {"type":"btn","data":{"button":"left","down":false}}]}}
-{"execute":"screendump","arguments":{"filename":"/tmp/shot.ppm"}}
-```
-
-Notes: explicit `{"type":"sync"}` events are rejected by QEMU 11 —
-synchronisation is automatic; and screendump writes PPM despite any `.png`
-extension.
-
-Recipes: `just kernel` (fallback stub), `just kernel-embed` (real stub),
-`just kernel-phase4` (servers), `just kernel-phase5` (servers + display
-stack), `just qemu-release`, `just debug` (GDB), `just lint-all` (clippy
-with `-D warnings`).
+`qemu-sbsa` / `qemu-sbsa-rtos` boot through `scripts/qemu-sbsa.sh`,
+which wires a second `-serial` chardev to `target-sbsa/sec.log` for the
+secure-world console. Server binaries for this machine are built with
+`TANIX_LINK_SHIFT=0xFFC2000000` into `target-sbsa/` so they land inside
+the 1 TiB RAM window; `rtos-guest` is the one binary that does *not*
+need the shift (it's loaded into kernel-allocated guest RAM at runtime,
+like `zephyr-stub`).
 
 ---
 
 ## Known limitations
 
-- Single CPU, cooperative scheduling only; no SMP, no interrupts for the
-  guest (the SGI doorbell is registered but the demo communicates via the
-  yield pair). The display service loop is receive-driven: there is no
-  device interrupt for the tablet, so the pointer is sampled on the app's
-  TICK cadence.
-- Page tables pre-map the whole DDR RWX; permissions are not yet tightened
-  per server region (server RAM zones are reserved from the frame
-  allocator, but not yet marked read-only to other tasks).
-- The EL2 stage is a one-way drop for now; no hypervisor services exist yet
-  (`hvc` handling at EL1 is only exercised under the `gunyah` feature).
-- virtio is used in legacy (pre-1.0) mode, single queue per device;
-  multi-queue and modern (PCI) transports are not implemented.
+- **Phase 22 (CI, docs, syscall coverage) is open.** There is no
+  `.github/workflows` CI harness yet, no `CHANGELOG.md`, and no
+  automated regression suite beyond the scripted QMP demos
+  (`net-test.sh`, `keyboard-demo.sh`, `mouse-demo.sh`) — these assert
+  outcomes but aren't wired into any CI.
+- **The hypervisor backend has no hardware isolation.** Tenants
+  (`zephyr-stub`, `rtos-guest`) share the kernel's own EL1 address space
+  and page tables; there is no EL2 stage-2 translation. A "real Gunyah"
+  or "real EL2 world" story is future work, documented as a platform
+  constraint in `vm/sched.rs`.
+- **`rtos-guest` (Phase 21) is freshly stabilized.** The most recent
+  commit fixed a guest panic-in-panic-handler crash; the co-tenant
+  scheduler has not had extensive soak time.
+- **Error handling is inconsistent in places.** ~70 `.unwrap()` and ~36
+  `.expect()` calls remain across the kernel and servers, mostly in
+  boot-time paths where a failure is arguably fatal anyway, but this
+  hasn't been systematically audited.
+- **Single-core is still the default demo path** for the display/UI
+  milestones (phases 5, 7, 8, 9); SMP (Phase 11) is exercised on the
+  socket-stack and later builds but the two aren't currently combined
+  in one demo image.
+- **VirtIO transports mix legacy and modern.** The Phase 3 kernel↔guest
+  channel and early virtio-mmio devices (gpu/tablet/keyboard) are
+  legacy (pre-1.0), single-queue; Phase 10+ (`net`, `fs`) moved to
+  modern VirtIO 1.0 over PCI. Both styles coexist depending on which
+  server you're looking at.
+- **MSI-X/ITS and NVMe were dropped from scope.** The Phase 18 UEFI/ACPI
+  work landed via MADT/SPCR/MCFG discovery; storage stayed on
+  virtio-blk with a FAT16 server rather than moving to NVMe.
 
 ## License
 
