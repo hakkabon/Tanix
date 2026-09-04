@@ -12,8 +12,11 @@ fn main() {
 
     // Link with the kernel linker script (entry point, sections, stack).
     // Phase 16: the `sbsa-ref` machine links at its own DDR base.
+    // Phase 23: the `qcs6490` machine links at 0x80080000 (QCS6490 DRAM).
     let linker_script = if std::env::var_os("CARGO_FEATURE_SBSA_REF").is_some() {
         manifest_dir.join("link-sbsa.ld")
+    } else if std::env::var_os("CARGO_FEATURE_QCS6490").is_some() {
+        manifest_dir.join("link-qcs6490.ld")
     } else {
         manifest_dir.join("link.ld")
     };

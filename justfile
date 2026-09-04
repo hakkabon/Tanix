@@ -282,3 +282,42 @@ kernel-sbsa-rtos: servers-sbsa rtos-guest-sbsa
 # Boot the full Phase-21 demo on the sbsa-ref machine.
 qemu-sbsa-rtos: kernel-sbsa-rtos
     ./scripts/qemu-sbsa.sh
+
+# ── Phase 23: QCS6490 real-hardware target ────────────────────────────────────
+
+# Build the kernel for QCS6490 (Radxa Dragon Q6A / RUBIK Pi 3).
+# Feature flags: qcs6490 (enables gunyah probe + GENI UART + QCS6490 machine
+# table).  No embedded servers yet — Phase 23 is a bare-metal boot probe.
+# Produces: target/aarch64-unknown-none/debug/tanix-kernel
+kernel-qcs6490:
+    cargo build --package {{KERNEL_PKG}} --target {{TARGET}} \
+        --features qcs6490
+
+# Build a QCS6490 kernel EFI application image ready for the Dragon Q6A ESP.
+#   1. cargo build  → tanix-kernel ELF
+#   2. elf2efi.py   → tanix-qcs6490.efi  (PE/COFF AArch64 EFI application)
+#   3. elf2efi.py   → tanix-qcs6490-esp.img  (FAT16 ESP image for dd or CP)
+#
+# The .efi file is the one you copy to the board's SD card ESP as either:
+#   /EFI/BOOT/BOOTAA64.EFI  (fallback boot, replaces default)
+#   /EFI/tanix/tanix.efi    (entry pointed to by /loader/entries/tanix.conf)
+# See docs/PHASE23_BOOT.md for the full procedure.
+kernel-qcs6490-efi: kernel-qcs6490
+    python3 scripts/elf2efi.py \
+        target/aarch64-unknown-none/debug/tanix-kernel \
+        target/tanix-qcs6490.efi \
+        target/tanix-qcs6490-esp.img
+    @echo "EFI image: target/tanix-qcs6490.efi"
+    @echo "ESP image: target/tanix-qcs6490-esp.img"
+
+# Smoke-test the QCS6490 build in QEMU virt (no GENI UART on virt; this
+# only checks that the kernel compiles and reaches kmain without crashing —
+# UART output will be silent after the PL011 init because the QCS6490 table
+# points uart_base at the GENI SE address 0x00A9_0000 which doesn't exist on
+# virt).  Use for CI compile-check only; real bring-up requires the board.
+#
+# Tip: boot with -M virt and redirect serial to file, then check that
+# `phase 23: QCS6490 kernel alive` does NOT appear (expected — no GENI SE
+# on virt) but the kernel image did not panic (no exception vector entry).
+qemu-qcs6490-smoketest: kernel-qcs6490
+    ./scripts/qemu.sh

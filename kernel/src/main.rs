@@ -87,7 +87,13 @@ static RTOS_GUEST_BIN: &[u8] = &[
 
 use core::arch::global_asm;
 
-#[cfg(not(feature = "sbsa-ref"))]
+// ── _start: QEMU virt / any plain UEFI-booted EL2 or EL1 target ─────────────
+//
+// Used for `virt` (default, no feature flags) — QEMU hands a `-kernel`
+// image at EL2 with fake-firmware PSCI — and for any future UEFI-only
+// target that does NOT need a custom EL3 monitor (i.e. NOT sbsa-ref or
+// qcs6490, both of which have their own `_start` blocks below).
+#[cfg(not(any(feature = "sbsa-ref", feature = "qcs6490")))]
 global_asm!(
     r#"
     .section .text._start, "ax"
@@ -154,6 +160,89 @@ _start:
     adrp x0, __stack_top
     add  x0, x0, :lo12:__stack_top
     mov  sp, x0
+    b    kmain_entry
+    "#
+);
+
+// ── _start: QCS6490 (Dragon Q6A / RUBIK Pi 3) — UEFI-only entry ─────────────
+//
+// Stock Dragon Q6A firmware (Qualcomm EDK2 + Gunyah):
+//   PBL → XBL → TZ/HYP → UEFI/EDK2 → Tanix EFI application
+//
+// UEFI hands the EFI application control at either EL2 or EL1 (depending
+// on whether Gunyah's `enable-kvm` DTB flag is set; the default observed
+// on stock firmware is EL1 — the kernel runs as a Gunyah EL1 App).
+// In either case QSEE already owns EL3 and we must not attempt to drop
+// from EL3 here.  The EFI system table pointer arrives in x1 at EL2, or
+// x1 = 0 at EL1 with the system table already stashed from the EL2 leg.
+//
+// This `_start` is intentionally simpler than the sbsa-ref one:
+//   - No EL3 leg (QSEE is there; an SMC to a non-existent handler would
+//     fault fatally).
+//   - No in-memory UART debug print before Rust (the GENI SE driver handles
+//     that once `arch::aarch64::init()` runs).
+//   - EL2 → EL1 drop uses HCR_EL2.RW=1 + HCR_EL2.VM=0 (no stage-2
+//     enabled yet; stage-2 is Phase 24 work).
+#[cfg(feature = "qcs6490")]
+global_asm!(
+    r#"
+    .section .text._start, "ax"
+    .global _start
+_start:
+    // Phase 23: QCS6490 entry — no EL3 leg (QSEE owns EL3).
+    // UEFI may hand us EL2 (if enable-kvm is set in DTB) or EL1 directly
+    // (the Gunyah EL1-App default).  x1 = EFI system table at EL2;
+    // at EL1 x1 is unspecified — the EL2 leg stashed the table before eret.
+    mrs  x9, CurrentEL
+    and  x9, x9, #0xc
+    cmp  x9, #0x8
+    b.eq 2f
+    // Already at EL1 (Gunyah EL1 App or UEFI-at-EL1 entry) — fall through.
+    b    1f
+
+2:  // EL2 → EL1.
+    // Stash the EFI system table pointer (x1) before we clobber x1.
+    adrp x2, EFI_SYSTAB
+    add  x2, x2, :lo12:EFI_SYSTAB
+    str  x1, [x2]
+    // HCR_EL2: RW=1 (AArch64 at EL1), VM=0 (no stage-2 yet).
+    mov  x1, #1
+    lsl  x1, x1, #31
+    msr  HCR_EL2, x1
+    msr  SCTLR_EL2, xzr
+    isb
+    adr  x1, 1f
+    msr  ELR_EL2, x1
+    mov  x1, #0x3c5      // SPSR_EL2: EL1h, DAIF masked
+    msr  SPSR_EL2, x1
+    eret
+
+1:  // EL1h continuation (EL1-App entry or after EL2 eret).
+    // If UEFI entered at EL1 directly, x1 holds the EFI system table;
+    // stash it (safe to stash 0 if this is the post-EL2-eret path since
+    // the table was already stashed above).
+    adrp x2, EFI_SYSTAB
+    add  x2, x2, :lo12:EFI_SYSTAB
+    str  x1, [x2]
+    // If the firmware MMU is on, drop it so we run on physical addresses
+    // until our own MMU table is installed.
+    mrs  x9, SCTLR_EL1
+    tbz  x9, #0, 4f
+    msr  SCTLR_EL1, xzr
+    isb
+4:
+    // Allow SIMD/FP (CPACR_EL1.FPEN = 3).
+    mov  x1, #3
+    lsl  x1, x1, #20
+    msr  CPACR_EL1, x1
+    isb
+    // Set up the kernel stack and enter Rust.
+    adrp x0, __stack_top
+    add  x0, x0, :lo12:__stack_top
+    mov  sp, x0
+    // Pass 0 as dtb — UEFI/ACPI is the topology source on QCS6490; there
+    // is no raw DT pointer in x0 at an EFI application entry point.
+    mov  x0, #0
     b    kmain_entry
     "#
 );
@@ -472,6 +561,57 @@ fn kmain(dtb: usize) -> ! {
     }
 
     let hv = hypervisor::detect_backend();
+
+    // ── Phase 23: QCS6490 hardware identification + Gunyah probe ─────────────
+    //
+    // On `qcs6490` builds the `gunyah` feature is always enabled and
+    // `detect_backend()` already ran `GunyahBackend::detect()` (an HVC call
+    // to `HYP_IDENTIFY`).  Log the outcome now that the UART is up so the
+    // Phase 23 Day-3 spike can confirm:
+    //   (a) the kernel reached Rust code on real silicon, and
+    //   (b) whether the stock Gunyah hypervisor responded to HYP_IDENTIFY.
+    //
+    // This is also the first chance to log the GENI UART probe result —
+    // `geni_uart::probe()` ran silently inside `uart::init()`.
+    #[cfg(feature = "qcs6490")]
+    {
+        log::info!(
+            "phase 23: QCS6490 kernel alive (GENI UART={:#x}, GICv3 GICD={:#x})",
+            arch::aarch64::machine().uart_base,
+            arch::aarch64::machine().gic_dist_base,
+        );
+        // Report the EL we entered at — critical for Day-3 triage.
+        let current_el = arch::aarch64::boot::current_el();
+        log::info!("phase 23: entered Rust at EL{}", current_el);
+        // Report whether Gunyah responded to the HYP_IDENTIFY probe issued
+        // inside detect_backend() / GunyahBackend::detect().
+        #[cfg(feature = "gunyah")]
+        {
+            let gunyah_present = {
+                // Re-probe: detect_backend already called this but we want
+                // to log the raw answer independently of which backend won.
+                use hypervisor::backend::GunyahBackend;
+                // Safety: HVC is only defined when running under Gunyah —
+                // which is the case on qcs6490 stock firmware (stock Linux
+                // boots as a Gunyah EL1 App, so HYP_IDENTIFY is safe).
+                // On a board with `enable-kvm` set in DTB the firmware may
+                // have switched to KVM mode; in that case HVC will fault and
+                // the probe returns false, which is the correct answer.
+                crate::hypervisor::backend::gunyah_detect_safe()
+            };
+            if gunyah_present {
+                log::info!("phase 23: Gunyah hypervisor detected — running as EL1 App");
+                log::info!(
+                    "phase 23: GunyahBackend selected (MSGQ/BELL/VCPU_RUN hypercalls available)"
+                );
+            } else {
+                log::info!(
+                    "phase 23: Gunyah HYP_IDENTIFY did not respond — \
+                     bare-metal or KVM mode (check enable-kvm in DTB)"
+                );
+            }
+        }
+    }
 
     // ── Phase 3: VirtIO shared-memory transport ───────────────────────────────
     //

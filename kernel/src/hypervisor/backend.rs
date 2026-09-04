@@ -900,3 +900,28 @@ impl Hypervisor for GunyahBackend {
         Ok(ShmemHandle(cap as u32))
     }
 }
+
+// ── Phase 23: safe Gunyah probe helper ────────────────────────────────────────
+
+/// Re-run the Gunyah `HYP_IDENTIFY` probe and return `true` if Gunyah
+/// answered.
+///
+/// This is a free function rather than `GunyahBackend::detect()` so it can
+/// be called from `kmain` without requiring `where Self: Sized`.
+///
+/// # Safety
+/// The HVC instruction is only valid inside a Gunyah EL1 App; calling it on
+/// bare-metal EL1 (no hypervisor present) causes an undefined-instruction
+/// exception.  On `qcs6490` builds this is safe because stock Dragon Q6A /
+/// RUBIK Pi 3 firmware runs the primary OS as a Gunyah EL1 App by default
+/// (confirmed by the `Gunyah based bootup` boot log marker).  If the board
+/// was reconfigured with `enable-kvm` in the DTB to use KVM instead, the
+/// HVC will fault and the UEFI exception handler will catch it (returning
+/// with r0 ≠ 0), which we interpret as "Gunyah not present" — the correct
+/// answer for that configuration.
+///
+/// This function is only compiled when the `gunyah` feature is enabled.
+#[cfg(feature = "gunyah")]
+pub fn gunyah_detect_safe() -> bool {
+    GunyahBackend::detect()
+}

@@ -25,6 +25,13 @@ embed-servers = []
 # the EL3 monitor at boot (sbsa-ref CPUs reset at EL3).
 sbsa-ref = []
 
+# Phase 23: target Qualcomm Dragonwing QCS6490 real silicon
+# (Radxa Dragon Q6A, RUBIK Pi 3).  Enables the GENI UART driver, the
+# QCS6490 machine table, and the `gunyah` feature (HYP_IDENTIFY probe)
+# automatically.  The kernel enters at NS EL1 via UEFI — QSEE occupies
+# EL3, so no in-kernel EL3 monitor is used.
+qcs6490 = ["gunyah"]
+
 # Probe for the Gunyah hypervisor via SMCCC HVC at boot.
 # Enable ONLY when actually booting under Gunyah — on bare-metal EL1 an HVC
 # is UNDEFINED and would take an unexpected exception.
