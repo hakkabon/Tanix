@@ -161,39 +161,53 @@ impl VirtioBlk {
         sys::cache_sync();
         self.dev.notify(QUEUE);
 
-        let mut rounds = 0u32;
-        loop {
-            if self.dev.read_isr() & 1 != 0 {
-                // Deassert the INTx line; the used ring carries the result.
+        // Phase 22 (Task 8): block on SYS_WAIT_IRQ instead of busy-polling.
+        // On QEMU the virtio-blk INTx SPI fires within microseconds; on real
+        // eMMC/UFS it can take up to several milliseconds.  Polling wastes
+        // the entire quantum; sleeping here hands the CPU back to other
+        // servers while the storage I/O completes.
+        //
+        // After the interrupt fires we still verify completion via the used
+        // ring (the IRQ is level-triggered so it can't race with this check).
+        sys::wait_irq(self.dev.irq);
+        // Deassert the INTx line by reading ISR (required to re-arm the GIC).
+        let _ = self.dev.read_isr();
+        sys::cache_sync();
+
+        match self.q.pop_used() {
+            Some((id, _)) => {
+                if id != SLOT_HEADER {
+                    return false;
+                }
+                let st = unsafe { ptr::read_volatile((self.header_base + 512) as *const u8) };
+                st == S_OK
             }
-            sys::cache_sync();
-            match self.q.pop_used() {
-                Some((id, _)) => {
-                    if id != SLOT_HEADER {
+            None => {
+                // Spurious wake (shouldn't happen with INTx, but handle it):
+                // fall back to a brief bounded poll so we don't silently lose
+                // completions.
+                let mut rounds = 0u32;
+                loop {
+                    sys::cache_sync();
+                    match self.q.pop_used() {
+                        Some((id, _)) => {
+                            if id != SLOT_HEADER { return false; }
+                            let st = unsafe {
+                                ptr::read_volatile((self.header_base + 512) as *const u8)
+                            };
+                            return st == S_OK;
+                        }
+                        None => {}
+                    }
+                    rounds += 1;
+                    if rounds >= WAIT_ROUNDS {
+                        let mut s = tanix_libsys::fmt::StrBuf::new();
+                        s.push_str("virtio-blk: request timed out used_idx=");
+                        s.push_dec32(self.q.used_idx() as u32);
+                        sys::log(1, s.as_str());
                         return false;
                     }
-                    let st = unsafe { ptr::read_volatile((self.header_base + 512) as *const u8) };
-                    return st == S_OK;
                 }
-                None => {}
-            }
-            rounds += 1;
-            if rounds >= WAIT_ROUNDS {
-                let mut s = tanix_libsys::fmt::StrBuf::new();
-                s.push_str("virtio-blk: request timed out used_idx=");
-                s.push_dec32(self.q.used_idx() as u32);
-                s.push_str(" desc=");
-                s.push_hex64(self.q.desc_base);
-                s.push_str(" avail=");
-                s.push_hex64(self.q.avail_base);
-                s.push_str(" used=");
-                s.push_hex64(self.q.used_base);
-                s.push_str(" hdr=");
-                s.push_hex64(self.header_base);
-                s.push_str(" data=");
-                s.push_hex64(self.data_base);
-                sys::log(1, s.as_str());
-                return false;
             }
         }
     }

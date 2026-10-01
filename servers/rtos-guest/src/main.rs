@@ -20,8 +20,9 @@
 //!   x4 — shared-memory physical base (VirtqueueConfig + VMM info block)
 //!   x5 — kernel's `vm_yield_entry` (yield = "pause this tenant")
 //!   x6 — guest-context pointer the kernel uses to resume us
-//!   x7 — machine console (PL011) base: 0x6000_0000 on sbsa-ref,
-//!        0x0900_0000 on virt
+//!   x7 — machine console base:
+//!         PL011: 0x6000_0000 (sbsa-ref) or 0x0900_0000 (virt)
+//!         GENI SE: 0x00A9_0000 (QCS6490 / Dragon Q6A / RUBIK Pi 3)
 //!
 //! Guest ↔ kernel contract (info block at shmem + 0x3000):
 //!   magic   (u32, "IVMM")        ← kernel publishes
@@ -34,9 +35,12 @@
 //! RTOS has nothing else to do.  When every thread exits, the guest
 //! publishes PARKED and yields — the kernel stops scheduling it.
 //!
-//! Platform: what the kernel tells us via boot x7 — sbsa-ref NS PL011
-//! (0x6000_0000) or virt (0x0900_0000).  A real upstream Zephyr
-//! build would additionally require EL2 stage-2 isolation and its own
+//! Platform: what the kernel tells us via boot x7.  On QEMU virt/sbsa-ref
+//! this is a PL011 UART base.  On QCS6490 real silicon it is the GENI SE
+//! base (0x00A9_0000); the UART type is inferred from the value range —
+//! the PL011 bases are ≥ 0x0900_0000, while the GENI SE is at 0x00A9_0000
+//! (below any expected PL011 address).  A real upstream Zephyr build
+//! would additionally require EL2 stage-2 isolation and its own
 //! GIC/timer view — outside this VM model; see the kernel README.
 
 #![no_std]
@@ -45,30 +49,131 @@
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 
-// ── UART (PL011; base from boot x7, kernel-published) ─────────────────────────
+// ── UART driver (PL011 or Qualcomm GENI SE) ──────────────────────────────────
+//
+// The kernel passes the console base in boot register x7.  On QEMU virt /
+// sbsa-ref this is a PL011 (base ≥ 0x0900_0000).  On QCS6490 real silicon
+// (Dragon Q6A, RUBIK Pi 3) it is the GENI SE UART0 base (0x00A9_0000).
+//
+// PL011 TX: write byte to DR (+0x000) when FR.TXFF (+0x018 bit 5) is clear.
+// GENI SE TX: write byte to SE_GENI_TX_TRANS_LEN (+0x270), push to
+//   SE_GENI_TX_FIFO (+0x700), then issue M_CMD0 (+0x600) = opcode|LAST_FRAG.
+//   Poll M_IRQ_STATUS (+0x610) bit 0 (M_CMD_DONE) before each new command.
+//
+// This polling TX path mirrors geni_uart.rs in the kernel so any register
+// address or protocol fix there must be mirrored here too.
 
+/// True when the configured UART is a GENI SE (QCS6490).
+/// Inferred from the base address: GENI SE UART0 is at 0x00A9_0000, which
+/// is below any PL011 address used (0x0900_0000 or higher).
+static mut UART_IS_GENI: bool = false;
 static mut UART_BASE: usize = 0x6000_0000;
 
 fn set_uart_base(uart: u64) {
     if uart != 0 {
-        unsafe { UART_BASE = uart as usize; }
+        unsafe {
+            UART_BASE = uart as usize;
+            // GENI SE addresses are below 0x0100_0000; PL011s are above.
+            UART_IS_GENI = (uart as usize) < 0x0100_0000;
+        }
     }
 }
 
-fn uart_dr() -> *mut u32 {
+// ── PL011 register helpers ────────────────────────────────────────────────────
+
+fn pl011_dr() -> *mut u32 {
     unsafe { (UART_BASE + 0x0000) as *mut u32 }
 }
-fn uart_fr() -> *const u32 {
+fn pl011_fr() -> *const u32 {
     unsafe { (UART_BASE + 0x0018) as *const u32 }
 }
 const FR_TXFF: u32 = 1 << 5;
 
-fn putc(b: u8) {
+fn pl011_putc_raw(b: u8) {
     unsafe {
-        while core::ptr::read_volatile(uart_fr()) & FR_TXFF != 0 {
+        while core::ptr::read_volatile(pl011_fr()) & FR_TXFF != 0 {
             core::hint::spin_loop();
         }
-        core::ptr::write_volatile(uart_dr(), b as u32);
+        core::ptr::write_volatile(pl011_dr(), b as u32);
+    }
+}
+
+// ── GENI SE register helpers ─────────────────────────────────────────────────
+//
+// Register offsets relative to the SE base (matches geni_uart.rs):
+
+/// M-FSM IRQ status — bit 0 = M_CMD_DONE (previous TX finished).
+const GENI_M_IRQ_STATUS: usize = 0x610;
+/// M-FSM IRQ clear.
+const GENI_M_IRQ_CLEAR: usize  = 0x618;
+/// TX transfer length register (bytes to send in this command).
+const GENI_TX_TRANS_LEN: usize = 0x270;
+/// TX FIFO push register (write one u32 → push up to 4 bytes).
+const GENI_TX_FIFO: usize      = 0x700;
+/// TX FIFO status — bits [27:16] = current FIFO level (words used).
+const GENI_TX_FIFO_STATUS: usize = 0x800;
+/// M_CMD0: kick off a transfer. opcode=1 (UART TX), LAST_FRAG = bit 20.
+const GENI_M_CMD0: usize       = 0x600;
+
+const GENI_M_CMD_DONE: u32   = 1 << 0;
+const GENI_TX_OPCODE: u32    = 1u32 << 27;
+const GENI_LAST_FRAG: u32    = 1u32 << 20;
+/// FIFO depth assumed (QCS6490 GENI SE); used for backpressure check.
+const GENI_TX_FIFO_DEPTH: u32 = 16;
+
+#[inline]
+fn geni_rd(off: usize) -> u32 {
+    unsafe { core::ptr::read_volatile((UART_BASE + off) as *const u32) }
+}
+#[inline]
+fn geni_wr(off: usize, val: u32) {
+    unsafe { core::ptr::write_volatile((UART_BASE + off) as *mut u32, val) }
+}
+
+/// Wait for the GENI M-FSM to finish the previous TX, then clear the done
+/// bit so the next command can start cleanly.
+fn geni_wait_tx_done() {
+    let mut spins: u32 = 0;
+    while geni_rd(GENI_M_IRQ_STATUS) & GENI_M_CMD_DONE == 0 {
+        spins += 1;
+        if spins > 2_000_000 {
+            // Timed out — clear anyway and hope for the best.
+            geni_wr(GENI_M_IRQ_CLEAR, GENI_M_CMD_DONE);
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    geni_wr(GENI_M_IRQ_CLEAR, GENI_M_CMD_DONE);
+}
+
+/// Transmit one byte via the GENI SE (one M_CMD0 command per byte,
+/// matching the kernel's geni_uart.rs polling path).
+fn geni_putc_raw(b: u8) {
+    geni_wait_tx_done();
+    // Set transfer length to 1 byte.
+    geni_wr(GENI_TX_TRANS_LEN, 1);
+    // Wait for FIFO space (level < depth - 1).
+    let mut spins: u32 = 0;
+    while (geni_rd(GENI_TX_FIFO_STATUS) >> 16) & 0xFFF >= GENI_TX_FIFO_DEPTH - 1 {
+        spins += 1;
+        if spins > 500_000 { break; }
+        core::hint::spin_loop();
+    }
+    // Push the byte (word-wide write, only LSB used for 1-byte transfer).
+    geni_wr(GENI_TX_FIFO, b as u32);
+    // Kick the M-FSM: opcode = UART TX (1), LAST_FRAG set.
+    geni_wr(GENI_M_CMD0, GENI_TX_OPCODE | GENI_LAST_FRAG | 1u32);
+}
+
+// ── Unified putc / puts ───────────────────────────────────────────────────────
+
+fn putc(b: u8) {
+    unsafe {
+        if UART_IS_GENI {
+            geni_putc_raw(b);
+        } else {
+            pl011_putc_raw(b);
+        }
     }
 }
 
@@ -453,6 +558,12 @@ fn k_sem_take(which: usize) {
                 sem.count -= 1;
                 return;
             }
+            // Guard against waiter-list overflow before writing.
+            if sem.n_waiters >= MAX_WAITERS {
+                // This should never happen with the current demo (3 threads,
+                // 2 semaphores), but panic loudly rather than corrupt memory.
+                panic!("k_sem_take: waiter overflow");
+            }
             sem.waiters[sem.n_waiters] = CUR;
             sem.n_waiters += 1;
         }
@@ -500,6 +611,10 @@ fn k_msgq_put(q: *mut Msgq, data: &[u8]) {
                 wake_waiter(&mut mq.get_waiters, &mut mq.n_get);
                 return;
             }
+            // Guard against put-waiter-list overflow before writing.
+            if mq.n_put >= MAX_WAITERS {
+                panic!("k_msgq_put: put-waiter overflow");
+            }
             mq.put_waiters[mq.n_put] = CUR;
             mq.n_put += 1;
         }
@@ -520,6 +635,10 @@ fn k_msgq_get(q: *mut Msgq, out: &mut [u8]) -> usize {
                 mq.count -= 1;
                 wake_waiter(&mut mq.put_waiters, &mut mq.n_put);
                 return n;
+            }
+            // Guard against get-waiter-list overflow before writing.
+            if mq.n_get >= MAX_WAITERS {
+                panic!("k_msgq_get: get-waiter overflow");
             }
             mq.get_waiters[mq.n_get] = CUR;
             mq.n_get += 1;
@@ -786,9 +905,25 @@ unsafe fn guest_idle(base: *mut u8, tenant_id: u8, yield_fn: YieldFn, guest_ctx:
         // whenever no thread is ready; a kernel preemption/resume lands
         // here too (the VMM restores the interrupted PC, i.e. just after
         // this save).
-        let mut jb = IDLE_JB;
-        let _ = gs_save(&mut jb);
-        IDLE_JB = jb;
+        //
+        // Fix for the idle-JB preemption race: save directly into IDLE_JB
+        // with IRQs masked across the entire save+check sequence.  Without
+        // masking, a kernel tick landing between `gs_save(&mut jb)` and
+        // `IDLE_JB = jb` would leave IDLE_JB with a stale snapshot; the
+        // next dispatch() would resume into the middle of the idle loop
+        // with an inconsistent stack pointer.
+        //
+        // IRQs are masked only for the duration of the save — the guest
+        // runs unmasked in all other windows so the VMM can preempt it.
+        core::arch::asm!("msr daifset, #2", options(nomem, nostack)); // mask IRQ
+        let resumed = gs_save(&mut *core::ptr::addr_of_mut!(IDLE_JB));
+        core::arch::asm!("msr daifclr, #2", options(nomem, nostack)); // unmask IRQ
+
+        if resumed != 0 {
+            // Resumed from dispatch() or a kernel preemption: re-enter
+            // the idle work loop from the top.
+            continue;
+        }
 
         // A thread may have been woken by another thread's give/put since
         // our last pass — give it the CPU now.

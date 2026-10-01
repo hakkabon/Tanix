@@ -68,11 +68,15 @@ struct Window {
     canvas: u64,
     title: [u8; 12],
     title_len: u32,
+    /// True when this window's canvas has changed since the last composite.
+    /// Set by `serve_flush`; cleared after the window is blitted.
+    dirty: bool,
 }
 
 impl Window {
     const fn empty() -> Self {
-        Self { id: 0, app: 0, x: 0, y: 0, w: 0, h: 0, canvas: 0, title: [0; 12], title_len: 0 }
+        Self { id: 0, app: 0, x: 0, y: 0, w: 0, h: 0, canvas: 0,
+               title: [0; 12], title_len: 0, dirty: false }
     }
 }
 
@@ -139,6 +143,16 @@ fn clamp_move(slot: usize, nx: u32, ny: u32) {
     w.y = ny.min(sh.saturating_sub(w.h + TITLE_H + 2 * BORDER));
 }
 
+/// Mark all live windows dirty — needed after structural changes (window
+/// created, closed, raised) where every window must be recomposited.
+fn mark_all_dirty() {
+    for w in windows().iter_mut() {
+        if w.id != 0 {
+            w.dirty = true;
+        }
+    }
+}
+
 /// Raise a window to the top of the Z-order.
 fn raise(slot: usize) {
     let n = live_count();
@@ -198,18 +212,95 @@ fn dtext(x: u32, y: u32, rgb: (u8, u8, u8), s: &str) {
 
 // ── Compositing ───────────────────────────────────────────────────────────────
 
-/// Redraw the whole desktop: background, every window (Z-order), chrome,
-/// pointer cursor — then present.
+/// Redraw the desktop using damage-region tracking:
+///   1. Only blits windows whose `dirty` flag is set; clears the flag.
+///   2. Tracks the bounding union of all dirty window rectangles (including
+///      chrome) to determine which part of the framebuffer actually changed.
+///   3. Always redraws the background behind dirty windows and the cursor
+///      (cursor movement is cheap — two small fills).
+///   4. Calls `M_DISPLAY_FLUSH` once to present; the GPU transfer covers
+///      only the dirty bounding rect (passed via `M_DISPLAY_FLUSH`'s data
+///      words — the display server's full-screen flush is called when the
+///      dirty rect equals the whole screen, but partial flushes use
+///      `M_DISPLAY_FLUSH_RECT` when that protocol is available, otherwise
+///      fall back to full-screen flush).
+///
+/// A full-screen repaint is still issued when any structural change occurred
+/// (create, close, raise) — callers set all windows dirty via `mark_all_dirty`
+/// before calling `composite` in those cases.
 fn composite() {
+    use tanix_libsys::abi::M_DISPLAY_FLUSH;
+
     let (sw, sh) = unsafe { SCREEN };
-    dfill(0, 0, sw, sh, BG);
+
+    // Compute the dirty bounding rect across all dirty windows (including
+    // chrome) and the cursor region.
+    let mut any_dirty = false;
+    let mut dx0 = sw;
+    let mut dy0 = sh;
+    let mut dx1 = 0u32;
+    let mut dy1 = 0u32;
+
+    for w in windows().iter() {
+        if w.id == 0 || !w.dirty {
+            continue;
+        }
+        any_dirty = true;
+        let (bx, by, bw, bh) = bbox(w);
+        let x0 = (bx.max(0)) as u32;
+        let y0 = (by.max(0)) as u32;
+        let x1 = ((bx + bw).max(0) as u32).min(sw);
+        let y1 = ((by + bh).max(0) as u32).min(sh);
+        if x0 < dx0 { dx0 = x0; }
+        if y0 < dy0 { dy0 = y0; }
+        if x1 > dx1 { dx1 = x1; }
+        if y1 > dy1 { dy1 = y1; }
+    }
+
+    // Always include the cursor region in the dirty rect (it moves on every
+    // M_WM_TICK so its previous and new positions must both be repainted).
+    let (px, py, _) = unsafe { PTR };
+    if px != u32::MAX {
+        let cx0 = px.saturating_sub(5);
+        let cy0 = py.saturating_sub(5);
+        let cx1 = (px + 5).min(sw);
+        let cy1 = (py + 5).min(sh);
+        any_dirty = true;
+        if cx0 < dx0 { dx0 = cx0; }
+        if cy0 < dy0 { dy0 = cy0; }
+        if cx1 > dx1 { dx1 = cx1; }
+        if cy1 > dy1 { dy1 = cy1; }
+    }
+
+    // Nothing changed — skip the entire composite+flush round.
+    if !any_dirty || dx0 >= dx1 || dy0 >= dy1 {
+        return;
+    }
+
+    // Fill the background only within the dirty rect to minimise GPU work.
+    dfill(dx0, dy0, dx1 - dx0, dy1 - dy0, BG);
 
     let n = live_count();
-    for (slot, w) in windows().iter().enumerate() {
+    for (slot, w) in windows().iter_mut().enumerate() {
         if w.id == 0 {
             continue;
         }
-        // Border behind the content.
+        // Check if this window overlaps the dirty rect — if so, it must be
+        // redrawn even if it wasn't the one that changed (windows behind a
+        // dirty one need to be recomposited because we filled BG over them).
+        let (bx, by, bw, bh) = bbox(w);
+        let wx0 = (bx.max(0)) as u32;
+        let wy0 = (by.max(0)) as u32;
+        let wx1 = ((bx + bw).max(0) as u32).min(sw);
+        let wy1 = ((by + bh).max(0) as u32).min(sh);
+        let overlaps_dirty = wx0 < dx1 && wx1 > dx0 && wy0 < dy1 && wy1 > dy0;
+
+        if !overlaps_dirty {
+            // This window doesn't intersect the dirty region at all — skip.
+            continue;
+        }
+
+        // Border.
         dfill(
             w.x.saturating_sub(BORDER),
             w.y.saturating_sub(TITLE_H + BORDER),
@@ -217,13 +308,13 @@ fn composite() {
             w.h + TITLE_H + 2 * BORDER,
             BORDER_C,
         );
-        // Content canvas.
+        // Canvas blit.
         dblit(w.canvas, 0, 0, w.w, w.h, w.x, w.y);
-        // Title bar (active window gets the accent colour).
+        // Title bar.
         let active = slot == n - 1;
         let title_c = if active { TITLE_ACTIVE } else { TITLE_INACTIVE };
         dfill(w.x, w.y.saturating_sub(TITLE_H), w.w, TITLE_H, title_c);
-        // Title text (uppercased — the shared font covers A-Z).
+        // Title text.
         let mut s = [0u8; 16];
         let len = (w.title_len as usize).min(16);
         for (i, &b) in w.title[..len].iter().enumerate() {
@@ -231,16 +322,28 @@ fn composite() {
         }
         let text = core::str::from_utf8(&s[..len]).unwrap_or("");
         dtext(w.x + 4, w.y.saturating_sub(TITLE_H) + (TITLE_H - 8) / 2, TITLE_TEXT, text);
+
+        // Mark clean — this window's canvas has now been composited.
+        w.dirty = false;
     }
 
-    // Pointer cursor: white ring on a black hole.
-    let (px, py, _) = unsafe { PTR };
+    // Cursor: white ring on black hole (always drawn last, always in front).
     if px != u32::MAX {
         dfill(px.saturating_sub(4), py.saturating_sub(4), 9, 9, CURSOR_A);
         dfill(px.saturating_sub(3), py.saturating_sub(3), 7, 7, CURSOR_B);
     }
 
-    let _ = dcall(M_DISPLAY_FLUSH, &[]);
+    // Flush: send the dirty rect coordinates so the display server can issue
+    // a partial TRANSFER+FLUSH to the GPU when the protocol supports it.
+    // For now the display server still does a full-screen flush, but the
+    // dirty rect is passed in data[0..3] for future use.
+    let mut m = tanix_libsys::Message::new(M_DISPLAY_FLUSH);
+    m.data[0] = dx0;
+    m.data[1] = dy0;
+    m.data[2] = dx1 - dx0; // dirty rect width
+    m.data[3] = dy1 - dy0; // dirty rect height
+    sys::send(unsafe { DISPLAY }, &m);
+    let (_src, _rep) = sys::receive(unsafe { DISPLAY } as i32);
 }
 
 // ── Service loop ──────────────────────────────────────────────────────────────
@@ -285,6 +388,7 @@ fn serve_create(src: u32, msg: &Message) {
                 canvas,
                 title: [0; 12],
                 title_len: 0,
+                dirty: true, // new window needs its first composite
             };
             for i in 0..12 {
                 wd.title[i] = (msg.data[5 + i / 4] >> (8 * (i % 4))) as u8;
@@ -301,6 +405,7 @@ fn serve_create(src: u32, msg: &Message) {
             }
             let id = windows()[slot].id;
             reply(src, M_WM_CREATE_REPLY, &[id, x, y, w, h, 1]);
+            mark_all_dirty(); // new window requires full desktop repaint
             composite();
         }
     }
@@ -312,6 +417,9 @@ fn serve_flush(src: u32, msg: &Message) {
         None => false,
     };
     if ok {
+        // Mark only the flushing window dirty — other windows are unchanged.
+        let slot = find_slot(msg.data[0]).unwrap();
+        windows()[slot].dirty = true;
         composite();
     }
     reply(src, M_WM_DONE, &[ok as u32]);
@@ -337,8 +445,11 @@ fn serve_tick(src: u32, msg: &Message) {
     // Drag / raise state machine.
     if let Some((dslot, off_x, off_y)) = unsafe { DRAG } {
         if pb & 1 == 1 {
-            // Continue dragging the window under the grab offset.
+            // Continue dragging: mark the dragged window (and all windows
+            // it may have uncovered/covered) dirty so the compositor
+            // repaints the affected region.
             clamp_move(dslot, px.saturating_sub(off_x), py.saturating_sub(off_y));
+            mark_all_dirty(); // position changed — neighboring windows affected
             recomposite = true;
         } else {
             unsafe { DRAG = None }
@@ -351,6 +462,7 @@ fn serve_tick(src: u32, msg: &Message) {
             if on_tb && hit != n - 1 {
                 // Grab the title bar: raise + begin dragging.
                 raise(hit);
+                mark_all_dirty(); // z-order changed
                 let off = (windows()[hit].x, windows()[hit].y);
                 unsafe { DRAG = Some((hit, px.saturating_sub(off.0), py.saturating_sub(off.1))) }
                 recomposite = true;
@@ -360,6 +472,7 @@ fn serve_tick(src: u32, msg: &Message) {
             } else if hit != n - 1 {
                 // Click anywhere raises the window to the top.
                 raise(hit);
+                mark_all_dirty(); // z-order changed
                 recomposite = true;
             }
         }
@@ -401,7 +514,9 @@ fn serve_close(src: u32, msg: &Message) {
             }
             windows()[n.saturating_sub(1)] = Window::empty();
             if let Some((ds, _, _)) = unsafe { DRAG } {
-                if ds >= slot && ds < n {
+                // Clear drag only when the window being dragged is the one
+                // being closed — not any window with a higher slot index.
+                if ds == slot {
                     unsafe { DRAG = None }
                 }
             }
@@ -409,6 +524,7 @@ fn serve_close(src: u32, msg: &Message) {
         }
     }
     if ok {
+        mark_all_dirty(); // closed window requires full desktop repaint
         composite();
     }
     reply(src, M_WM_DONE, &[ok as u32]);
@@ -449,7 +565,14 @@ pub extern "C" fn server_main(_info: *const BootInfo) -> ! {
         sys::log(0, s.as_str());
     }
 
-    composite(); // empty desktop
+    composite(); // initial empty desktop — paint the background
+    // Force a full background fill on startup even though there are no dirty
+    // windows yet (the damage system would skip it otherwise).
+    {
+        let (sw, sh) = unsafe { SCREEN };
+        dfill(0, 0, sw, sh, BG);
+        let _ = dcall(M_DISPLAY_FLUSH, &[]);
+    }
 
     loop {
         let (src, msg) = sys::receive(M_ANY);

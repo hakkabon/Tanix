@@ -325,6 +325,11 @@ impl Device {
         }
 
         // Poll until the device completes our head descriptor.
+        // Bounded: if the device never returns our descriptor within
+        // MAX_POLL_ROUNDS iterations, log and return 0 so the caller
+        // can handle the failure rather than hanging forever.
+        const MAX_POLL_ROUNDS: u32 = 4_000_000;
+        let mut rounds = 0u32;
         let mut used_tail = queue.used_tail; // copy before vring borrow
         loop {
             let used_idx = unsafe { ptr::read_volatile(&vring.used_idx) } as usize;
@@ -337,6 +342,13 @@ impl Device {
                     return elem.len;
                 }
             }
+            rounds += 1;
+            if rounds >= MAX_POLL_ROUNDS {
+                sys::log(1, "virtio: device did not complete request (timeout)");
+                queue.used_tail = used_tail;
+                return 0;
+            }
+            core::hint::spin_loop();
         }
     }
 

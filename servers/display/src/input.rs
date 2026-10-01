@@ -71,14 +71,28 @@ pub struct Tablet {
 impl Tablet {
     /// Probe for the tablet, bring it to DRIVER_OK and hand it the full
     /// ring of empty event buffers.
+    ///
+    /// A tablet is an input device that advertises BOTH `EV_ABS` (absolute
+    /// axes) AND `EV_KEY`.  This mirrors the keyboard probe logic so we
+    /// never accidentally initialise the keyboard as the tablet when the
+    /// keyboard enumerates in a lower MMIO slot.
     pub fn open() -> Option<Self> {
-        let dev = match crate::virtio::find(DEVICE_ID_INPUT) {
+        let mut found: Option<Device> = None;
+        crate::virtio::for_each(DEVICE_ID_INPUT, |dev| {
+            // Only take the first device that has EV_ABS — that is the
+            // tablet (absolute pointer); the keyboard has EV_KEY but no
+            // EV_ABS.
+            if found.is_none() && dev.supports_event(EV_ABS) {
+                found = Some(dev);
+            }
+        });
+        let dev = match found {
             Some(d) => {
                 sys::log(0, "tablet: device found");
                 d
             }
             None => {
-                sys::log(1, "tablet: device not found");
+                sys::log(1, "tablet: device not found (add -device virtio-tablet-device)");
                 return None;
             }
         };

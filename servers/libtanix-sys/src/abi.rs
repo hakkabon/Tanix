@@ -44,6 +44,9 @@ pub struct BootInfo {
 /// Machine ids (mirror of `kernel/src/arch/aarch64/machine.rs`).
 pub const MACHINE_VIRT: u32 = 0;
 pub const MACHINE_SBSA_REF: u32 = 1;
+/// Phase 23: Qualcomm Dragonwing QCS6490 real silicon
+/// (Radxa Dragon Q6A, RUBIK Pi 3).
+pub const MACHINE_QCS6490: u32 = 2;
 
 // ── Per-server protocol constants ─────────────────────────────────────────────
 

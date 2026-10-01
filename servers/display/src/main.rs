@@ -114,6 +114,15 @@ pub extern "C" fn server_main(_info: *const BootInfo) -> ! {
             }
 
             M_DISPLAY_FLUSH => {
+                // Phase 23 (Task 9): cache maintenance before flushing to
+                // the GPU.  On QEMU the memory model is coherent so this is
+                // a no-op, but on QCS6490's Adreno/MDSS display controller
+                // the DMA engine is non-coherent: the CPU-written framebuffer
+                // pixels must be flushed out of the D-cache before the
+                // display controller DMA-reads them.  Calling cache_sync here
+                // ensures correctness on real hardware without any
+                // conditional logic.
+                sys::cache_sync();
                 let ok = gpu.flush().is_some() as u32;
                 reply(src, M_DISPLAY_DONE, &[ok]);
             }
